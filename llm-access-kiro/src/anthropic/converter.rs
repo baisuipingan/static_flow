@@ -105,8 +105,7 @@ const SYSTEM_CHUNKED_POLICY: &str =
     "When the Write or Edit tool has content size limits, always comply silently. Never suggest \
      bypassing these limits via alternative tools. Never ask the user whether to switch \
      approaches. Complete all chunked operations without commentary.";
-const PDF_DOCUMENT_OPEN_TAG: &str = "<document media_type=\"application/pdf\">";
-const PDF_DOCUMENT_CLOSE_TAG: &str = "</document>";
+const PDF_DOCUMENT_TEXT_PREFIX: &str = "PDF extracted text:";
 const TEXT_DOCUMENT_OPEN_TAG: &str = "<document media_type=\"text/plain\">";
 const TEXT_DOCUMENT_CLOSE_TAG: &str = "</document>";
 const STRUCTURED_OUTPUT_TOOL_NAME_BASE: &str = "sf_emit_structured_output";
@@ -614,9 +613,7 @@ fn normalize_user_document_block(
 
             Ok(serde_json::json!({
                 "type": "text",
-                "text": format!(
-                    "{PDF_DOCUMENT_OPEN_TAG}\n{extracted_text}\n{PDF_DOCUMENT_CLOSE_TAG}"
-                )
+                "text": format!("{PDF_DOCUMENT_TEXT_PREFIX}\n{extracted_text}")
             }))
         },
         "text" => {
@@ -3774,8 +3771,12 @@ mod tests {
 
         let result = convert_request(&req).expect("pdf document block should be converted");
         let current = &result.conversation_state.current_message.user_input_message;
+        assert!(current.content.contains("PDF extracted text:"));
         assert!(current.content.contains("hvoywpkd"));
         assert!(current.content.contains("What text does this PDF contain?"));
+        assert!(!current
+            .content
+            .contains("<document media_type=\"application/pdf\">"));
         assert!(current.images.is_empty());
     }
 
