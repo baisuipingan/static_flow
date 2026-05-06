@@ -1,7 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-RELEASE_DIR="${LLM_ACCESS_RELEASE_DIR:-$HOME/staticflow-llm-access-release}"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+RELEASE_DIR="${LLM_ACCESS_RELEASE_DIR:-$SCRIPT_DIR}"
 SERVICE="${LLM_ACCESS_SERVICE:-llm-access.service}"
 INSTALL_PATH="${LLM_ACCESS_INSTALL_PATH:-/usr/local/bin/llm-access}"
 BACKUP_DIR="${LLM_ACCESS_BACKUP_DIR:-/usr/local/bin/staticflow-backups}"

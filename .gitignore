@@ -83,6 +83,7 @@ bin/
 tmp/
 .local/
 backend/.local/
+/.local/llm-access-cloud-release.env
 .worktrees/
 conf/pingora/staticflow-gateway.yaml
 conf/gpt2api-rs.json

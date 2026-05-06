@@ -4,11 +4,14 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LOCAL_SCRIPT="$ROOT_DIR/scripts/prepare_llm_access_cloud_release.sh"
 REMOTE_SCRIPT="$ROOT_DIR/scripts/activate_llm_access_cloud_release.sh"
+CONFIG_EXAMPLE="$ROOT_DIR/conf/llm-access-cloud-release.env.example"
 
 for script in "$LOCAL_SCRIPT" "$REMOTE_SCRIPT"; do
   test -x "$script"
   bash -n "$script"
 done
+
+test -s "$CONFIG_EXAMPLE"
 
 if command -v shellcheck >/dev/null 2>&1; then
   shellcheck "$LOCAL_SCRIPT" "$REMOTE_SCRIPT"
@@ -20,9 +23,20 @@ grep -F 'cargo clippy -p llm-access-core -p llm-access-store -p llm-access' "$LO
 grep -F 'cargo build -p llm-access --release' "$LOCAL_SCRIPT" >/dev/null
 grep -F 'scp ' "$LOCAL_SCRIPT" >/dev/null
 grep -F 'llm-access.latest' "$LOCAL_SCRIPT" >/dev/null
+grep -F '.local/llm-access-cloud-release.env' "$LOCAL_SCRIPT" >/dev/null
+grep -F 'source "$CONFIG_FILE"' "$LOCAL_SCRIPT" >/dev/null
 ! grep -F 'pgrep' "$LOCAL_SCRIPT" >/dev/null
 ! grep -F 'another Rust/frontend build appears to be running' "$LOCAL_SCRIPT" >/dev/null
+! grep -F '35.241.86.154' "$LOCAL_SCRIPT" >/dev/null
+! grep -F 'google_compute_engine' "$LOCAL_SCRIPT" >/dev/null
+! grep -F 'staticflow-llm-access-release' "$LOCAL_SCRIPT" >/dev/null
 
 grep -F 'sudo mv -f' "$REMOTE_SCRIPT" >/dev/null
 grep -F 'systemctl restart' "$REMOTE_SCRIPT" >/dev/null
 grep -F 'http://127.0.0.1:19080/healthz' "$REMOTE_SCRIPT" >/dev/null
+
+grep -F 'GCP_HOST=' "$CONFIG_EXAMPLE" >/dev/null
+grep -F 'GCP_SSH_KEY=' "$CONFIG_EXAMPLE" >/dev/null
+grep -F 'REMOTE_RELEASE_DIR=' "$CONFIG_EXAMPLE" >/dev/null
+! grep -F '35.241.86.154' "$CONFIG_EXAMPLE" >/dev/null
+! grep -F 'google_compute_engine' "$CONFIG_EXAMPLE" >/dev/null

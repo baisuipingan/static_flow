@@ -3,16 +3,7 @@ set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REMOTE_SCRIPT="$ROOT_DIR/scripts/activate_llm_access_cloud_release.sh"
-
-DEFAULT_TARGET_DIR="/mnt/wsl/data4tb/static-flow-data/cargo-target/static_flow"
-CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$DEFAULT_TARGET_DIR}"
-GCP_USER="${GCP_USER:-ts_user}"
-GCP_HOST="${GCP_HOST:-35.241.86.154}"
-GCP_SSH_KEY="${GCP_SSH_KEY:-$HOME/.ssh/google_compute_engine}"
-GCP_DEST="${GCP_DEST:-$GCP_USER@$GCP_HOST}"
-REMOTE_RELEASE_DIR="${REMOTE_RELEASE_DIR:-/home/$GCP_USER/staticflow-llm-access-release}"
-BUILD_JOBS="${BUILD_JOBS:-4}"
-ALLOW_DIRTY="${ALLOW_DIRTY:-0}"
+CONFIG_FILE="${LLM_ACCESS_CLOUD_RELEASE_CONFIG:-$ROOT_DIR/.local/llm-access-cloud-release.env}"
 
 log() {
   printf '[llm-access-release] %s\n' "$*"
@@ -31,9 +22,51 @@ shell_quote() {
   printf '%q' "$1"
 }
 
+expand_path() {
+  case "$1" in
+    "~")
+      printf '%s\n' "$HOME"
+      ;;
+    "~/"*)
+      printf '%s/%s\n' "$HOME" "${1#"~/"}"
+      ;;
+    *)
+      printf '%s\n' "$1"
+      ;;
+  esac
+}
+
+load_config() {
+  [[ -r "$CONFIG_FILE" ]] || fail "missing config file: $CONFIG_FILE; copy conf/llm-access-cloud-release.env.example and edit it"
+  # shellcheck source=/dev/null
+  source "$CONFIG_FILE"
+}
+
+require_var() {
+  local name="$1"
+  [[ -n "${!name:-}" ]] || fail "missing required config value: $name in $CONFIG_FILE"
+}
+
 for cmd in cargo curl df git scp sha256sum ssh; do
   require_cmd "$cmd"
 done
+
+load_config
+
+BUILD_JOBS="${BUILD_JOBS:-4}"
+ALLOW_DIRTY="${ALLOW_DIRTY:-0}"
+require_var CARGO_TARGET_DIR
+require_var GCP_SSH_KEY
+require_var REMOTE_RELEASE_DIR
+
+if [[ -z "${GCP_DEST:-}" ]]; then
+  require_var GCP_USER
+  require_var GCP_HOST
+  GCP_DEST="$GCP_USER@$GCP_HOST"
+fi
+
+CARGO_TARGET_DIR="$(expand_path "$CARGO_TARGET_DIR")"
+GCP_SSH_KEY="$(expand_path "$GCP_SSH_KEY")"
 
 [[ -x "$REMOTE_SCRIPT" ]] || fail "remote activation script is not executable: $REMOTE_SCRIPT"
 [[ -r "$GCP_SSH_KEY" ]] || fail "SSH key is not readable: $GCP_SSH_KEY"
@@ -45,7 +78,8 @@ if [[ "$ALLOW_DIRTY" != "1" ]] && [[ -n "$(git status --porcelain)" ]]; then
   fail "working tree is dirty; commit first or run with ALLOW_DIRTY=1"
 fi
 
-df -h /mnt/wsl/data4tb >/dev/null
+mkdir -p "$CARGO_TARGET_DIR"
+df -h "$CARGO_TARGET_DIR" >/dev/null
 
 export CARGO_TARGET_DIR
 
