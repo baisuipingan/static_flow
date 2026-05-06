@@ -31,15 +31,6 @@ shell_quote() {
   printf '%q' "$1"
 }
 
-check_no_parallel_build() {
-  local procs
-  procs="$(pgrep -af '([c]argo|[r]ustc|[t]runk|[l]d|[l]ld|[m]old)' || true)"
-  if [[ -n "$procs" ]]; then
-    printf '%s\n' "$procs" >&2
-    fail "another Rust/frontend build appears to be running"
-  fi
-}
-
 for cmd in cargo curl df git scp sha256sum ssh; do
   require_cmd "$cmd"
 done
@@ -55,7 +46,6 @@ if [[ "$ALLOW_DIRTY" != "1" ]] && [[ -n "$(git status --porcelain)" ]]; then
 fi
 
 df -h /mnt/wsl/data4tb >/dev/null
-check_no_parallel_build
 
 export CARGO_TARGET_DIR
 

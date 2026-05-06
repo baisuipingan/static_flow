@@ -20,6 +20,8 @@ grep -F 'cargo clippy -p llm-access-core -p llm-access-store -p llm-access' "$LO
 grep -F 'cargo build -p llm-access --release' "$LOCAL_SCRIPT" >/dev/null
 grep -F 'scp ' "$LOCAL_SCRIPT" >/dev/null
 grep -F 'llm-access.latest' "$LOCAL_SCRIPT" >/dev/null
+! grep -F 'pgrep' "$LOCAL_SCRIPT" >/dev/null
+! grep -F 'another Rust/frontend build appears to be running' "$LOCAL_SCRIPT" >/dev/null
 
 grep -F 'sudo mv -f' "$REMOTE_SCRIPT" >/dev/null
 grep -F 'systemctl restart' "$REMOTE_SCRIPT" >/dev/null
