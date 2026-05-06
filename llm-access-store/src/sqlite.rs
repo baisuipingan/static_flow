@@ -649,6 +649,8 @@ impl SqliteControlStore {
                 proxy,
             });
         }
+        let codex_status = self.get_codex_rate_limit_status()?;
+        sort_codex_routes_by_cached_quota(&mut routes, codex_status.as_ref());
         Ok(routes)
     }
 
@@ -4034,6 +4036,79 @@ fn route_strategy_from_config(route: &KeyRouteConfig) -> anyhow::Result<RouteStr
     }
 }
 
+fn sort_codex_routes_by_cached_quota(
+    routes: &mut [ProviderCodexRoute],
+    status: Option<&CodexRateLimitStatus>,
+) {
+    let status_by_account = status
+        .map(|status| {
+            status
+                .accounts
+                .iter()
+                .map(|account| (account.name.as_str(), account))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    routes.sort_by(|left, right| {
+        let left_score = codex_route_quota_score(&left.account_name, &status_by_account);
+        let right_score = codex_route_quota_score(&right.account_name, &status_by_account);
+        right_score
+            .rank
+            .cmp(&left_score.rank)
+            .then_with(|| right_score.remaining.total_cmp(&left_score.remaining))
+            .then_with(|| right_score.last_success_at.cmp(&left_score.last_success_at))
+            .then_with(|| left.account_name.cmp(&right.account_name))
+    });
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CodexRouteQuotaScore {
+    rank: u8,
+    remaining: f64,
+    last_success_at: i64,
+}
+
+fn codex_route_quota_score(
+    account_name: &str,
+    status_by_account: &BTreeMap<&str, &core_store::CodexPublicAccountStatus>,
+) -> CodexRouteQuotaScore {
+    let Some(status) = status_by_account.get(account_name) else {
+        return CodexRouteQuotaScore {
+            rank: 2,
+            remaining: -1.0,
+            last_success_at: 0,
+        };
+    };
+    if status.status != core_store::KEY_STATUS_ACTIVE || status.usage_error_message.is_some() {
+        return CodexRouteQuotaScore {
+            rank: 0,
+            remaining: -1.0,
+            last_success_at: status.last_usage_success_at.unwrap_or(0),
+        };
+    }
+    let Some(remaining) = codex_remaining_bottleneck(status) else {
+        return CodexRouteQuotaScore {
+            rank: 2,
+            remaining: -1.0,
+            last_success_at: status.last_usage_success_at.unwrap_or(0),
+        };
+    };
+    CodexRouteQuotaScore {
+        rank: if remaining > 0.0 { 3 } else { 1 },
+        remaining,
+        last_success_at: status.last_usage_success_at.unwrap_or(0),
+    }
+}
+
+fn codex_remaining_bottleneck(status: &core_store::CodexPublicAccountStatus) -> Option<f64> {
+    [status.primary_remaining_percent, status.secondary_remaining_percent]
+        .into_iter()
+        .flatten()
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 100.0))
+        .reduce(f64::min)
+}
+
 fn effective_kiro_cache_policy_json(
     runtime_policy_json: &str,
     override_json: Option<&str>,
@@ -5098,6 +5173,90 @@ mod tests {
         let proxy = route.proxy.expect("codex proxy");
         assert_eq!(proxy.proxy_url, "http://127.0.0.1:9010");
         assert_eq!(proxy.proxy_username.as_deref(), Some("codex-user"));
+    }
+
+    #[test]
+    fn provider_route_repository_orders_codex_auto_routes_by_cached_remaining_quota() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlStore::new(conn);
+
+        for (name, created_at_ms) in [("DogDu", 100), ("test1", 101)] {
+            repo.create_admin_codex_account(&llm_access_core::store::NewAdminCodexAccount {
+                name: name.to_string(),
+                account_id: Some(format!("acct-{name}")),
+                auth_json: format!(r#"{{"access_token":"access-{name}"}}"#),
+                map_gpt53_codex_to_spark: false,
+                created_at_ms,
+            })
+            .expect("create codex account");
+        }
+        repo.create_admin_key(&llm_access_core::store::NewAdminKey {
+            id: "key-auto".to_string(),
+            name: "auto key".to_string(),
+            secret: "sfk_auto".to_string(),
+            key_hash: "hash-auto".to_string(),
+            provider_type: "codex".to_string(),
+            protocol_family: "openai".to_string(),
+            public_visible: false,
+            quota_billable_limit: 1000,
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+            created_at_ms: 110,
+        })
+        .expect("create key");
+        repo.upsert_codex_rate_limit_status(
+            &llm_access_core::store::CodexRateLimitStatus {
+                status: "ready".to_string(),
+                refresh_interval_seconds: 300,
+                last_checked_at: Some(200),
+                last_success_at: Some(200),
+                source_url: "https://chatgpt.com/backend-api/wham/usage".to_string(),
+                error_message: None,
+                accounts: vec![
+                    codex_public_status("DogDu", 1.0, 52.0),
+                    codex_public_status("test1", 80.0, 97.0),
+                ],
+                buckets: Vec::new(),
+            },
+            200,
+        )
+        .expect("persist codex status");
+
+        let routes = repo
+            .resolve_provider_codex_routes(&llm_access_core::store::AuthenticatedKey {
+                key_id: "key-auto".to_string(),
+                key_name: "auto key".to_string(),
+                provider_type: "codex".to_string(),
+                protocol_family: "openai".to_string(),
+                status: "active".to_string(),
+                quota_billable_limit: 1000,
+                billable_tokens_used: 0,
+            })
+            .expect("resolve routes");
+
+        let names = routes
+            .iter()
+            .map(|route| route.account_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["test1", "DogDu"]);
+    }
+
+    fn codex_public_status(
+        name: &str,
+        primary_remaining_percent: f64,
+        secondary_remaining_percent: f64,
+    ) -> llm_access_core::store::CodexPublicAccountStatus {
+        llm_access_core::store::CodexPublicAccountStatus {
+            name: name.to_string(),
+            status: llm_access_core::store::KEY_STATUS_ACTIVE.to_string(),
+            plan_type: Some("Plus".to_string()),
+            primary_remaining_percent: Some(primary_remaining_percent),
+            secondary_remaining_percent: Some(secondary_remaining_percent),
+            last_usage_checked_at: Some(200),
+            last_usage_success_at: Some(200),
+            usage_error_message: None,
+        }
     }
 
     #[test]
