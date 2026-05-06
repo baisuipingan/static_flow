@@ -1,444 +1,189 @@
 # StaticFlow
 
-[CLI 使用手册](./docs/cli-user-guide.zh.md)
+[English](./README.md) | [CLI 使用手册](./docs/cli-user-guide.zh.md)
 
-本地优先的动态博客系统：后端在本地运行在 Pingora gateway 后面，通过云端 Caddy + pb-mapper 对外暴露 HTTPS；文章与图片统一写入 LanceDB，由前端直接请求公网同源 API。
+本地优先的写作、知识管理与媒体平台，全栈 Rust 实现。Axum 后端 + Yew/WASM 前端 +
+LanceDB 存储。支持文章发布、AI 评论审核、音乐管理、图片资产导入、外部文章转载，
+以及公开 LLM 接入层 — 全部自托管在本地机器上，可选云端边缘入口。
 
-除了内容系统本身，StaticFlow 当前还内置了一套对外 `LLM Access` 能力：Codex 的 OpenAI-compatible 网关、Kiro 的 Anthropic-compatible 网关、provider 级上游代理解析、可配额度的 gateway key，以及统一的 usage 账本。实现细节见 [docs/llm-access-and-kiro-gateway-implementation.md](./docs/llm-access-and-kiro-gateway-implementation.md)。
+## 功能特性
 
-## 核心理念
-
-> **"Don't build agents, build skills instead."**
-> — [Anthropic Expert Talk](https://www.youtube.com/watch?v=CEvIs9y1uog)
-
-本项目不开发独立 AI Agent。
-
-策略：
-- **智能能力**：交给 Claude Code/Codex + skills
-- **工程工具**：CLI 只做 LanceDB 读写
+- 全文搜索与语义（向量）搜索，支持跨语言回退
+- 双语文章发布，Markdown 源文件 + 元数据自动补全
+- 图片导入，blob v2 存储、缩略图、向量相似搜索
+- 音乐库：网易云/NCM 导入、歌词、许愿功能
+- AI 评论审核：后台 Codex agent worker 自动回复
+- 外部博客转载：风格感知翻译 + 自适应源格式处理
+- 交互式页面镜像：JS 重度外部页面本地化
+- 公开 LLM 接入层：OpenAI 兼容（Codex）和 Anthropic 兼容（Kiro）网关，
+  配额管理与用量计费
 
 ## 项目结构
 
+全栈 Rust monorepo，14 个 workspace crate：
+
 ```text
 static-flow/
-├── frontend/     # Yew WASM 前端
-├── backend/      # Axum 后端（LanceDB 查询层）
-├── shared/       # 共享类型
-├── cli/          # LanceDB CLI 工具
-└── content/      # 示例 Markdown 与图片
+├── shared/              # Rust 库 — LanceDB 存储、数据类型
+├── backend/             # Axum HTTP 服务 — handler、路由、worker
+├── frontend/            # Yew/WASM SPA — 页面、组件、i18n
+├── cli/                 # sf-cli — LanceDB 操作（写入/查询/嵌入/优化）
+├── gateway/             # Pingora 本地入口网关（蓝绿切换）
+├── runtime/             # 共享运行时工具（日志、追踪、信号处理）
+├── media-service/       # 媒体处理服务（图片/音频管线）
+├── media-types/         # 共享媒体类型定义
+├── llm-access/          # 独立 LLM 接入服务二进制
+├── llm-access-core/     # 核心 LLM 逻辑（路由、配额、代理解析）
+├── llm-access-codex/    # Codex/OpenAI 兼容网关
+├── llm-access-kiro/     # Kiro/Anthropic 兼容网关
+├── llm-access-migrations/ # llm-access 存储 schema 迁移
+├── llm-access-store/    # 存储层（SQLite 控制面 + DuckDB 分析）
+├── skills/              # Codex/Claude agent skill 定义
+├── scripts/             # Shell 脚本 — 启动器、worker runner、e2e 测试
+├── docs/                # 技术文档、实现深潜、运维手册
+├── conf/                # 配置文件（Pingora gateway YAML、systemd 模板）
+├── content/             # 文章 Markdown 源文件与图片
+├── tools/               # 第三方工具（ncmdump-rs、pb-mapper）
+├── deps/                # Git 子模块 — lance/lancedb/pingora fork
+└── patches/             # 供应商 crate 补丁
 ```
 
-## 数据仓库（Hugging Face）
+## 前置依赖
 
-`static-flow` 对应网站：<https://acking-you.github.io/>
-
-本项目将运行时数据放在两个 Hugging Face 数据集仓库和一个本地音乐库中管理：
-
-- 当前本地数据根目录：`/mnt/wsl/data4tb/static-flow-data`
-
-- Content DB（内容主库 + 请求表 + 交互镜像 + LLM gateway）
-  - HF 数据集仓库：`LB7666/my_lancedb_data`
-  - 远端地址：`git@hf.co:datasets/LB7666/my_lancedb_data`
-  - 本地数据目录：`/mnt/wsl/data4tb/static-flow-data/lancedb`
-  - 表：`articles`, `images`, `taxonomies`, `article_views`, `api_behavior_events`, `article_requests`, `article_request_ai_runs`, `article_request_ai_run_chunks`, `interactive_pages`, `interactive_page_locales`, `interactive_assets`, `llm_gateway_keys`, `llm_gateway_usage_events`, `llm_gateway_runtime_config`, `llm_gateway_proxy_configs`, `llm_gateway_proxy_bindings`, `llm_gateway_token_requests`, `llm_gateway_account_contribution_requests`, `llm_gateway_sponsor_requests`
-- Comments DB（评论审核与 AI 运行记录）
-  - HF 数据集仓库：`LB7666/static-flow-comments`
-  - 远端地址：`git@hf.co:datasets/LB7666/static-flow-comments`
-  - 本地数据目录：`/mnt/wsl/data4tb/static-flow-data/lancedb-comments`
-  - 表：`comment_tasks`, `comment_published`, `comment_audit_logs`, `comment_ai_runs`, `comment_ai_run_chunks`
-- Music DB（本地优先音乐库）
-  - 本地数据目录：`/mnt/wsl/data4tb/static-flow-data/lancedb-music`
-  - 表：`songs`, `music_plays`, `music_comments`, `music_wishes`, `music_wish_ai_runs`, `music_wish_ai_run_chunks`
-
-推荐流程：
-
-1. 先通过 `sf-cli` 写入/更新数据（保证 schema 与索引一致）。
-2. 再用 Git 对数据快照做版本提交。
-3. 最后 push 到 Hugging Face 数据集远端。
-
-快速配置（SSH + Git Xet）：
-
-```bash
-# 1) 准备 SSH key，并把公钥添加到 https://huggingface.co/settings/keys
-ls ~/.ssh/id_ed25519.pub || ssh-keygen -t ed25519 -C "LB7666@hf"
-eval "$(ssh-agent -s)"
-ssh-add ~/.ssh/id_ed25519
-mkdir -p ~/.ssh
-ssh-keyscan -H hf.co >> ~/.ssh/known_hosts
-chmod 600 ~/.ssh/known_hosts
-ssh -T git@hf.co
-
-# 2) 将本地数据目录绑定到 HF 数据集远端
-cd /mnt/wsl/data4tb/static-flow-data/lancedb
-git init -b main
-git remote remove origin 2>/dev/null || true
-git remote add origin git@hf.co:datasets/LB7666/my_lancedb_data
-git fetch origin main
-git checkout -B main origin/main
-
-# 3) 安装并启用 Git Xet
-bash <(curl -fsSL https://raw.githubusercontent.com/huggingface/xet-core/main/git_xet/install.sh)
-export PATH="$HOME/.local/bin:$PATH"
-git xet install
-git xet track "*.lance"
-git xet track "*.txn"
-git xet track "*.manifest"
-
-# 4) 日常同步
-git add -A
-git commit -m "data: sync $(date '+%F %T')" || echo "no changes"
-git push origin main
-```
-
-说明：执行 `git xet track` 后，`.gitattributes` 中仍出现 `filter=lfs` 属于正常现象，
-这是 Hugging Face 的 Xet 兼容传输实现方式。
-
-## 部署模式
-
-### 模式 A：自托管（推荐）
-
-后端同时提供 API 和前端静态文件。当前生产链路是公网 HTTPS 先进入云端
-Caddy 和 pb-mapper，再落到本地 Pingora gateway。
-
-```text
-浏览器 -> https://ackingliu.top
-       -> 云端 Caddy (:443)
-       -> 云端 pb-mapper-client (127.0.0.1:39080)
-       -> 云端 pb-mapper-server (:7666)
-       -> 本地 tmux `pbmapper-sf-backend`
-       -> 本地 Pingora gateway (127.0.0.1:39180)
-       -> active backend slot（当前 green，127.0.0.1:39081）
-          ├── /api/*        → API handler
-          ├── /posts/:id    → SEO 注入页
-          ├── /sitemap.xml  → 动态 sitemap
-          └── /*            → 前端静态文件 (SPA fallback)
-```
-
-当前本机生产 tmux 后台运行的 binary：
-
-| tmux session | Binary | 作用 | 监听 / 目标 |
-| --- | --- | --- | --- |
-| `sf-gateway` | `target/release-backend/staticflow-pingora-gateway --conf conf/pingora/staticflow-gateway.yaml` | 本地稳定入口。日常 backend 热更新不要停它。 | 监听 `127.0.0.1:39180` |
-| `sf-backend-green` | `scripts/start_backend_selfhosted.sh --port 39081`，并设置 `BACKEND_BIN=target/release-backend/static-flow-backend` | 当前被 Pingora 选中的 backend slot。 | 监听 `127.0.0.1:39081`，使用 `DB_ROOT=/mnt/wsl/data4tb/static-flow-data` |
-| `gpt2api-rs` | `deps/gpt2api_rs/target/release/gpt2api-rs serve` | StaticFlow 路由/admin 使用的 GPT2API 图片网关。 | 监听 `127.0.0.1:18787` |
-| `pbmapper-sf-backend` | `~/.local/pbmapper/current/pb-mapper-server-cli ... tcp-server --key sf-backend --addr 127.0.0.1:39180` | 把本地 Pingora gateway 注册到云端 relay。 | 连接 `ackingliu.top:7666` |
-| `pbmapper-home-ubuntu` | `~/.local/pbmapper/current/pb-mapper-server-cli ... tcp-server --key home-ubuntu --addr 127.0.0.1:22` | 把本地 SSH 入口注册到云端 relay。 | 连接 `ackingliu.top:7666` |
-
-说明：
-- `conf/pingora/staticflow-gateway.yaml` 是本地 gateway 的事实配置源。
-  当前 `active_upstream: green` 表示 `39180 -> 39081`。
-- 本地 Pingora listener 设置了 `downstream_h2c: true`：Caddy/pb-mapper 可以用
-  cleartext HTTP/2 prior-knowledge 访问 `127.0.0.1:39180`，普通 HTTP/1.1 客户端仍会自动回退。
-- 云端 Caddy 和 pb-mapper 仍由 `ubuntu@ackingliu.top` 上的 systemd 管理：
-  `caddy`、`pb-mapper-server.service`、`pb-mapper-client-cli@sf-backend.service`。
-- `MSG_HEADER_KEY`、GPT2API admin token 这类部署密钥不写入 README；需要运维时从
-  live tmux/process environment 查看。
-
-常用运行态检查：
-
-```bash
-tmux list-panes -a -F '#{session_name}|#{pane_pid}|#{pane_current_command}|#{pane_start_command}'
-ss -tlnp '( sport = :39180 or sport = :39080 or sport = :39081 or sport = :18787 )'
-readlink -f /proc/<pid>/exe
-curl --http2-prior-knowledge -o /dev/null -sS -w 'h2c=%{http_version} code=%{http_code}\n' http://127.0.0.1:39180/api/healthz
-```
-
-云端 Caddy 到本地 relay endpoint 应优先 h2c，并保留 HTTP/1.1 回退：
-
-```caddy
-reverse_proxy 127.0.0.1:39080 {
-    transport http {
-        versions h2c 1.1
-    }
-}
-```
-
-一次性手动自托管启动方式：
-
-```bash
-# 1. 构建前端（API_BASE=/api，同源请求）
-bash scripts/build_frontend_selfhosted.sh
-
-# 2. 启动后端（自动 serve 前端静态文件）
-bash scripts/start_backend_selfhosted.sh --daemon
-
-# 日志查看
-tail -f /tmp/staticflow-backend.log
-
-# 前端代码改动后需要重新构建 + 重启后端（后端启动时缓存 index.html）
-bash scripts/build_frontend_selfhosted.sh
-bash scripts/start_backend_selfhosted.sh --daemon
-```
-
-### 模式 B：本地开发（trunk 热重载）
-
-前端由 trunk dev server 提供，支持热重载；trunk 自动代理 `/api` 到后端。
-
-```bash
-# 1. 启动后端
-bash scripts/start_backend_selfhosted.sh
-
-# 2. 启动前端（trunk serve，自动代理 /api -> localhost:39080）
-bash scripts/start_frontend_with_api.sh --open
-```
-
-后端: `http://127.0.0.1:39080` | 前端: `http://127.0.0.1:38080`
-
-### 模式 C：GitHub Pages（纯前端）
-
-前端部署到 GitHub Pages，API 通过 pb-mapper 隧道访问本地后端。
-CI 自动构建，`STATICFLOW_API_BASE` 由 GitHub repo variables 配置。
-
-```text
-浏览器 -> https://acking-you.github.io (GitHub Pages 静态文件)
-       -> fetch(STATICFLOW_API_BASE/api/...) -> pb-mapper -> 本地 backend
-```
-
-参考配置：
-- 自托管 Caddy：云端 `/etc/caddy/Caddyfile`
-- GitHub Pages CI：`.github/workflows/deploy.yml`
-- 旧版 Nginx 配置：`deployment-examples/`
-
-## LLM Access / Kiro Access
-
-自托管模式下，StaticFlow 现在不只是内容站点，也会对外暴露两条公开接入面：
-
-- `/llm-access`：Codex 接入页，底层走 OpenAI-compatible 的 `/api/llm-gateway/v1`
-- `/kiro-access`：Kiro 接入页，底层走 Anthropic-compatible 的 `/api/kiro-gateway`
-
-当前实现的共性：
-
-- 两条接入线都由 StaticFlow backend 代理，不直接暴露上游真实账号
-- 上游代理解析统一走共享的 provider 级代理注册表
-- key、runtime config、proxy config、proxy binding、usage event 都统一落在 LLM gateway 存储里
-- 详细运行时实现、代理优先级、账号路由、缓存刷新和排障路径见 [docs/llm-access-and-kiro-gateway-implementation.md](./docs/llm-access-and-kiro-gateway-implementation.md)
-
-如果你只关心 Codex 接入，公开页会额外给出：
-
-- 已带 `/v1` 的 OpenAI-compatible Base URL
-- 可公开分发的 API key
-- 现成的 Codex provider 配置片段
-- `auth.json` 备用写法和 `curl` / Python 示例
-
-推荐的 Codex provider 配置如下：
-
-```toml
-model_provider = "staticflow"
-
-[model_providers.staticflow]
-name = "OpenAI"
-base_url = "https://your-host/api/llm-gateway/v1"
-wire_api = "responses"
-requires_openai_auth = true
-supports_websockets = false
-```
-
-这个配置的目的，是让 Codex 保持在远端 `/responses` 和 `/responses/compact` 路径上工作，避免退回本地兼容路径。
+- Rust stable 工具链（edition 2021）
+- `wasm32-unknown-unknown` target：`rustup target add wasm32-unknown-unknown`
+- [Trunk](https://trunkrs.dev/) 前端构建：`cargo install trunk`
+- Git 子模块：`git submodule update --init --recursive`
+- 建议：将 `CARGO_TARGET_DIR` 设置到大容量挂载点，避免根文件系统空间不足
 
 ## 快速开始
 
 ```bash
-# 前置依赖
-rustup target add wasm32-unknown-unknown
-cargo install trunk
+# 1. 克隆并初始化子模块
+git clone https://github.com/acking-you/static-flow.git
+cd static-flow
+git submodule update --init --recursive
 
-# 编译二进制
-make bin-all
+# 2. 设置构建产物目录（根据实际环境调整路径）
+export CARGO_TARGET_DIR=/path/to/large-mount/cargo-target/static_flow
 
-# 初始化 LanceDB
-cd cli
-../target/release/sf-cli init --db-path ../data/lancedb
+# 3. 编译后端 + CLI
+cargo build --release -p static-flow-backend -p sf-cli --jobs 8
 
-# --- 自托管模式（推荐） ---
-cd ..
+# 4. 初始化 LanceDB 表结构
+$CARGO_TARGET_DIR/release/sf-cli init --db-path ./data/lancedb
+
+# 5. 构建前端（自托管模式，同源 API）
 bash scripts/build_frontend_selfhosted.sh
-bash scripts/start_backend_selfhosted.sh --daemon
 
-# --- 本地开发模式 ---
-cd ..
-bash scripts/start_backend_selfhosted.sh          # 前台启动后端
-bash scripts/start_frontend_with_api.sh --open     # 另一个终端，trunk 热重载
+# 6. 启动后端（同时 serve 前端静态文件 + API）
+bash scripts/start_backend_selfhosted.sh --daemon
 ```
 
-## CLI 命令
+本地开发（热重载）：
 
 ```bash
-cd cli
-
-# 编译 CLI 二进制
-make bin-cli
-
-# 一键跑完整 CLI 回归测试（docs + images + CRUD + API）
-cd ..
-./scripts/test_cli_e2e.sh
-# 或：BUILD_PROFILE=release ./scripts/test_cli_e2e.sh
-cd cli
-
-# 初始化 LanceDB 表结构
-../target/release/sf-cli init --db-path ../data/lancedb
-
-# 手动重跑所有应建索引（适合批量导入后）
-# - articles.content（全文索引）
-# - articles.vector_en / articles.vector_zh（向量索引）
-# - images.vector（向量索引）
-# - taxonomies 表用于分类/标签元数据（无向量索引）
-# - article_views 为 backend 运行时统计表（CLI 无需管理其索引）
-../target/release/sf-cli ensure-indexes --db-path ../data/lancedb
-
-# write-article / write-images / sync-notes 默认会自动执行 index-only optimize
-# 用于把新写入数据纳入索引覆盖；批量流水线可通过 --no-auto-optimize 关闭
-
-# 写入单篇文章
-../target/release/sf-cli write-article \
-  --db-path ../data/lancedb \
-  --file ../content/post-001.md \
-  --date "2026-02-12" \
-  --summary "文章摘要" \
-  --tags "rust,wasm" \
-  --category "Tech" \
-  --category-description "Engineering notes about Rust + WASM" \
-  --content-en-file ../tmp/content_en.md \
-  --summary-zh-file ../tmp/detailed_summary_zh.md \
-  --summary-en-file ../tmp/detailed_summary_en.md
-
-# 也可写在 markdown frontmatter 中
-# category_description: "Rust 与 WASM 的工程实践"
-# date: "2026-02-12"
-# content_en: |
-# detailed_summary:
-#   zh: |
-#   en: |
-# 若两者同时提供，以 CLI --date 为准。
-# `--summary-zh-file` 与 `--summary-en-file` 必须成对提供。
-
-# 批量写入图片
-../target/release/sf-cli write-images \
-  --db-path ../data/lancedb \
-  --dir ../content/images \
-  --recursive \
-  --generate-thumbnail
-
-# 缩略图实现细节
-# - 仅在 --generate-thumbnail 时生成，尺寸由 --thumbnail-size 控制（默认 256）
-# - 缩略图统一存为 PNG 二进制到 images.thumbnail
-# - 读取 /api/images/:id-or-filename?thumb=true 时，thumbnail 为空会自动回退原图 data
-
-# 同步本地笔记目录（markdown + 图片）
-# - 自动把 markdown 中引用的本地图片写入 images 表
-# - 自动把 markdown 图片链接改写为 images/<sha256_id>
-# - 自动 upsert 文章到 articles 表
-# - 自动 upsert 分类/标签元数据到 taxonomies 表
-../target/release/sf-cli sync-notes \
-  --db-path ../data/lancedb \
-  --dir ../content \
-  --recursive \
-  --generate-thumbnail
-
-# 查询验证
-../target/release/sf-cli query --db-path ../data/lancedb --table articles --limit 10
-../target/release/sf-cli query --db-path ../data/lancedb --table articles --limit 1 --format vertical
-
-# 数据库风格管理（增删改查 + 索引）
-../target/release/sf-cli db --db-path ../data/lancedb list-tables
-../target/release/sf-cli db --db-path ../data/lancedb describe-table articles
-../target/release/sf-cli db --db-path ../data/lancedb query-rows articles --where "category='Tech'" --columns id,title,date --limit 5
-../target/release/sf-cli db --db-path ../data/lancedb query-rows articles --limit 1 --format vertical
-../target/release/sf-cli db --db-path ../data/lancedb count-rows articles --where "vector_en IS NOT NULL"
-../target/release/sf-cli db --db-path ../data/lancedb update-rows articles --set "category='Notes'" --where "id='post-001'"
-../target/release/sf-cli db --db-path ../data/lancedb delete-rows articles --where "id='draft-001'"
-../target/release/sf-cli db --db-path ../data/lancedb list-indexes articles --with-stats
-../target/release/sf-cli db --db-path ../data/lancedb ensure-indexes
-../target/release/sf-cli db --db-path ../data/lancedb optimize articles
-../target/release/sf-cli db --db-path ../data/lancedb optimize images
-# 一键立即清理孤儿文件（仅 prune，不做全量重写）
-../target/release/sf-cli db --db-path ../data/lancedb cleanup-orphans --table images
-# 对全部清理目标表统一清理孤儿文件（含 article_views；若不存在会自动跳过）
-../target/release/sf-cli db --db-path ../data/lancedb cleanup-orphans
-
-# 核心表结构（sf-cli 管理）
-# - articles：文章内容/元数据 + 向量
-# - images：图片二进制 + 向量
-# - taxonomies：分类/标签元数据（`kind`、`key`、`name`、`description`）
-# 运行时统计表（backend 管理）
-# - article_views：浏览事件与日/小时分桶（首次调用 `/api/articles/:id/view` 自动创建）
-
-# 与 backend 同款 API 调试命令
-../target/release/sf-cli api --db-path ../data/lancedb list-articles --category "Tech"
-../target/release/sf-cli api --db-path ../data/lancedb get-article frontend-architecture
-../target/release/sf-cli api --db-path ../data/lancedb search --q "staticflow"
-../target/release/sf-cli api --db-path ../data/lancedb semantic-search --q "前端 架构"
-../target/release/sf-cli api --db-path ../data/lancedb related-articles frontend-architecture
-../target/release/sf-cli api --db-path ../data/lancedb list-tags
-../target/release/sf-cli api --db-path ../data/lancedb list-categories
-../target/release/sf-cli api --db-path ../data/lancedb list-images
-../target/release/sf-cli api --db-path ../data/lancedb search-images --id <image_id>
-../target/release/sf-cli api --db-path ../data/lancedb get-image <image_id_or_filename> --thumb --out ./tmp-thumb.bin
+bash scripts/start_backend_selfhosted.sh            # 终端 1：后端
+bash scripts/start_frontend_with_api.sh --open       # 终端 2：trunk 开发服务器
 ```
 
-## API 列表
+后端：`http://127.0.0.1:39080` | 前端开发：`http://127.0.0.1:38080`
+
+## 部署模式
+
+- **自托管（生产）**：后端提供 API + 前端静态文件，运行在 Pingora gateway 后面。
+  当前生产使用 GCP Caddy 做 TLS + pb-mapper 做云端到本地的中继。
+  详见 [docs/ops-runbook.md](./docs/ops-runbook.md)。
+- **本地开发**：Trunk 开发服务器热重载，自动代理 `/api` 到后端。
+- **GitHub Pages**：纯前端静态部署，API 通过 `STATICFLOW_API_BASE` 配置。
+  CI：`.github/workflows/deploy.yml`。
+
+## CLI 概览
+
+`sf-cli` 提供 LanceDB 操作：写入文章/图片、同步笔记、查询/搜索、管理索引、
+优化表、调试 API 响应。
+
+```bash
+# 同步本地笔记目录（markdown + 图片 → LanceDB）
+sf-cli sync-notes --db-path ./data/lancedb --dir ./content --recursive --generate-thumbnail
+
+# 查询文章
+sf-cli query --db-path ./data/lancedb --table articles --limit 10
+
+# 数据库管理
+sf-cli db --db-path ./data/lancedb list-tables
+sf-cli db --db-path ./data/lancedb optimize articles
+
+# API 兼容调试命令
+sf-cli api --db-path ./data/lancedb search --q "staticflow"
+sf-cli api --db-path ./data/lancedb semantic-search --q "前端 架构"
+```
+
+完整 CLI 用法：[docs/cli-user-guide.zh.md](./docs/cli-user-guide.zh.md)
+
+## API 概览
+
+后端默认监听 `127.0.0.1:39080`（生产环境在 Pingora `39180` 后面）。
 
 | 端点 | 说明 |
 |------|------|
 | `GET /api/articles` | 文章列表（支持 tag/category 过滤） |
 | `GET /api/articles/:id` | 文章详情 |
-| `POST /api/articles/:id/view` | 记录文章浏览（默认同一文章+客户端 60 秒去重） |
-| `GET /api/articles/:id/view-trend` | 文章浏览趋势（按天/按小时，按 Asia/Shanghai 分桶） |
+| `GET /api/articles/:id/raw/:lang` | 原始 Markdown（`lang=zh\|en`） |
+| `POST /api/articles/:id/view` | 记录浏览（60 秒去重） |
+| `GET /api/articles/:id/view-trend` | 浏览趋势（按天/小时，Asia/Shanghai） |
 | `GET /api/articles/:id/related` | 相关文章（向量相似） |
+| `POST /api/comments/submit` | 提交评论（限流） |
+| `GET /api/comments/list` | 文章公开评论列表 |
 | `GET /api/search?q=` | 全文搜索 |
-| `GET /api/semantic-search?q=` | 语义搜索（向量，含跨语言回退与语义片段高亮） |
+| `GET /api/semantic-search?q=` | 语义搜索（向量，跨语言） |
 | `GET /api/images` | 图片列表 |
-| `GET /api/images/:id-or-filename` | 从 LanceDB 读取图片二进制（支持 `?thumb=true`，无缩略图则回退原图） |
+| `GET /api/images/:id` | 图片二进制（支持 `?thumb=true`） |
 | `GET /api/image-search?id=` | 以图搜图 |
 | `GET /api/tags` | 标签列表 |
 | `GET /api/categories` | 分类列表 |
 
-> 可观测性：每个 backend 响应都会返回 `x-request-id` 与 `x-trace-id`，并且 backend/shared 的请求内日志会带同一组 ID，便于串联排障。
+每个响应包含 `x-request-id` 和 `x-trace-id` 用于关联追踪。
 
-> 查询路径可观测：日志会输出 `query/path/fastest_path/is_fastest/reason/rows/elapsed_ms`，可直接判断是否命中索引或发生回退。
-
-> 语义高亮模式：`/api/semantic-search` 默认走快速高亮；追加 `&enhanced_highlight=true` 可启用高精度片段重排（更慢）。
-
-> 浏览统计：建议在文章详情页加载时调用 `/api/articles/:id/view`；后端默认按“文章 + 客户端指纹”做 60 秒去重（可通过本地 admin 接口 `/admin/view-analytics-config` 调整），并按 `Asia/Shanghai` 维护日/小时趋势分桶。
-
-> 检索说明：若你更新了代码但仍看到“英文语义检索无结果”，请重新编译二进制（`cargo build --release -p sf-cli -p static-flow-backend`），旧二进制不会包含向量列回退逻辑。
-
-## 关键环境变量
-
-后端（由 `scripts/start_backend_selfhosted.sh` 自动设置）：
-- `DB_ROOT`（默认 `/mnt/wsl/data4tb/static-flow-data`，自动解析 content/comments/music 三个 DB）
-- `PORT`（默认 `39080`）
-- `HOST`（默认 `127.0.0.1`）
-- `SITE_BASE_URL`（默认 `https://ackingliu.top`，用于 SEO 注入）
-- `FRONTEND_DIST_DIR`（默认 `../frontend/dist`，自托管模式的静态文件目录）
-- `RUST_ENV`（`development` 或 `production`）
-- `ALLOWED_ORIGINS`（生产可选，逗号分隔 CORS 白名单）
-
-前端构建时：
-- `STATICFLOW_API_BASE`
-  - 自托管模式：`/api`（由 `build_frontend_selfhosted.sh` 设置）
-  - GitHub Pages：绝对 URL（由 CI workflow 的 repo variables 设置）
-  - 本地开发：`http://127.0.0.1:39080/api`（由 `start_frontend_with_api.sh` 设置）
-
-## 开发命令
+## 开发
 
 ```bash
-# Workspace
-cargo build --workspace
-cargo test --workspace
-cargo fmt --all
-cargo clippy --workspace -- -D warnings
+export CARGO_TARGET_DIR=/path/to/large-mount/cargo-target/static_flow
 
-# Frontend（自托管构建）
+# 编译
+cargo build -p static-flow-backend -p sf-cli --jobs 8
+
+# 测试
+cargo test -p static-flow-shared -p static-flow-backend --jobs 8
+
+# Lint（提交前修复所有警告）
+cargo clippy -p static-flow-shared -p static-flow-backend --jobs 8 -- -D warnings
+
+# 格式化（仅改动文件 — 不要在 workspace 根目录运行 cargo fmt --all）
+rustfmt path/to/changed_file.rs
+
+# 前端自托管构建
 bash scripts/build_frontend_selfhosted.sh
 
-# Frontend（trunk 热重载开发）
+# 前端热重载开发
 bash scripts/start_frontend_with_api.sh --open
 
-# Backend
-make bin-backend
-bash scripts/start_backend_selfhosted.sh           # 前台
-bash scripts/start_backend_selfhosted.sh --daemon   # 后台（日志: /tmp/staticflow-backend.log）
+# CLI E2E 测试
+./scripts/test_cli_e2e.sh
 ```
+
+关键环境变量：
+- `DB_ROOT`：LanceDB 数据根目录（默认 `/mnt/wsl/data4tb/static-flow-data`）
+- `PORT`：后端端口（默认 `39080`）
+- `STATICFLOW_API_BASE`：前端构建时 API 基址（自托管用 `/api`）
+- `STATICFLOW_LLM_ACCESS_MODE=external`：将 LLM 路由代理到独立服务
+
+## 数据仓库（Hugging Face）
+
+运行时数据存储在两个 Hugging Face 数据集仓库和一个本地音乐库中：
+- Content DB：[LB7666/my_lancedb_data](https://huggingface.co/datasets/LB7666/my_lancedb_data)
+- Comments DB：[LB7666/static-flow-comments](https://huggingface.co/datasets/LB7666/static-flow-comments)
+- Music DB：仅本地，`/mnt/wsl/data4tb/static-flow-data/lancedb-music`
 
 ## License
 

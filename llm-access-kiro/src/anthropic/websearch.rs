@@ -221,6 +221,8 @@ pub fn generate_websearch_events(
     output_tokens: i32,
 ) -> Vec<SseEvent> {
     let message_id = format!("msg_{}", &Uuid::new_v4().simple().to_string()[..24]);
+    let mut final_usage = anthropic_usage_json(input_tokens, output_tokens, 0);
+    final_usage["server_tool_use"] = json!({"web_search_requests": 1});
     let mut events = vec![SseEvent::new(
         "message_start",
         json!({
@@ -232,7 +234,7 @@ pub fn generate_websearch_events(
                 "model": model,
                 "content": [],
                 "stop_reason": null,
-                "usage": anthropic_usage_json(input_tokens, 0, 0)
+                "usage": anthropic_usage_json(input_tokens, 3, 0)
             }
         }),
     )];
@@ -268,10 +270,31 @@ pub fn generate_websearch_events(
                 "id": tool_use_id,
                 "type": "server_tool_use",
                 "name": "web_search",
-                "input": {"query": query}
+                "input": {}
             }
         }),
     ));
+    events.push(SseEvent::new(
+        "content_block_delta",
+        json!({
+            "type": "content_block_delta",
+            "index": 1,
+            "delta": {"type": "input_json_delta", "partial_json": ""}
+        }),
+    ));
+    let input_json = serde_json::to_string(&json!({"query": query}))
+        .expect("web search query input should serialize");
+    for chunk in input_json.chars().collect::<Vec<_>>().chunks(24) {
+        let partial_json: String = chunk.iter().collect();
+        events.push(SseEvent::new(
+            "content_block_delta",
+            json!({
+                "type": "content_block_delta",
+                "index": 1,
+                "delta": {"type": "input_json_delta", "partial_json": partial_json}
+            }),
+        ));
+    }
     events.push(SseEvent::new(
         "content_block_stop",
         json!({"type": "content_block_stop", "index": 1}),
@@ -284,6 +307,7 @@ pub fn generate_websearch_events(
             "index": 2,
             "content_block": {
                 "type": "web_search_tool_result",
+                "tool_use_id": tool_use_id,
                 "content": create_search_result_blocks(search_results)
             }
         }),
@@ -320,13 +344,8 @@ pub fn generate_websearch_events(
         "message_delta",
         json!({
             "type": "message_delta",
-            "delta": {"stop_reason": "end_turn"},
-            "usage": {
-                "output_tokens": output_tokens,
-                "server_tool_use": {
-                    "web_search_requests": 1
-                }
-            }
+            "delta": {"stop_reason": "end_turn", "stop_sequence": null},
+            "usage": final_usage
         }),
     ));
     events.push(SseEvent::new("message_stop", json!({"type": "message_stop"})));
@@ -352,6 +371,7 @@ pub fn create_non_stream_content_blocks(
         }),
         json!({
             "type": "web_search_tool_result",
+            "tool_use_id": tool_use_id,
             "content": create_search_result_blocks(search_results.as_ref())
         }),
         json!({
@@ -503,6 +523,51 @@ mod tests {
         );
         req._tool_choice = Some(serde_json::json!({"type": "tool", "name": "web_search"}));
         assert!(should_route_mcp_web_search(&req));
+    }
+
+    #[test]
+    fn websearch_stream_uses_server_tool_input_deltas_and_result_link() {
+        let events = generate_websearch_events(
+            "claude-opus-4-7",
+            "latest AI news today",
+            "srvtoolu_test",
+            None,
+            10,
+            "summary",
+            3,
+        );
+        let tool_start = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "server_tool_use"
+            })
+            .expect("server_tool_use block should start");
+        assert_eq!(tool_start.data["content_block"]["input"], serde_json::json!({}));
+        assert!(events.iter().any(|event| {
+            event.event == "content_block_delta"
+                && event.data["index"] == serde_json::json!(1)
+                && event.data["delta"]["type"] == "input_json_delta"
+                && event.data["delta"]["partial_json"]
+                    .as_str()
+                    .is_some_and(|partial| partial.contains("latest AI"))
+        }));
+
+        let result_start = events
+            .iter()
+            .find(|event| {
+                event.event == "content_block_start"
+                    && event.data["content_block"]["type"] == "web_search_tool_result"
+            })
+            .expect("web_search_tool_result block should start");
+        assert_eq!(result_start.data["content_block"]["tool_use_id"], "srvtoolu_test");
+
+        let message_delta = events
+            .iter()
+            .find(|event| event.event == "message_delta")
+            .expect("message_delta should be emitted");
+        assert_eq!(message_delta.data["delta"]["stop_sequence"], serde_json::json!(null));
+        assert_eq!(message_delta.data["usage"]["server_tool_use"]["web_search_requests"], 1);
     }
 
     #[test]

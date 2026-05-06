@@ -348,11 +348,14 @@ fn push_normalization_event(
 fn normalize_message(
     message: &super::types::Message,
     message_index: usize,
+    drop_empty_user_noop: bool,
     events: &mut Vec<NormalizationEvent>,
 ) -> Result<Option<super::types::Message>, ConversionError> {
     match &message.content {
         serde_json::Value::String(text) => {
-            if message.role == "assistant" && text.trim().is_empty() {
+            if text.trim().is_empty()
+                && (message.role == "assistant" || (message.role == "user" && drop_empty_user_noop))
+            {
                 push_normalization_event(
                     events,
                     message_index,
@@ -460,10 +463,14 @@ fn normalize_message(
                 return Ok(Some(message.clone()));
             }
 
-            // Keep user-only whitespace turns intact so the explicit
+            // Keep current-turn user whitespace intact so the explicit
             // request-validation toggle still controls whether those payloads
-            // are accepted. Only assistant-side no-op turns are removed here.
-            if retained_items.is_empty() && message.role != "assistant" {
+            // are accepted. History-side no-op user turns are removed because
+            // they cannot add context and Kiro rejects empty history entries.
+            if retained_items.is_empty()
+                && message.role != "assistant"
+                && !(message.role == "user" && drop_empty_user_noop)
+            {
                 return Ok(Some(message.clone()));
             }
 
@@ -1018,9 +1025,11 @@ pub fn normalize_request(req: &MessagesRequest) -> Result<NormalizedRequest, Con
         .iter()
         .rposition(|message| message.role == "user")
         .ok_or_else(|| no_user_message_error(&req.messages))?;
+    let current_user_start = trailing_user_message_start(&req.messages[..last_user_idx + 1])?;
     let mut events = Vec::new();
     let mut normalized_messages = Vec::with_capacity(last_user_idx + 1);
     let mut message_index_map = Vec::with_capacity(last_user_idx + 1);
+    let mut drop_assistant_after_empty_user_noop = false;
 
     for (message_index, message) in req.messages.iter().enumerate() {
         if message_index > last_user_idx {
@@ -1036,9 +1045,35 @@ pub fn normalize_request(req: &MessagesRequest) -> Result<NormalizedRequest, Con
             continue;
         }
 
-        if let Some(normalized) = normalize_message(message, message_index, &mut events)? {
-            message_index_map.push(message_index);
-            normalized_messages.push(normalized);
+        if drop_assistant_after_empty_user_noop {
+            if message.role == "assistant" {
+                push_normalization_event(
+                    &mut events,
+                    message_index,
+                    &message.role,
+                    None,
+                    None,
+                    "drop_message",
+                    "assistant_after_empty_user_noop",
+                );
+                continue;
+            }
+            if message.role == "user" {
+                drop_assistant_after_empty_user_noop = false;
+            }
+        }
+
+        let drop_empty_user_noop = message.role == "user" && message_index < current_user_start;
+        match normalize_message(message, message_index, drop_empty_user_noop, &mut events)? {
+            Some(normalized) => {
+                message_index_map.push(message_index);
+                normalized_messages.push(normalized);
+            },
+            None => {
+                if drop_empty_user_noop {
+                    drop_assistant_after_empty_user_noop = true;
+                }
+            },
         }
     }
 
@@ -2145,6 +2180,13 @@ fn normalize_claude_code_model_identity(content: String, requested_model: &str) 
     let replacement = format!(
         "You are powered by the model named {model_name}. The exact model ID is {model_id}."
     );
+    let has_existing_model_identity = content.lines().any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.contains("You are powered by the model named")
+            && trimmed.contains("The exact model ID is")
+    });
+    let mut replaced_existing = false;
+    let mut inserted_after_identity = false;
     content
         .lines()
         .map(|line| {
@@ -2152,8 +2194,17 @@ fn normalize_claude_code_model_identity(content: String, requested_model: &str) 
             if trimmed.contains("You are powered by the model named")
                 && trimmed.contains("The exact model ID is")
             {
+                replaced_existing = true;
                 let indent = &line[..line.len() - trimmed.len()];
                 format!("{indent}{replacement}")
+            } else if !has_existing_model_identity
+                && !replaced_existing
+                && !inserted_after_identity
+                && (trimmed == CLAUDE_CODE_CLI_SYSTEM_IDENTITY_LINE
+                    || trimmed == CLAUDE_AGENT_SDK_SYSTEM_IDENTITY_LINE)
+            {
+                inserted_after_identity = true;
+                format!("{line}\n{replacement}")
             } else {
                 line.to_string()
             }
@@ -2703,6 +2754,105 @@ mod tests {
                 && event.action == "drop_message"
                 && event.reason == "message_became_empty_after_normalization"
         }));
+    }
+
+    #[test]
+    fn normalize_request_drops_empty_history_user_error_pairs() {
+        let req = base_request(vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!(""),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!(
+                    r#"{"error":{"message":"用户额度不足","type":"new_api_error"}}"#
+                ),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("  "),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!(
+                    r#"{"error":{"message":"message 0 content must not be empty","type":"invalid_request_error"}}"#
+                ),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("解释一下 Kiro API"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("Kiro API 是一组兼容接口。"),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("再用一句话说明"),
+            },
+        ]);
+
+        let normalized = normalize_request(&req).expect("normalization should succeed");
+
+        assert_eq!(normalized.request.messages.len(), 3);
+        assert_eq!(normalized.message_index_map, vec![4, 5, 6]);
+        assert_eq!(normalized.request.messages[0].content, serde_json::json!("解释一下 Kiro API"));
+        assert_eq!(
+            normalized.request.messages[1].content,
+            serde_json::json!("Kiro API 是一组兼容接口。")
+        );
+        assert_eq!(normalized.request.messages[2].content, serde_json::json!("再用一句话说明"));
+        assert!(normalized.normalization_events.iter().any(|event| {
+            event.message_index == 0
+                && event.role == "user"
+                && event.action == "drop_message"
+                && event.reason == "whitespace_only_string_message"
+        }));
+        assert!(normalized.normalization_events.iter().any(|event| {
+            event.message_index == 1
+                && event.role == "assistant"
+                && event.action == "drop_message"
+                && event.reason == "assistant_after_empty_user_noop"
+        }));
+        assert!(normalized.normalization_events.iter().any(|event| {
+            event.message_index == 3
+                && event.role == "assistant"
+                && event.action == "drop_message"
+                && event.reason == "assistant_after_empty_user_noop"
+        }));
+
+        let result = convert_request(&req).expect("conversion should succeed");
+        assert_eq!(result.conversation_state.history.len(), 2);
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .content,
+            "再用一句话说明"
+        );
+    }
+
+    #[test]
+    fn convert_request_still_rejects_current_empty_user_message() {
+        let req = base_request(vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("解释一下 Kiro API"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("Kiro API 是一组兼容接口。"),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!(""),
+            },
+        ]);
+
+        let err = convert_request(&req).expect_err("current empty user should reject");
+        assert_eq!(err.to_string(), "message 2 content must not be empty");
     }
 
     #[test]
@@ -3257,6 +3407,29 @@ mod tests {
             "You are powered by the model named Opus 4.6. The exact model ID is claude-opus-4-6."
         ));
         assert!(!system_prefix.contains("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn convert_request_injects_missing_claude_code_model_identity() {
+        let mut req = base_request(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!("Hello"),
+        }]);
+        req.model = "claude-opus-4-7".to_string();
+        req.system = Some(vec![SystemMessage {
+            text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+        }]);
+
+        let result = convert_request(&req).expect("conversion should succeed");
+        let system_prefix = match &result.conversation_state.history[0] {
+            Message::User(message) => &message.user_input_message.content,
+            other => panic!("expected injected system user message, got {other:?}"),
+        };
+
+        assert!(system_prefix.contains("You are Claude Code, Anthropic's official CLI"));
+        assert!(system_prefix.contains(
+            "You are powered by the model named Opus 4.7. The exact model ID is claude-opus-4-7."
+        ));
     }
 
     #[test]

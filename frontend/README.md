@@ -7,7 +7,7 @@ This crate contains the Yew-based client for the Static Flow experience. It rend
 - **Rust** stable toolchain (1.75+ recommended)
 - **wasm32-unknown-unknown** target: `rustup target add wasm32-unknown-unknown`
 - **Trunk** CLI for bundling and serving (`cargo install trunk`)
-- Optional: a local API on `http://localhost:3000` if you want the proxy in `Trunk.toml` to forward requests during development
+- Optional: a local backend on `http://127.0.0.1:39080` for API proxy during development
 
 ## Common Commands
 
@@ -16,10 +16,11 @@ This crate contains the Yew-based client for the Static Flow experience. It rend
 trunk serve
 
 # Create an optimized production bundle in dist/
+# For public deployment, use scripts/build_frontend_selfhosted.sh instead
 trunk build --release
 
-# Format Rust code
-cargo fmt
+# Format only changed files (do not run cargo fmt at workspace root)
+rustfmt src/changed_file.rs
 
 # Lint with Clippy (fail on warnings by default)
 cargo clippy -- -D warnings
@@ -50,9 +51,10 @@ frontend/
 
 ## Workflow & Notes
 
-1. Run `trunk serve` in watch mode for local development. The proxy defined in `Trunk.toml` can forward API calls to a backend at `localhost:3000` so the UI behaves closer to production.
-2. Keep `cargo fmt` and `cargo clippy -- -D warnings` clean before pushing to ensure CI parity.
+1. Run `trunk serve` in watch mode for local development. The proxy defined in `Trunk.toml` forwards API calls to the backend at `127.0.0.1:39080`.
+2. Format only files you changed with `rustfmt`. Do not run `cargo fmt --all` at the workspace root — it would reformat `deps/lance` and `deps/lancedb` submodules.
 3. Static assets go in `static/` and will be copied directly into the final `dist/` bundle.
+4. For production self-hosted builds, always use `scripts/build_frontend_selfhosted.sh` (sets `STATICFLOW_API_BASE=/api`). Bare `trunk build --release` falls back to `localhost:3000/api`.
 
 ## Current Progress & TODO
 

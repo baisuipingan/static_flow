@@ -278,7 +278,9 @@ pub fn is_llm_access_path(path: &str) -> bool {
 
 /// Return the provider/protocol contract for provider data-plane routes.
 pub fn provider_route_requirement(path: &str) -> Option<ProviderRouteRequirement> {
-    if path == "/v1/messages"
+    if path == "/v1/models" {
+        None
+    } else if path == "/v1/messages"
         || path == "/v1/messages/count_tokens"
         || path.starts_with("/cc/v1/")
         || path.starts_with("/api/kiro-gateway/v1/")
@@ -349,6 +351,7 @@ mod tests {
         };
 
         assert_eq!(provider_route_requirement("/v1/responses"), Some(codex));
+        assert_eq!(provider_route_requirement("/v1/models"), None);
         assert_eq!(provider_route_requirement("/v1/messages"), Some(kiro));
         assert_eq!(provider_route_requirement("/v1/messages/count_tokens"), Some(kiro));
         assert_eq!(provider_route_requirement("/api/llm-gateway/v1/responses"), Some(codex));

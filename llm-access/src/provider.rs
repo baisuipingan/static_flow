@@ -54,6 +54,7 @@ use llm_access_kiro::{
             anthropic_usage_json, build_inline_thinking_content_blocks, resolve_input_tokens,
             BufferedStreamContext, StreamContext,
         },
+        supported_models_response,
         types::{MessagesRequest, OutputConfig, Thinking},
         websearch::{self, McpResponse},
     },
@@ -2040,6 +2041,12 @@ async fn dispatch_kiro_proxy(
         kiro_request_scheduler,
         ..
     } = deps;
+    if request.uri().path() == "/v1/models" {
+        if request.method() == Method::GET {
+            return axum::Json(supported_models_response()).into_response();
+        }
+        return (StatusCode::METHOD_NOT_ALLOWED, "unsupported kiro method").into_response();
+    }
     let mut usage_meta = ProviderUsageMetadata::from_request_parts(
         request.method(),
         request.uri(),
@@ -3756,12 +3763,20 @@ fn override_kiro_thinking_from_model_name(payload: &mut MessagesRequest) {
     if !model.contains("thinking") {
         return;
     }
-    let is_opus_46 = model.contains("opus") && (model.contains("4-6") || model.contains("4.6"));
+    let is_high_reasoning_opus = model.contains("opus")
+        && (model.contains("4-6")
+            || model.contains("4.6")
+            || model.contains("4-7")
+            || model.contains("4.7"));
     payload.thinking = Some(Thinking {
-        thinking_type: if is_opus_46 { "adaptive".to_string() } else { "enabled".to_string() },
+        thinking_type: if is_high_reasoning_opus {
+            "adaptive".to_string()
+        } else {
+            "enabled".to_string()
+        },
         budget_tokens: 20_000,
     });
-    if is_opus_46 {
+    if is_high_reasoning_opus {
         let output_config = payload.output_config.get_or_insert(OutputConfig {
             effort: None,
             format: None,
@@ -4307,11 +4322,15 @@ pub async fn provider_entry(state: ProviderState, request: Request<Body>) -> Res
 }
 
 fn presented_secret<'a>(headers: &'a HeaderMap, path: &str) -> Option<&'a str> {
-    if is_kiro_data_plane_route(path) {
+    if accepts_anthropic_api_key_header(path) {
         x_api_key_secret(headers).or_else(|| bearer_secret(headers))
     } else {
         bearer_secret(headers)
     }
+}
+
+fn accepts_anthropic_api_key_header(path: &str) -> bool {
+    path == "/v1/models" || is_kiro_data_plane_route(path)
 }
 
 fn is_kiro_data_plane_route(path: &str) -> bool {
@@ -4348,6 +4367,9 @@ fn is_active_key(key: &AuthenticatedKey) -> bool {
 }
 
 fn key_matches_route(key: &AuthenticatedKey, path: &str) -> bool {
+    if path == "/v1/models" {
+        return true;
+    }
     let Some(requirement) = provider_route_requirement(path) else {
         return true;
     };
@@ -6406,6 +6428,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn provider_entry_accepts_x_api_key_on_neutral_models_route() {
+        let dispatcher = Arc::new(CapturingDispatcher::default());
+        let state = test_state_with_dispatcher(dispatcher.clone());
+
+        let response = super::provider_entry(
+            state,
+            request_with_x_api_key_to_path("/v1/models", Some("valid-secret")),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(dispatcher.seen.lock().expect("dispatcher state").as_slice(), &[(
+            "key-1".to_string(),
+            "/v1/models".to_string()
+        )]);
+    }
+
+    #[tokio::test]
     async fn provider_entry_rejects_x_api_key_on_codex_routes() {
         let dispatcher = Arc::new(CapturingDispatcher::default());
         let state = test_state_with_dispatcher(dispatcher.clone());
@@ -6723,6 +6763,36 @@ mod tests {
         assert_eq!(requests[0].authorization.as_deref(), Some("Bearer upstream-token"));
         assert_eq!(requests[0].accept.as_deref(), Some("application/json"));
         assert_eq!(requests[0].user_agent.as_deref(), Some("codex_cli_rs/0.125.0"));
+    }
+
+    #[tokio::test]
+    async fn kiro_models_fetches_local_catalog_on_root_models_route() {
+        let state = super::ProviderState::new(Arc::new(TestStore), empty_route_store());
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("GET")
+                .uri("/v1/models")
+                .header("x-api-key", "valid-secret")
+                .body(Body::empty())
+                .expect("request"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body = serde_json::from_slice::<serde_json::Value>(&body).expect("json response");
+        assert_eq!(body["object"], "list");
+        let ids = body["data"]
+            .as_array()
+            .expect("model data")
+            .iter()
+            .filter_map(|item| item.get("id").and_then(serde_json::Value::as_str))
+            .collect::<Vec<_>>();
+        assert!(ids.contains(&"claude-opus-4-7"));
+        assert!(ids.contains(&"claude-opus-4-7-thinking"));
     }
 
     #[tokio::test]
@@ -7179,6 +7249,14 @@ mod tests {
         assert!(body.contains("event: message_start"));
         assert!(body.contains("hello "));
         assert!(body.contains("back"));
+        let message_delta = body
+            .split("\n\n")
+            .find(|frame| frame.starts_with("event: message_delta"))
+            .expect("message_delta frame");
+        assert!(message_delta.contains(r#""input_tokens":1"#));
+        assert!(message_delta.contains(r#""output_tokens":3"#));
+        assert!(message_delta.contains(r#""cache_creation_input_tokens":0"#));
+        assert!(message_delta.contains(r#""cache_read_input_tokens":0"#));
         assert!(body.contains("event: message_stop"));
     }
 

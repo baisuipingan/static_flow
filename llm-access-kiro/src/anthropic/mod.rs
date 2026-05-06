@@ -8,7 +8,7 @@ pub mod websearch;
 use self::types::{CountTokensRequest, CountTokensResponse, Model, ModelsResponse};
 use crate::token;
 
-const SUPPORTED_MODEL_CATALOG: [(&str, &str, i64); 10] = [
+const SUPPORTED_MODEL_CATALOG: [(&str, &str, i64); 12] = [
     ("claude-sonnet-4-5-20250929", "Claude Sonnet 4.5", 1727568000),
     ("claude-sonnet-4-5-20250929-thinking", "Claude Sonnet 4.5 (Thinking)", 1727568000),
     ("claude-opus-4-5-20251101", "Claude Opus 4.5", 1730419200),
@@ -17,6 +17,8 @@ const SUPPORTED_MODEL_CATALOG: [(&str, &str, i64); 10] = [
     ("claude-sonnet-4-6-thinking", "Claude Sonnet 4.6 (Thinking)", 1770314400),
     ("claude-opus-4-6", "Claude Opus 4.6", 1770314400),
     ("claude-opus-4-6-thinking", "Claude Opus 4.6 (Thinking)", 1770314400),
+    ("claude-opus-4-7", "Claude Opus 4.7", 1770314400),
+    ("claude-opus-4-7-thinking", "Claude Opus 4.7 (Thinking)", 1770314400),
     ("claude-haiku-4-5-20251001", "Claude Haiku 4.5", 1727740800),
     ("claude-haiku-4-5-20251001-thinking", "Claude Haiku 4.5 (Thinking)", 1727740800),
 ];
