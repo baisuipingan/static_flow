@@ -6136,7 +6136,7 @@ pub struct SubmitLlmGatewayAccountContributionInput {
     pub id_token: String,
     pub access_token: String,
     pub refresh_token: String,
-    pub requester_email: String,
+    pub requester_email: Option<String>,
     pub contributor_message: String,
     pub github_id: Option<String>,
     pub frontend_page_url: Option<String>,
@@ -6832,12 +6832,22 @@ pub async fn submit_llm_gateway_account_contribution_request(
         let url = format!("{}/llm-gateway/account-contribution-requests/submit", API_BASE);
         let mut body = serde_json::json!({
             "account_name": input.account_name,
-            "id_token": input.id_token,
-            "access_token": input.access_token,
             "refresh_token": input.refresh_token,
-            "requester_email": input.requester_email,
             "contributor_message": input.contributor_message,
         });
+        if !input.id_token.trim().is_empty() {
+            body["id_token"] = serde_json::Value::String(input.id_token.trim().to_string());
+        }
+        if !input.access_token.trim().is_empty() {
+            body["access_token"] = serde_json::Value::String(input.access_token.trim().to_string());
+        }
+        if let Some(email) = input
+            .requester_email
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            body["requester_email"] = serde_json::Value::String(email.trim().to_string());
+        }
         if let Some(account_id) = input
             .account_id
             .as_deref()
@@ -8220,6 +8230,41 @@ pub async fn admin_approve_and_issue_llm_gateway_account_contribution_request(
     }
 }
 
+/// Validate a Codex account contribution by refreshing its auth before import.
+pub async fn admin_validate_llm_gateway_account_contribution_request(
+    request_id: &str,
+    admin_note: Option<&str>,
+) -> Result<AdminLlmGatewayAccountContributionRequestView, String> {
+    #[cfg(feature = "mock")]
+    {
+        let _ = (request_id, admin_note);
+        Err("mock not supported".to_string())
+    }
+
+    #[cfg(not(feature = "mock"))]
+    {
+        let url = format!(
+            "{}/admin/llm-gateway/account-contribution-requests/{}/validate",
+            admin_base(),
+            urlencoding::encode(request_id)
+        );
+        let response = api_post(&url)
+            .json(&serde_json::json!({ "admin_note": admin_note }))
+            .map_err(|e| format!("Serialize error: {:?}", e))?
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {:?}", e))?;
+        if !response.ok() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed: {text}"));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Parse error: {:?}", e))
+    }
+}
+
 /// Reject an account contribution request from the admin UI.
 pub async fn admin_reject_llm_gateway_account_contribution_request(
     request_id: &str,
@@ -8528,10 +8573,11 @@ pub async fn import_admin_llm_gateway_account(
     access_token: &str,
     refresh_token: &str,
     account_id: Option<&str>,
+    auth_json: Option<&str>,
 ) -> Result<AccountSummaryView, String> {
     #[cfg(feature = "mock")]
     {
-        let _ = (id_token, access_token, refresh_token);
+        let _ = (id_token, access_token, refresh_token, auth_json);
         Ok(AccountSummaryView {
             name: name.to_string(),
             status: "active".to_string(),
@@ -8557,16 +8603,34 @@ pub async fn import_admin_llm_gateway_account(
     #[cfg(not(feature = "mock"))]
     {
         let url = format!("{}/admin/llm-gateway/accounts", admin_base());
-        let mut payload = serde_json::json!({
-            "name": name,
-            "tokens": {
-                "id_token": id_token,
-                "access_token": access_token,
-                "refresh_token": refresh_token,
+        let mut payload = serde_json::json!({ "name": name });
+        if let Some(raw_auth_json) = auth_json.map(str::trim).filter(|value| !value.is_empty()) {
+            payload["auth_json"] = serde_json::from_str(raw_auth_json)
+                .map_err(|_| "auth.json 不是合法 JSON".to_string())?;
+        } else {
+            let mut tokens = serde_json::Map::new();
+            if !id_token.trim().is_empty() {
+                tokens.insert(
+                    "id_token".to_string(),
+                    serde_json::Value::String(id_token.trim().to_string()),
+                );
             }
-        });
-        if let Some(aid) = account_id {
-            payload["tokens"]["account_id"] = serde_json::json!(aid);
+            if !access_token.trim().is_empty() {
+                tokens.insert(
+                    "access_token".to_string(),
+                    serde_json::Value::String(access_token.trim().to_string()),
+                );
+            }
+            if !refresh_token.trim().is_empty() {
+                tokens.insert(
+                    "refresh_token".to_string(),
+                    serde_json::Value::String(refresh_token.trim().to_string()),
+                );
+            }
+            if let Some(aid) = account_id.map(str::trim).filter(|value| !value.is_empty()) {
+                tokens.insert("account_id".to_string(), serde_json::Value::String(aid.to_string()));
+            }
+            payload["tokens"] = serde_json::Value::Object(tokens);
         }
         let response = api_post(&url)
             .json(&payload)

@@ -64,6 +64,9 @@ pub const DEFAULT_KIRO_CHANNEL_MAX_CONCURRENCY: u64 = 1;
 pub const DEFAULT_KIRO_CHANNEL_MIN_START_INTERVAL_MS: u64 = 0;
 /// Pending status used by public token/account contribution requests.
 pub const PUBLIC_TOKEN_REQUEST_STATUS_PENDING: &str = "pending";
+/// Validated status used by account contribution requests after auth refresh
+/// checks.
+pub const PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED: &str = "validated";
 /// Submitted status used by public sponsor requests before payment email.
 pub const PUBLIC_SPONSOR_REQUEST_STATUS_SUBMITTED: &str = "submitted";
 /// Active managed key status.
@@ -1617,6 +1620,13 @@ pub trait PublicSubmissionStore: Send + Sync {
         request: NewPublicAccountContributionRequest,
     ) -> anyhow::Result<()>;
 
+    /// Return whether the proposed account contribution name conflicts with an
+    /// existing account or live contribution request.
+    async fn public_account_contribution_name_exists(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<bool>;
+
     /// Persist one public sponsor request.
     async fn create_public_sponsor_request(
         &self,
@@ -1882,6 +1892,27 @@ pub trait AdminReviewQueueStore: Send + Sync {
         action: AdminReviewQueueAction,
     ) -> anyhow::Result<Option<AdminAccountContributionRequest>>;
 
+    /// Mark an account contribution request as validated after a successful
+    /// Codex auth refresh check.
+    async fn validate_admin_account_contribution_request(
+        &self,
+        request_id: &str,
+        account_id: Option<String>,
+        id_token: String,
+        access_token: String,
+        refresh_token: String,
+        action: AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>>;
+
+    /// Mark an account contribution request as failed after validation rejects
+    /// the supplied auth.
+    async fn fail_admin_account_contribution_request(
+        &self,
+        request_id: &str,
+        failure_reason: String,
+        action: AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>>;
+
     /// Reject an account contribution request and disable/remove partial
     /// records.
     async fn reject_admin_account_contribution_request(
@@ -2055,6 +2086,13 @@ impl PublicSubmissionStore for EmptyPublicSubmissionStore {
         _request: NewPublicAccountContributionRequest,
     ) -> anyhow::Result<()> {
         Ok(())
+    }
+
+    async fn public_account_contribution_name_exists(
+        &self,
+        _account_name: &str,
+    ) -> anyhow::Result<bool> {
+        Ok(false)
     }
 
     async fn create_public_sponsor_request(
@@ -2493,6 +2531,27 @@ impl AdminReviewQueueStore for EmptyAdminReviewQueueStore {
         _account: Option<NewAdminCodexAccount>,
         _account_group: Option<NewAdminAccountGroup>,
         _key: Option<NewAdminKey>,
+        _action: AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>> {
+        Ok(None)
+    }
+
+    async fn validate_admin_account_contribution_request(
+        &self,
+        _request_id: &str,
+        _account_id: Option<String>,
+        _id_token: String,
+        _access_token: String,
+        _refresh_token: String,
+        _action: AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>> {
+        Ok(None)
+    }
+
+    async fn fail_admin_account_contribution_request(
+        &self,
+        _request_id: &str,
+        _failure_reason: String,
         _action: AdminReviewQueueAction,
     ) -> anyhow::Result<Option<AdminAccountContributionRequest>> {
         Ok(None)

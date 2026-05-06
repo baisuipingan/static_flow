@@ -17,8 +17,8 @@ use llm_access_core::{
         NewAdminProxyConfig, NewPublicAccountContributionRequest, NewPublicSponsorRequest,
         NewPublicTokenRequest, ProviderCodexAuthUpdate, ProviderCodexRoute, ProviderKiroAuthUpdate,
         ProviderProxyConfig, PublicAccessKey, PublicAccountContribution, PublicSponsor,
-        PublicUsageLookupKey, PUBLIC_SPONSOR_REQUEST_STATUS_SUBMITTED,
-        PUBLIC_TOKEN_REQUEST_STATUS_PENDING,
+        PublicUsageLookupKey, PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED,
+        PUBLIC_SPONSOR_REQUEST_STATUS_SUBMITTED, PUBLIC_TOKEN_REQUEST_STATUS_PENDING,
     },
 };
 use llm_access_kiro::cache_policy::{resolve_effective_kiro_cache_policy, KiroCachePolicy};
@@ -3322,6 +3322,80 @@ impl SqliteControlStore {
         self.get_admin_account_contribution_request(request_id)
     }
 
+    /// Mark an account contribution request as validated after refresh
+    /// succeeds.
+    pub fn validate_admin_account_contribution_request(
+        &self,
+        request_id: &str,
+        account_id: Option<String>,
+        id_token: &str,
+        access_token: &str,
+        refresh_token: &str,
+        action: &AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>> {
+        if self
+            .get_admin_account_contribution_request(request_id)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.conn
+            .execute(
+                "UPDATE llm_account_contribution_requests
+                 SET status = ?2,
+                     account_id = ?3,
+                     id_token = ?4,
+                     access_token = ?5,
+                     refresh_token = ?6,
+                     admin_note = ?7,
+                     failure_reason = NULL,
+                     updated_at_ms = ?8,
+                     processed_at_ms = NULL
+                 WHERE request_id = ?1",
+                params![
+                    request_id,
+                    PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED,
+                    &account_id,
+                    id_token,
+                    access_token,
+                    refresh_token,
+                    &action.admin_note,
+                    action.updated_at_ms,
+                ],
+            )
+            .context("validate admin account contribution request")?;
+        self.get_admin_account_contribution_request(request_id)
+    }
+
+    /// Mark an account contribution request as failed after refresh validation
+    /// rejects the supplied auth.
+    pub fn fail_admin_account_contribution_request(
+        &self,
+        request_id: &str,
+        failure_reason: &str,
+        action: &AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>> {
+        if self
+            .get_admin_account_contribution_request(request_id)?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.conn
+            .execute(
+                "UPDATE llm_account_contribution_requests
+                 SET status = 'failed',
+                     admin_note = ?2,
+                     failure_reason = ?3,
+                     updated_at_ms = ?4,
+                     processed_at_ms = NULL
+                 WHERE request_id = ?1",
+                params![request_id, &action.admin_note, failure_reason, action.updated_at_ms],
+            )
+            .context("fail admin account contribution request")?;
+        self.get_admin_account_contribution_request(request_id)
+    }
+
     /// Reject an account contribution request and clean up partial records.
     pub fn reject_admin_account_contribution_request(
         &self,
@@ -3599,6 +3673,33 @@ impl SqliteControlStore {
             )
             .context("create public account contribution request")?;
         Ok(())
+    }
+
+    /// Return whether a public contribution account name is already taken by a
+    /// configured Codex account or by an active contribution request.
+    pub fn public_account_contribution_name_exists(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<bool> {
+        let exists: i64 = self
+            .conn
+            .query_row(
+                "SELECT EXISTS(
+                    SELECT 1 FROM llm_codex_accounts WHERE account_name = ?1
+                    UNION ALL
+                    SELECT 1 FROM llm_account_contribution_requests
+                     WHERE account_name = ?1
+                       AND status IN (?2, ?3, 'issued')
+                )",
+                params![
+                    account_name,
+                    PUBLIC_TOKEN_REQUEST_STATUS_PENDING,
+                    PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED,
+                ],
+                |row| row.get(0),
+            )
+            .context("check public account contribution name")?;
+        Ok(exists != 0)
     }
 
     /// Insert one public sponsor request.
@@ -5625,5 +5726,149 @@ mod tests {
         assert_eq!(kiro_accounts[0].account_name, "kiro-a");
         assert_eq!(kiro_accounts[0].auth_method, "idc");
         assert_eq!(kiro_accounts[0].user_id.as_deref(), Some("user-1"));
+    }
+
+    #[test]
+    fn account_contribution_name_conflicts_skip_failed_and_rejected_requests() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlStore::new(conn);
+
+        assert!(!repo
+            .public_account_contribution_name_exists("contrib-live")
+            .expect("check empty name"));
+
+        repo.create_public_account_contribution_request(&account_contribution_request(
+            "llmacct-live",
+            "contrib-live",
+            10,
+        ))
+        .expect("create live contribution");
+        assert!(repo
+            .public_account_contribution_name_exists("contrib-live")
+            .expect("check live name"));
+
+        repo.create_public_account_contribution_request(&account_contribution_request(
+            "llmacct-failed",
+            "contrib-failed",
+            20,
+        ))
+        .expect("create failed contribution");
+        repo.conn
+            .execute(
+                "UPDATE llm_account_contribution_requests SET status = 'failed' WHERE request_id \
+                 = ?1",
+                ["llmacct-failed"],
+            )
+            .expect("mark failed");
+        assert!(!repo
+            .public_account_contribution_name_exists("contrib-failed")
+            .expect("check failed name"));
+
+        repo.create_public_account_contribution_request(&account_contribution_request(
+            "llmacct-rejected",
+            "contrib-rejected",
+            30,
+        ))
+        .expect("create rejected contribution");
+        repo.conn
+            .execute(
+                "UPDATE llm_account_contribution_requests SET status = 'rejected' WHERE \
+                 request_id = ?1",
+                ["llmacct-rejected"],
+            )
+            .expect("mark rejected");
+        assert!(!repo
+            .public_account_contribution_name_exists("contrib-rejected")
+            .expect("check rejected name"));
+
+        repo.create_admin_codex_account(&llm_access_core::store::NewAdminCodexAccount {
+            name: "existing-account".to_string(),
+            account_id: None,
+            auth_json: r#"{"tokens":{"access_token":"access"}}"#.to_string(),
+            map_gpt53_codex_to_spark: false,
+            created_at_ms: 40,
+        })
+        .expect("create existing account");
+        assert!(repo
+            .public_account_contribution_name_exists("existing-account")
+            .expect("check existing account name"));
+    }
+
+    #[test]
+    fn account_contribution_validation_updates_status_and_auth_fields() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlStore::new(conn);
+        repo.create_public_account_contribution_request(&account_contribution_request(
+            "llmacct-validate",
+            "contrib-validate",
+            10,
+        ))
+        .expect("create contribution");
+
+        let validated = repo
+            .validate_admin_account_contribution_request(
+                "llmacct-validate",
+                Some("acct-next".to_string()),
+                "id-next",
+                "access-next",
+                "refresh-next",
+                &llm_access_core::store::AdminReviewQueueAction {
+                    admin_note: Some("validated".to_string()),
+                    updated_at_ms: 20,
+                },
+            )
+            .expect("validate contribution")
+            .expect("contribution exists");
+
+        assert_eq!(
+            validated.status,
+            llm_access_core::store::PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED
+        );
+        assert_eq!(validated.account_id.as_deref(), Some("acct-next"));
+        assert_eq!(validated.id_token, "id-next");
+        assert_eq!(validated.access_token, "access-next");
+        assert_eq!(validated.refresh_token, "refresh-next");
+        assert_eq!(validated.failure_reason, None);
+        assert_eq!(validated.processed_at, None);
+
+        let failed = repo
+            .fail_admin_account_contribution_request(
+                "llmacct-validate",
+                "refresh failed",
+                &llm_access_core::store::AdminReviewQueueAction {
+                    admin_note: None,
+                    updated_at_ms: 30,
+                },
+            )
+            .expect("fail contribution")
+            .expect("contribution exists");
+        assert_eq!(failed.status, "failed");
+        assert_eq!(failed.failure_reason.as_deref(), Some("refresh failed"));
+        assert_eq!(failed.processed_at, None);
+    }
+
+    fn account_contribution_request(
+        request_id: &str,
+        account_name: &str,
+        created_at_ms: i64,
+    ) -> llm_access_core::store::NewPublicAccountContributionRequest {
+        llm_access_core::store::NewPublicAccountContributionRequest {
+            request_id: request_id.to_string(),
+            account_name: account_name.to_string(),
+            account_id: Some("acct-1".to_string()),
+            id_token: "id-token".to_string(),
+            access_token: "access-token".to_string(),
+            refresh_token: "refresh-token".to_string(),
+            requester_email: String::new(),
+            contributor_message: "shared account".to_string(),
+            github_id: None,
+            frontend_page_url: None,
+            fingerprint: format!("fingerprint-{request_id}"),
+            client_ip: "198.51.100.31".to_string(),
+            ip_region: "unknown".to_string(),
+            created_at_ms,
+        }
     }
 }

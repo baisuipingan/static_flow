@@ -55,8 +55,11 @@ pub(crate) async fn ensure_context_for_route(
     store: &dyn ProviderRouteStore,
     force_refresh: bool,
 ) -> anyhow::Result<CodexCallContext> {
-    let initial = parse_auth_parts(&route.auth_json)?;
-    if !force_refresh && !access_token_is_expired(&initial.access_token) {
+    let initial = parse_auth_parts_allow_missing_access(&route.auth_json)?;
+    if !force_refresh
+        && !initial.access_token.is_empty()
+        && !access_token_is_expired(&initial.access_token)
+    {
         return Ok(initial.into_context());
     }
 
@@ -68,8 +71,9 @@ pub(crate) async fn ensure_context_for_route(
         .ok_or_else(|| {
             anyhow!("active Codex account `{}` is not configured", route.account_name)
         })?;
-    let latest = parse_auth_parts(&latest_route.auth_json)?;
-    let latest_access_token_is_expired = access_token_is_expired(&latest.access_token);
+    let latest = parse_auth_parts_allow_missing_access(&latest_route.auth_json)?;
+    let latest_access_token_is_expired =
+        latest.access_token.is_empty() || access_token_is_expired(&latest.access_token);
     if !force_refresh && !latest_access_token_is_expired {
         return Ok(latest.into_context());
     }
@@ -91,6 +95,23 @@ pub(crate) async fn ensure_context_for_route(
         })
         .await?;
     Ok(next_parts.into_context())
+}
+
+pub(crate) async fn refresh_auth_json_for_route(
+    route: &ProviderCodexRoute,
+) -> anyhow::Result<ProviderCodexAuthUpdate> {
+    let current = parse_auth_parts_allow_missing_access(&route.auth_json)?;
+    let refreshed = refresh_auth(route, &current).await?;
+    let auth_json = refreshed_auth_json(&route.auth_json, &current, &refreshed)?;
+    let next_parts = parse_auth_parts(&auth_json)?;
+    Ok(ProviderCodexAuthUpdate {
+        account_name: route.account_name.clone(),
+        auth_json,
+        account_id: next_parts.account_id,
+        status: KEY_STATUS_ACTIVE.to_string(),
+        last_error: None,
+        refreshed_at_ms: now_ms(),
+    })
 }
 
 fn auth_parts_changed(previous: &CodexAuthParts, latest: &CodexAuthParts) -> bool {
@@ -122,6 +143,38 @@ fn parse_auth_parts(auth_json: &str) -> anyhow::Result<CodexAuthParts> {
                 .and_then(|tokens| optional_string(tokens, &["access_token", "accessToken"]))
         })
         .ok_or_else(|| anyhow!("codex auth missing access token"))?;
+    let refresh_token = optional_string(&value, &["refresh_token", "refreshToken"]).or_else(|| {
+        value
+            .get("tokens")
+            .and_then(|tokens| optional_string(tokens, &["refresh_token", "refreshToken"]))
+    });
+    let id_token = optional_string(&value, &["id_token", "idToken"]).or_else(|| {
+        value
+            .get("tokens")
+            .and_then(|tokens| optional_string(tokens, &["id_token", "idToken"]))
+    });
+    let account_id = optional_string(&value, &["account_id", "accountId"]).or_else(|| {
+        value
+            .get("tokens")
+            .and_then(|tokens| optional_string(tokens, &["account_id", "accountId"]))
+    });
+    Ok(CodexAuthParts {
+        access_token,
+        refresh_token,
+        id_token,
+        account_id,
+    })
+}
+
+fn parse_auth_parts_allow_missing_access(auth_json: &str) -> anyhow::Result<CodexAuthParts> {
+    let value: Value = serde_json::from_str(auth_json).context("parse codex auth json")?;
+    let access_token = optional_string(&value, &["access_token", "accessToken"])
+        .or_else(|| {
+            value
+                .get("tokens")
+                .and_then(|tokens| optional_string(tokens, &["access_token", "accessToken"]))
+        })
+        .unwrap_or_default();
     let refresh_token = optional_string(&value, &["refresh_token", "refreshToken"]).or_else(|| {
         value
             .get("tokens")

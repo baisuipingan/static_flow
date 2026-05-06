@@ -886,6 +886,22 @@ impl PublicSubmissionStore for SqliteControlRepository {
         .context("sqlite control repository public account contribution task failed")?
     }
 
+    async fn public_account_contribution_name_exists(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<bool> {
+        let account_name = account_name.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.public_account_contribution_name_exists(&account_name)
+        })
+        .await
+        .context("sqlite control repository public account contribution name task failed")?
+    }
+
     async fn create_public_sponsor_request(
         &self,
         request: NewPublicSponsorRequest,
@@ -1056,6 +1072,54 @@ impl AdminReviewQueueStore for SqliteControlRepository {
         })
         .await
         .context("sqlite control repository issue admin account contribution request task failed")?
+    }
+
+    async fn validate_admin_account_contribution_request(
+        &self,
+        request_id: &str,
+        account_id: Option<String>,
+        id_token: String,
+        access_token: String,
+        refresh_token: String,
+        action: AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>> {
+        let request_id = request_id.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.validate_admin_account_contribution_request(
+                &request_id,
+                account_id,
+                &id_token,
+                &access_token,
+                &refresh_token,
+                &action,
+            )
+        })
+        .await
+        .context(
+            "sqlite control repository validate admin account contribution request task failed",
+        )?
+    }
+
+    async fn fail_admin_account_contribution_request(
+        &self,
+        request_id: &str,
+        failure_reason: String,
+        action: AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>> {
+        let request_id = request_id.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.fail_admin_account_contribution_request(&request_id, &failure_reason, &action)
+        })
+        .await
+        .context("sqlite control repository fail admin account contribution request task failed")?
     }
 
     async fn reject_admin_account_contribution_request(

@@ -34,6 +34,11 @@ const SQLITE_MIGRATIONS: &[SqlMigration] = &[
         name: "duckdb_usage_runtime_settings",
         sql: include_str!("../migrations/sqlite/0004_duckdb_usage_runtime_settings.sql"),
     },
+    SqlMigration {
+        version: 5,
+        name: "account_contribution_validated_status",
+        sql: include_str!("../migrations/sqlite/0005_account_contribution_validated_status.sql"),
+    },
 ];
 
 const DUCKDB_MIGRATIONS: &[SqlMigration] = &[
@@ -124,7 +129,7 @@ mod tests {
     fn sqlite_migrations_are_file_backed_and_versioned() {
         let migrations = super::sqlite_migrations();
 
-        assert_eq!(migrations.len(), 4);
+        assert_eq!(migrations.len(), 5);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(migrations[0].name, "init");
         assert!(migrations[0]
@@ -146,6 +151,9 @@ mod tests {
         assert!(migrations[3]
             .sql
             .contains("duckdb_usage_checkpoint_threshold_mib"));
+        assert_eq!(migrations[4].version, 5);
+        assert_eq!(migrations[4].name, "account_contribution_validated_status");
+        assert!(migrations[4].sql.contains("'validated'"));
     }
 
     #[test]
@@ -179,7 +187,7 @@ mod tests {
         let applied_count: i64 = conn
             .query_row("SELECT count(*) FROM llm_access_schema_migrations", [], |row| row.get(0))
             .expect("count migrations");
-        assert_eq!(applied_count, 4);
+        assert_eq!(applied_count, 5);
 
         let full_logging_column_count: i64 = conn
             .query_row(
@@ -205,5 +213,18 @@ mod tests {
             )
             .expect("inspect runtime config duckdb columns");
         assert_eq!(runtime_duckdb_column_count, 2);
+
+        conn.execute(
+            "INSERT INTO llm_account_contribution_requests (
+                request_id, account_name, id_token, access_token, refresh_token,
+                requester_email, contributor_message, status, fingerprint, client_ip,
+                ip_region, created_at_ms, updated_at_ms
+            ) VALUES (
+                'llmacct-validated', 'acct-validated', '', 'access', 'refresh',
+                '', 'ok', 'validated', 'fp', '127.0.0.1', 'unknown', 1, 1
+            )",
+            [],
+        )
+        .expect("validated account contribution status is allowed");
     }
 }

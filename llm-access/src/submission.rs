@@ -57,10 +57,14 @@ pub(crate) struct SubmitLlmGatewayAccountContributionRequest {
     account_name: String,
     #[serde(default)]
     account_id: Option<String>,
-    id_token: String,
-    access_token: String,
-    refresh_token: String,
-    requester_email: String,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+    #[serde(default)]
+    requester_email: Option<String>,
     contributor_message: String,
     #[serde(default)]
     github_id: Option<String>,
@@ -143,6 +147,18 @@ pub(crate) async fn submit_public_account_contribution_request(
         Err(err) => return err.into_response(),
     };
     let request_id = request.request_id.clone();
+    match state
+        .public_submission_store
+        .public_account_contribution_name_exists(&request.account_name)
+        .await
+    {
+        Ok(false) => {},
+        Ok(true) => {
+            return conflict("account_name already exists or is already pending review")
+                .into_response()
+        },
+        Err(_) => return internal_error("public submission store error").into_response(),
+    }
     match state
         .public_submission_store
         .create_public_account_contribution_request(request)
@@ -237,15 +253,15 @@ async fn normalize_account_contribution_request(
     let account_name =
         validate_account_name(&request.account_name).map_err(|err| bad_request(&err))?;
     let account_id = normalize_optional_string(request.account_id);
-    let id_token = request.id_token.trim().to_string();
-    let access_token = request.access_token.trim().to_string();
-    let refresh_token = request.refresh_token.trim().to_string();
-    if id_token.is_empty() || access_token.is_empty() || refresh_token.is_empty() {
-        return Err(bad_request("id_token, access_token, and refresh_token are required"));
+    let id_token = normalize_optional_string(request.id_token).unwrap_or_default();
+    let access_token = normalize_optional_string(request.access_token).unwrap_or_default();
+    let refresh_token = normalize_optional_string(request.refresh_token).unwrap_or_default();
+    if refresh_token.is_empty() {
+        return Err(bad_request("refresh_token is required"));
     }
-    let requester_email = normalize_requester_email_input(Some(request.requester_email))
+    let requester_email = normalize_requester_email_input(request.requester_email)
         .map_err(|err| bad_request(&format!("invalid requester_email: {err}")))?
-        .ok_or_else(|| bad_request("requester_email is required"))?;
+        .unwrap_or_default();
     let contributor_message = request.contributor_message.trim();
     if contributor_message.is_empty() {
         return Err(bad_request("contributor_message is required"));
@@ -615,6 +631,13 @@ fn bad_request(message: &str) -> SubmitError {
     }
 }
 
+fn conflict(message: &str) -> SubmitError {
+    SubmitError {
+        status: StatusCode::CONFLICT,
+        message: message.to_string(),
+    }
+}
+
 fn internal_error(message: &str) -> SubmitError {
     SubmitError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
@@ -641,5 +664,37 @@ mod tests {
 
         assert_eq!(context.client_ip, "208.77.246.15");
         assert_eq!(context.ip_region, "Singapore/Singapore");
+    }
+
+    #[tokio::test]
+    async fn account_contribution_allows_optional_email_and_partial_auth() {
+        let resolver = crate::geoip::GeoIpResolver::fixed_for_tests("unknown");
+        let headers = HeaderMap::new();
+        let guard = Arc::new(PublicSubmitGuard::default());
+
+        let request = normalize_account_contribution_request(
+            SubmitLlmGatewayAccountContributionRequest {
+                account_name: "shared_account".to_string(),
+                account_id: None,
+                id_token: None,
+                access_token: None,
+                refresh_token: Some(" refresh-token ".to_string()),
+                requester_email: None,
+                contributor_message: "shared for validation".to_string(),
+                github_id: None,
+                frontend_page_url: None,
+            },
+            &headers,
+            &guard,
+            &resolver,
+        )
+        .await
+        .expect("normalized account contribution");
+
+        assert_eq!(request.account_name, "shared_account");
+        assert_eq!(request.id_token, "");
+        assert_eq!(request.access_token, "");
+        assert_eq!(request.refresh_token, "refresh-token");
+        assert_eq!(request.requester_email, "");
     }
 }

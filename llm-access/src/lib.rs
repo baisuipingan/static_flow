@@ -218,6 +218,10 @@ pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
             post(admin::approve_and_issue_llm_gateway_account_contribution_request),
         )
         .route(
+            "/admin/llm-gateway/account-contribution-requests/:request_id/validate",
+            post(admin::validate_llm_gateway_account_contribution_request),
+        )
+        .route(
             "/admin/llm-gateway/account-contribution-requests/:request_id/reject",
             post(admin::reject_llm_gateway_account_contribution_request),
         )

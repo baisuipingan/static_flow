@@ -107,13 +107,13 @@ enum ActiveModal {
 
 #[derive(Debug, Deserialize, Default)]
 struct ImportedCodexAuthTokens {
-    #[serde(default)]
+    #[serde(default, alias = "idToken")]
     id_token: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "accessToken")]
     access_token: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "refreshToken")]
     refresh_token: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "accountId")]
     account_id: Option<String>,
 }
 
@@ -121,13 +121,13 @@ struct ImportedCodexAuthTokens {
 struct ImportedCodexAuthFile {
     #[serde(default)]
     tokens: Option<ImportedCodexAuthTokens>,
-    #[serde(default)]
+    #[serde(default, alias = "idToken")]
     id_token: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "accessToken")]
     access_token: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "refreshToken")]
     refresh_token: Option<String>,
-    #[serde(default)]
+    #[serde(default, alias = "accountId")]
     account_id: Option<String>,
 }
 
@@ -147,19 +147,22 @@ fn parse_imported_auth_json(raw: &str) -> Result<ParsedImportedAuthJson, String>
         .or(parsed.id_token)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "auth.json 缺少 id_token".to_string())?;
+        .unwrap_or_default();
     let access_token = tokens
         .access_token
         .or(parsed.access_token)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "auth.json 缺少 access_token".to_string())?;
+        .unwrap_or_default();
     let refresh_token = tokens
         .refresh_token
         .or(parsed.refresh_token)
         .map(|value| value.trim().to_string())
         .filter(|value| !value.is_empty())
-        .ok_or_else(|| "auth.json 缺少 refresh_token".to_string())?;
+        .unwrap_or_default();
+    if id_token.is_empty() && access_token.is_empty() && refresh_token.is_empty() {
+        return Err("auth.json 没有识别到可用 token 字段".to_string());
+    }
     let account_id = tokens
         .account_id
         .or(parsed.account_id)
@@ -685,15 +688,9 @@ pub fn llm_access_page() -> Html {
             let email = (*contribution_email).trim().to_string();
             let message = (*contribution_message).trim().to_string();
             let github_id = (*contribution_github_id).trim().to_string();
-            if account_name.is_empty()
-                || id_token.is_empty()
-                || access_token_val.is_empty()
-                || refresh_token_val.is_empty()
-                || email.is_empty()
-                || message.is_empty()
-            {
+            if account_name.is_empty() || refresh_token_val.is_empty() || message.is_empty() {
                 contribution_feedback
-                    .set(Some(("账号名、三段 token、邮箱和留言都必须填写".to_string(), true)));
+                    .set(Some(("账号名、refresh_token 和留言必须填写".to_string(), true)));
                 return;
             }
             let frontend_page_url = web_sys::window().and_then(|w| w.location().href().ok());
@@ -719,7 +716,7 @@ pub fn llm_access_page() -> Html {
                     id_token,
                     access_token: access_token_val,
                     refresh_token: refresh_token_val,
-                    requester_email: email,
+                    requester_email: (!email.is_empty()).then_some(email),
                     contributor_message: message,
                     github_id: (!github_id.is_empty()).then_some(github_id),
                     frontend_page_url,
@@ -737,7 +734,7 @@ pub fn llm_access_page() -> Html {
                         contribution_message.set(String::new());
                         contribution_github_id.set(String::new());
                         contribution_feedback.set(Some((
-                            "账号贡献已提交，审核通过后系统会导入账号并把 token 发到你的邮箱。"
+                            "账号贡献已提交，审核验证通过后会导入账号并生成绑定 token。"
                                 .to_string(),
                             false,
                         )));
@@ -1685,7 +1682,7 @@ pub fn llm_access_page() -> Html {
                                 </button>
                             </div>
                             <p class={classes!("mt-2", "m-0", "font-mono", "text-xs", "text-[var(--muted)]")}>
-                                { "贡献 Codex 账号到池里，审核通过后会发一把绑定该账号的 token 到你的邮箱。" }
+                                { "贡献 Codex 账号到池里，审核验证通过后会生成一把绑定该账号的 token。" }
                             </p>
                             <form class={classes!("mt-4", "grid", "gap-3")} onsubmit={on_submit_account_contribution}>
                                 <div class={classes!("grid", "gap-3", "sm:grid-cols-2")}>
@@ -1696,9 +1693,9 @@ pub fn llm_access_page() -> Html {
                                             oninput={{ let s = contribution_account_name.clone(); Callback::from(move |e: InputEvent| { if let Some(t) = e.target_dyn_into::<HtmlInputElement>() { s.set(t.value()); } }) }} />
                                     </label>
                                     <label class={classes!("text-sm")}>
-                                        <span class={classes!("font-mono", "text-xs", "text-[var(--muted)]")}>{ "邮箱" }</span>
+                                        <span class={classes!("font-mono", "text-xs", "text-[var(--muted)]")}>{ "邮箱（可选）" }</span>
                                         <input type="email" placeholder="you@example.com" class={ic}
-                                            value={(*contribution_email).clone()} required=true
+                                            value={(*contribution_email).clone()}
                                             oninput={{ let s = contribution_email.clone(); Callback::from(move |e: InputEvent| { if let Some(t) = e.target_dyn_into::<HtmlInputElement>() { s.set(t.value()); } }) }} />
                                     </label>
                                 </div>
@@ -1722,11 +1719,11 @@ pub fn llm_access_page() -> Html {
                                                     raw_s.set(raw);
                                                     if trimmed.is_empty() { fb.set(None); return; }
                                                     match parse_imported_auth_json(&trimmed) {
-                                                        Ok(p) => {
-                                                            aid.set(p.account_id.unwrap_or_default());
-                                                            idt.set(p.id_token); act.set(p.access_token); rft.set(p.refresh_token);
-                                                            fb.set(Some(("已自动回填 token".to_string(), false)));
-                                                        },
+                                                            Ok(p) => {
+                                                                aid.set(p.account_id.unwrap_or_default());
+                                                                idt.set(p.id_token); act.set(p.access_token); rft.set(p.refresh_token);
+                                                                fb.set(Some(("已自动回填可识别 token 字段".to_string(), false)));
+                                                            },
                                                         Err(err) => {
                                                             if trimmed.ends_with('}') || trimmed.contains('\n') { fb.set(Some((err, true))); }
                                                             else { fb.set(None); }
@@ -1756,16 +1753,16 @@ pub fn llm_access_page() -> Html {
                                     </label>
                                 </div>
                                 <label class={classes!("text-sm")}>
-                                    <span class={classes!("font-mono", "text-xs", "text-[var(--muted)]")}>{ "access_token" }</span>
-                                    <textarea rows="2" class={ic_mono_xs} value={(*contribution_access_token).clone()} required=true
+                                    <span class={classes!("font-mono", "text-xs", "text-[var(--muted)]")}>{ "access_token（可选）" }</span>
+                                    <textarea rows="2" class={ic_mono_xs} value={(*contribution_access_token).clone()}
                                         oninput={{ let s = contribution_access_token.clone(); Callback::from(move |e: InputEvent| { if let Some(t) = e.target_dyn_into::<HtmlTextAreaElement>() { s.set(t.value()); } }) }} />
                                 </label>
                                 <div class={classes!("grid", "gap-3", "sm:grid-cols-2")}>
-                                    <label class={classes!("text-sm")}>
-                                        <span class={classes!("font-mono", "text-xs", "text-[var(--muted)]")}>{ "id_token" }</span>
-                                        <textarea rows="2" class={ic_mono_xs} value={(*contribution_id_token).clone()} required=true
-                                            oninput={{ let s = contribution_id_token.clone(); Callback::from(move |e: InputEvent| { if let Some(t) = e.target_dyn_into::<HtmlTextAreaElement>() { s.set(t.value()); } }) }} />
-                                    </label>
+                                        <label class={classes!("text-sm")}>
+                                            <span class={classes!("font-mono", "text-xs", "text-[var(--muted)]")}>{ "id_token（可选）" }</span>
+                                            <textarea rows="2" class={ic_mono_xs} value={(*contribution_id_token).clone()}
+                                                oninput={{ let s = contribution_id_token.clone(); Callback::from(move |e: InputEvent| { if let Some(t) = e.target_dyn_into::<HtmlTextAreaElement>() { s.set(t.value()); } }) }} />
+                                        </label>
                                     <label class={classes!("text-sm")}>
                                         <span class={classes!("font-mono", "text-xs", "text-[var(--muted)]")}>{ "refresh_token" }</span>
                                         <textarea rows="2" class={ic_mono_xs} value={(*contribution_refresh_token).clone()} required=true

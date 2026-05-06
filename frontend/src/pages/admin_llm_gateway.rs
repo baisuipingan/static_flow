@@ -13,11 +13,13 @@ use crate::{
         admin_approve_and_issue_llm_gateway_token_request,
         admin_approve_llm_gateway_sponsor_request,
         admin_reject_llm_gateway_account_contribution_request,
-        admin_reject_llm_gateway_token_request, check_admin_llm_gateway_proxy_config,
-        create_admin_llm_gateway_account_group, create_admin_llm_gateway_key,
-        create_admin_llm_gateway_proxy_config, delete_admin_llm_gateway_account,
-        delete_admin_llm_gateway_account_group, delete_admin_llm_gateway_key,
-        delete_admin_llm_gateway_proxy_config, delete_admin_llm_gateway_sponsor_request,
+        admin_reject_llm_gateway_token_request,
+        admin_validate_llm_gateway_account_contribution_request,
+        check_admin_llm_gateway_proxy_config, create_admin_llm_gateway_account_group,
+        create_admin_llm_gateway_key, create_admin_llm_gateway_proxy_config,
+        delete_admin_llm_gateway_account, delete_admin_llm_gateway_account_group,
+        delete_admin_llm_gateway_key, delete_admin_llm_gateway_proxy_config,
+        delete_admin_llm_gateway_sponsor_request,
         fetch_admin_llm_gateway_account_contribution_requests,
         fetch_admin_llm_gateway_account_groups, fetch_admin_llm_gateway_accounts,
         fetch_admin_llm_gateway_config, fetch_admin_llm_gateway_keys,
@@ -84,6 +86,51 @@ export function copy_text(text) {
 "#)]
 extern "C" {
     fn copy_text(text: &str);
+}
+
+struct ParsedAdminCodexAuthJson {
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+    account_id: Option<String>,
+}
+
+fn parse_admin_codex_auth_json(raw: &str) -> Result<ParsedAdminCodexAuthJson, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| "auth.json 不是合法 JSON".to_string())?;
+    if !value.is_object() {
+        return Err("auth.json 必须是 JSON object".to_string());
+    }
+    let id_token = optional_auth_json_string(&value, &["id_token", "idToken"]).unwrap_or_default();
+    let access_token =
+        optional_auth_json_string(&value, &["access_token", "accessToken"]).unwrap_or_default();
+    let refresh_token =
+        optional_auth_json_string(&value, &["refresh_token", "refreshToken"]).unwrap_or_default();
+    if id_token.is_empty() && access_token.is_empty() && refresh_token.is_empty() {
+        return Err("auth.json 没有识别到可用 token 字段".to_string());
+    }
+    Ok(ParsedAdminCodexAuthJson {
+        id_token,
+        access_token,
+        refresh_token,
+        account_id: optional_auth_json_string(&value, &["account_id", "accountId"]),
+    })
+}
+
+fn optional_auth_json_string(value: &serde_json::Value, fields: &[&str]) -> Option<String> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            value.get("tokens").and_then(|tokens| {
+                fields
+                    .iter()
+                    .find_map(|field| tokens.get(*field).and_then(serde_json::Value::as_str))
+            })
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn account_proxy_select_value(account: &AccountSummaryView) -> String {
@@ -1815,6 +1862,8 @@ pub fn admin_llm_gateway_page() -> Html {
     let import_access_token = use_state(String::new);
     let import_refresh_token = use_state(String::new);
     let import_account_id = use_state(String::new);
+    let import_raw_auth_json = use_state(String::new);
+    let import_raw_auth_feedback = use_state(|| None::<(String, bool)>);
     let importing = use_state(|| false);
     let account_action_inflight = use_state(HashSet::<String>::new);
     let account_proxy_inputs = use_state(BTreeMap::<String, String>::new);
@@ -3064,6 +3113,48 @@ pub fn admin_llm_gateway_page() -> Html {
         })
     };
 
+    let on_validate_account_contribution_request = {
+        let account_contribution_request_action_inflight =
+            account_contribution_request_action_inflight.clone();
+        let account_contribution_requests = account_contribution_requests.clone();
+        let reload_account_contribution_requests = reload_account_contribution_requests.clone();
+        let load_error = load_error.clone();
+        Callback::from(move |request_id: String| {
+            let account_contribution_request_action_inflight =
+                account_contribution_request_action_inflight.clone();
+            let account_contribution_requests = account_contribution_requests.clone();
+            let reload_account_contribution_requests = reload_account_contribution_requests.clone();
+            let load_error = load_error.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut inflight = (*account_contribution_request_action_inflight).clone();
+                inflight.insert(request_id.clone());
+                account_contribution_request_action_inflight.set(inflight);
+
+                match admin_validate_llm_gateway_account_contribution_request(&request_id, None)
+                    .await
+                {
+                    Ok(updated) => {
+                        let mut list = (*account_contribution_requests).clone();
+                        if let Some(item) = list
+                            .iter_mut()
+                            .find(|item| item.request_id == updated.request_id)
+                        {
+                            *item = updated;
+                        }
+                        account_contribution_requests.set(list);
+                        load_error.set(None);
+                        reload_account_contribution_requests.emit((None, None));
+                    },
+                    Err(err) => load_error.set(Some(err)),
+                }
+
+                let mut inflight = (*account_contribution_request_action_inflight).clone();
+                inflight.remove(&request_id);
+                account_contribution_request_action_inflight.set(inflight);
+            });
+        })
+    };
+
     let on_approve_account_contribution_request = {
         let account_contribution_request_action_inflight =
             account_contribution_request_action_inflight.clone();
@@ -3478,6 +3569,8 @@ pub fn admin_llm_gateway_page() -> Html {
         let import_access_token = import_access_token.clone();
         let import_refresh_token = import_refresh_token.clone();
         let import_account_id = import_account_id.clone();
+        let import_raw_auth_json = import_raw_auth_json.clone();
+        let import_raw_auth_feedback = import_raw_auth_feedback.clone();
         let importing = importing.clone();
         let load_error = load_error.clone();
         let reload = reload.clone();
@@ -3486,6 +3579,7 @@ pub fn admin_llm_gateway_page() -> Html {
             let id_token = (*import_id_token).trim().to_string();
             let access_token = (*import_access_token).trim().to_string();
             let refresh_token = (*import_refresh_token).trim().to_string();
+            let raw_auth_json = (*import_raw_auth_json).trim().to_string();
             let account_id = {
                 let v = (*import_account_id).trim().to_string();
                 if v.is_empty() {
@@ -3502,14 +3596,19 @@ pub fn admin_llm_gateway_page() -> Html {
             let import_access_token = import_access_token.clone();
             let import_refresh_token = import_refresh_token.clone();
             let import_account_id = import_account_id.clone();
+            let import_raw_auth_json = import_raw_auth_json.clone();
+            let import_raw_auth_feedback = import_raw_auth_feedback.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 importing.set(true);
+                let raw_auth_json_ref =
+                    (!raw_auth_json.is_empty()).then_some(raw_auth_json.as_str());
                 match import_admin_llm_gateway_account(
                     &name,
                     &id_token,
                     &access_token,
                     &refresh_token,
                     account_id.as_deref(),
+                    raw_auth_json_ref,
                 )
                 .await
                 {
@@ -3519,6 +3618,8 @@ pub fn admin_llm_gateway_page() -> Html {
                         import_access_token.set(String::new());
                         import_refresh_token.set(String::new());
                         import_account_id.set(String::new());
+                        import_raw_auth_json.set(String::new());
+                        import_raw_auth_feedback.set(None);
                         load_error.set(None);
                         reload.emit(());
                     },
@@ -3580,7 +3681,7 @@ pub fn admin_llm_gateway_page() -> Html {
         .count();
     let pending_contribution_requests = account_contribution_requests
         .iter()
-        .filter(|r| r.status == "pending")
+        .filter(|r| r.status == "pending" || r.status == "failed" || r.status == "validated")
         .count();
     let pending_sponsor_requests = sponsor_requests
         .iter()
@@ -5157,9 +5258,58 @@ pub fn admin_llm_gateway_page() -> Html {
                                     }}
                                 />
                             </label>
-                        </div>
-                        <label class={classes!("text-sm")}>
-                            <span class={classes!("text-[var(--muted)]")}>{ "access_token" }</span>
+                            </div>
+                            <label class={classes!("text-sm")}>
+                                <span class={classes!("text-[var(--muted)]")}>{ "auth.json（可直接粘贴导入）" }</span>
+                                <textarea
+                                    rows="4"
+                                    placeholder="{\"tokens\":{...}}"
+                                    class={classes!("mt-1", "w-full", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2", "font-mono", "text-xs")}
+                                    value={(*import_raw_auth_json).clone()}
+                                    oninput={{
+                                        let import_raw_auth_json = import_raw_auth_json.clone();
+                                        let import_raw_auth_feedback = import_raw_auth_feedback.clone();
+                                        let import_account_id = import_account_id.clone();
+                                        let import_id_token = import_id_token.clone();
+                                        let import_access_token = import_access_token.clone();
+                                        let import_refresh_token = import_refresh_token.clone();
+                                        Callback::from(move |event: InputEvent| {
+                                            if let Some(target) = event.target_dyn_into::<web_sys::HtmlTextAreaElement>() {
+                                                let raw = target.value();
+                                                let trimmed = raw.trim().to_string();
+                                                import_raw_auth_json.set(raw);
+                                                if trimmed.is_empty() {
+                                                    import_raw_auth_feedback.set(None);
+                                                    return;
+                                                }
+                                                match parse_admin_codex_auth_json(&trimmed) {
+                                                    Ok(parsed) => {
+                                                        import_account_id.set(parsed.account_id.unwrap_or_default());
+                                                        import_id_token.set(parsed.id_token);
+                                                        import_access_token.set(parsed.access_token);
+                                                        import_refresh_token.set(parsed.refresh_token);
+                                                        import_raw_auth_feedback.set(Some(("已解析并回填可识别字段；提交时会保留完整 JSON".to_string(), false)));
+                                                    },
+                                                    Err(err) => {
+                                                        if trimmed.ends_with('}') || trimmed.contains('\n') {
+                                                            import_raw_auth_feedback.set(Some((err, true)));
+                                                        } else {
+                                                            import_raw_auth_feedback.set(None);
+                                                        }
+                                                    },
+                                                }
+                                            }
+                                        })
+                                    }}
+                                />
+                                if let Some((message, is_error)) = (*import_raw_auth_feedback).clone() {
+                                    <div class={classes!("mt-1", "font-mono", "text-[11px]", if is_error { "text-red-600 dark:text-red-300" } else { "text-emerald-600 dark:text-emerald-300" })}>
+                                        { message }
+                                    </div>
+                                }
+                            </label>
+                            <label class={classes!("text-sm")}>
+                                <span class={classes!("text-[var(--muted)]")}>{ "access_token" }</span>
                             <textarea
                                 rows="2"
                                 class={classes!("mt-1", "w-full", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2", "font-mono", "text-xs")}
@@ -6033,9 +6183,9 @@ pub fn admin_llm_gateway_page() -> Html {
                     <div class={classes!("flex", "items-center", "justify-between", "gap-3", "flex-wrap")}>
                         <div>
                             <h2 class={classes!("m-0", "font-mono", "text-base", "font-bold", "text-[var(--text)]")}>{ "Account Contributions" }</h2>
-                            <p class={classes!("mt-1", "m-0", "text-xs", "text-[var(--muted)]")}>
-                                { "公开页提交的 Codex 账号贡献申请会先进入这里；只有审核通过后，系统才会导入账号并发放绑定该账号路由的 token。" }
-                            </p>
+                                <p class={classes!("mt-1", "m-0", "text-xs", "text-[var(--muted)]")}>
+                                    { "公开页提交的 Codex 账号贡献申请会先进入这里；先验证 auth refresh，validated 后才能入库并发放绑定该账号路由的 token。" }
+                                </p>
                         </div>
                         <button
                             class={classes!("btn-terminal")}
@@ -6058,8 +6208,9 @@ pub fn admin_llm_gateway_page() -> Html {
                                 onchange={on_account_contribution_status_filter_change}
                             >
                                 <option value="" selected={(*account_contribution_request_status_filter).is_empty()}>{ "全部" }</option>
-                                <option value="pending" selected={*account_contribution_request_status_filter == "pending"}>{ "pending" }</option>
-                                <option value="failed" selected={*account_contribution_request_status_filter == "failed"}>{ "failed" }</option>
+                                    <option value="pending" selected={*account_contribution_request_status_filter == "pending"}>{ "pending" }</option>
+                                    <option value="validated" selected={*account_contribution_request_status_filter == "validated"}>{ "validated" }</option>
+                                    <option value="failed" selected={*account_contribution_request_status_filter == "failed"}>{ "failed" }</option>
                                 <option value="issued" selected={*account_contribution_request_status_filter == "issued"}>{ "issued" }</option>
                                 <option value="rejected" selected={*account_contribution_request_status_filter == "rejected"}>{ "rejected" }</option>
                             </select>
@@ -6073,17 +6224,20 @@ pub fn admin_llm_gateway_page() -> Html {
                     } else {
                         <div class={classes!("mt-4", "space-y-3")}>
                             { for account_contribution_requests.iter().map(|item| {
-                                let request_id = item.request_id.clone();
-                                let approve_request_id = item.request_id.clone();
-                                let reject_request_id = item.request_id.clone();
-                                let approve_cb = on_approve_account_contribution_request.clone();
+                                    let request_id = item.request_id.clone();
+                                    let validate_request_id = item.request_id.clone();
+                                    let approve_request_id = item.request_id.clone();
+                                    let reject_request_id = item.request_id.clone();
+                                    let validate_cb = on_validate_account_contribution_request.clone();
+                                    let approve_cb = on_approve_account_contribution_request.clone();
                                 let reject_cb = on_reject_account_contribution_request.clone();
                                 let on_copy = on_copy.clone();
                                 let action_busy =
                                     account_contribution_request_action_inflight.contains(&request_id);
                                 let status_class = match item.status.as_str() {
-                                    "pending" => classes!("bg-amber-500/10", "text-amber-700", "dark:text-amber-200", "border-amber-500/20"),
-                                    "failed" => classes!("bg-red-500/10", "text-red-700", "dark:text-red-200", "border-red-500/20"),
+                                        "pending" => classes!("bg-amber-500/10", "text-amber-700", "dark:text-amber-200", "border-amber-500/20"),
+                                        "validated" => classes!("bg-sky-500/10", "text-sky-700", "dark:text-sky-200", "border-sky-500/20"),
+                                        "failed" => classes!("bg-red-500/10", "text-red-700", "dark:text-red-200", "border-red-500/20"),
                                     "issued" => classes!("bg-emerald-500/10", "text-emerald-700", "dark:text-emerald-200", "border-emerald-500/20"),
                                     "rejected" => classes!("bg-slate-500/10", "text-slate-700", "dark:text-slate-200", "border-slate-500/20"),
                                     _ => classes!("bg-[var(--surface-alt)]", "text-[var(--muted)]", "border-[var(--border)]"),
@@ -6097,7 +6251,9 @@ pub fn admin_llm_gateway_page() -> Html {
                                                         { item.status.clone() }
                                                     </span>
                                                     <span class={classes!("font-semibold")}>{ item.account_name.clone() }</span>
-                                                    <span class={classes!("text-xs", "text-[var(--muted)]")}>{ item.requester_email.clone() }</span>
+                                                        if !item.requester_email.trim().is_empty() {
+                                                            <span class={classes!("text-xs", "text-[var(--muted)]")}>{ item.requester_email.clone() }</span>
+                                                        }
                                                     <span class={classes!("text-xs", "font-mono", "text-[var(--muted)]")}>{ item.request_id.clone() }</span>
                                                 </div>
                                                 <div class={classes!("text-xs", "text-[var(--muted)]")}>
@@ -6167,15 +6323,24 @@ pub fn admin_llm_gateway_page() -> Html {
                                                 { item.processed_at.map(format_ms).map(|value| format!("processed {}", value)).unwrap_or_else(|| "尚未处理".to_string()) }
                                             </div>
                                             <div class={classes!("flex", "items-center", "gap-2")}>
-                                                if item.status == "pending" || item.status == "failed" {
-                                                    <button
-                                                        class={classes!("btn-terminal", "btn-terminal-primary")}
-                                                        onclick={Callback::from(move |_| approve_cb.emit(approve_request_id.clone()))}
-                                                        disabled={action_busy}
-                                                    >
-                                                        { if action_busy { "处理中..." } else { "批准并导入" } }
-                                                    </button>
-                                                }
+                                                    if item.status == "pending" || item.status == "failed" {
+                                                        <button
+                                                            class={classes!("btn-terminal", "btn-terminal-primary")}
+                                                            onclick={Callback::from(move |_| validate_cb.emit(validate_request_id.clone()))}
+                                                            disabled={action_busy}
+                                                        >
+                                                            { if action_busy { "验证中..." } else { "验证" } }
+                                                        </button>
+                                                    }
+                                                    if item.status == "validated" {
+                                                        <button
+                                                            class={classes!("btn-terminal", "btn-terminal-primary")}
+                                                            onclick={Callback::from(move |_| approve_cb.emit(approve_request_id.clone()))}
+                                                            disabled={action_busy}
+                                                        >
+                                                            { if action_busy { "入库中..." } else { "入库并发放" } }
+                                                        </button>
+                                                    }
                                                 if item.status == "pending" || item.status == "failed" {
                                                     <button
                                                         class={classes!("btn-terminal", "!text-red-600", "dark:!text-red-300")}

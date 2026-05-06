@@ -15,6 +15,7 @@ use axum::{
     Json,
 };
 use llm_access_core::{
+    provider::RouteStrategy,
     store::{
         self as core_store, AdminAccountGroupPatch, AdminCodexAccountPatch, AdminKeyPatch,
         AdminProxyConfigPatch, AdminReviewQueueAction, AdminRuntimeConfig, NewAdminAccountGroup,
@@ -38,7 +39,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 
-use crate::{codex_status, kiro_refresh, kiro_status, HttpState};
+use crate::{codex_refresh, codex_status, kiro_refresh, kiro_status, HttpState};
 
 const MAX_CODEX_CLIENT_VERSION_LEN: usize = 64;
 const MAX_RUNTIME_CACHE_TTL_SECONDS: u64 = 86_400;
@@ -405,14 +406,20 @@ pub(crate) struct UpdateLlmGatewayProxyBindingRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct ImportLlmGatewayAccountRequest {
     name: String,
-    tokens: ImportLlmGatewayAccountTokens,
+    #[serde(default)]
+    tokens: Option<ImportLlmGatewayAccountTokens>,
+    #[serde(default)]
+    auth_json: Option<serde_json::Value>,
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ImportLlmGatewayAccountTokens {
-    id_token: String,
-    access_token: String,
-    refresh_token: String,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
     #[serde(default)]
     account_id: Option<String>,
 }
@@ -1164,32 +1171,14 @@ pub(crate) async fn import_llm_gateway_account(
         Ok(name) => name,
         Err(response) => return response.into_response(),
     };
-    let id_token = request.tokens.id_token.trim().to_string();
-    let access_token = request.tokens.access_token.trim().to_string();
-    let refresh_token = request.tokens.refresh_token.trim().to_string();
-    if access_token.is_empty() {
-        return bad_request("access_token is required").into_response();
-    }
-    if refresh_token.is_empty() {
-        return bad_request("refresh_token is required").into_response();
-    }
-    if id_token.is_empty() {
-        return bad_request("id_token is required").into_response();
-    }
-    let account_id = normalize_optional_string_option(request.tokens.account_id.as_deref());
-    let auth_json = match serde_json::to_string(&serde_json::json!({
-        "id_token": id_token,
-        "access_token": access_token,
-        "refresh_token": refresh_token,
-        "account_id": account_id,
-    })) {
-        Ok(value) => value,
-        Err(_) => return internal_error("Failed to encode account auth").into_response(),
+    let auth = match normalize_imported_codex_auth(request.auth_json, request.tokens) {
+        Ok(auth) => auth,
+        Err(response) => return response.into_response(),
     };
     let account = NewAdminCodexAccount {
         name,
-        account_id,
-        auth_json,
+        account_id: auth.account_id,
+        auth_json: auth.auth_json,
         map_gpt53_codex_to_spark: false,
         created_at_ms: now_ms(),
     };
@@ -2045,7 +2034,7 @@ pub(crate) async fn reject_llm_gateway_token_request(
     }
 }
 
-pub(crate) async fn approve_and_issue_llm_gateway_account_contribution_request(
+pub(crate) async fn validate_llm_gateway_account_contribution_request(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Path(request_id): Path<String>,
@@ -2072,24 +2061,124 @@ pub(crate) async fn approve_and_issue_llm_gateway_account_contribution_request(
         return conflict("LLM gateway account contribution request is finalized").into_response();
     }
     let action = review_queue_action(request);
+    let proxy = match required_codex_default_proxy(&state).await {
+        Ok(proxy) => proxy,
+        Err(response) => return response.into_response(),
+    };
+    let auth = match codex_auth_from_fields(
+        current.account_id.as_deref(),
+        Some(&current.id_token),
+        Some(&current.access_token),
+        Some(&current.refresh_token),
+    ) {
+        Ok(auth) => auth,
+        Err(response) => return response.into_response(),
+    };
+    let route = core_store::ProviderCodexRoute {
+        account_name: current.account_name.clone(),
+        account_group_id_at_event: None,
+        route_strategy_at_event: RouteStrategy::Auto,
+        auth_json: auth.auth_json,
+        map_gpt53_codex_to_spark: false,
+        request_max_concurrency: None,
+        request_min_start_interval_ms: None,
+        account_request_max_concurrency: None,
+        account_request_min_start_interval_ms: None,
+        proxy: Some(proxy),
+    };
+    let refreshed = match codex_refresh::refresh_auth_json_for_route(&route).await {
+        Ok(update) => update,
+        Err(err) => {
+            let failure_reason = format!("Codex auth refresh validation failed: {err}");
+            return match state
+                .admin_review_queue_store
+                .fail_admin_account_contribution_request(&request_id, failure_reason, action)
+                .await
+            {
+                Ok(Some(request)) => Json(request).into_response(),
+                Ok(None) => {
+                    not_found("LLM gateway account contribution request not found").into_response()
+                },
+                Err(_) => internal_error("Failed to fail llm gateway account contribution request")
+                    .into_response(),
+            };
+        },
+    };
+    let refreshed_auth = match normalize_codex_auth_json(&refreshed.auth_json) {
+        Ok(auth) => auth,
+        Err(response) => return response.into_response(),
+    };
+    let refreshed_id_token = refreshed_auth.id_token_or_empty();
+    let refreshed_access_token = refreshed_auth.access_token_or_empty();
+    let refreshed_refresh_token = refreshed_auth.refresh_token_or_empty();
+    match state
+        .admin_review_queue_store
+        .validate_admin_account_contribution_request(
+            &request_id,
+            refreshed_auth.account_id,
+            refreshed_id_token,
+            refreshed_access_token,
+            refreshed_refresh_token,
+            action,
+        )
+        .await
+    {
+        Ok(Some(request)) => Json(request).into_response(),
+        Ok(None) => not_found("LLM gateway account contribution request not found").into_response(),
+        Err(_) => internal_error("Failed to validate llm gateway account contribution request")
+            .into_response(),
+    }
+}
+
+pub(crate) async fn approve_and_issue_llm_gateway_account_contribution_request(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(request_id): Path<String>,
+    Json(request): Json<ReviewQueueActionRequest>,
+) -> Response {
+    if let Err(response) = ensure_admin_access(&headers) {
+        return response.into_response();
+    }
+    let current = match state
+        .admin_review_queue_store
+        .get_admin_account_contribution_request(&request_id)
+        .await
+    {
+        Ok(Some(request)) => request,
+        Ok(None) => {
+            return not_found("LLM gateway account contribution request not found").into_response()
+        },
+        Err(_) => {
+            return internal_error("Failed to load llm gateway account contribution request")
+                .into_response()
+        },
+    };
+    if matches!(current.status.as_str(), "issued" | "rejected") {
+        return conflict("LLM gateway account contribution request is finalized").into_response();
+    }
+    if current.status != core_store::PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED {
+        return conflict("LLM gateway account contribution request must be validated before issue")
+            .into_response();
+    }
+    let action = review_queue_action(request);
     let imported_account_name = current
         .imported_account_name
         .clone()
         .unwrap_or_else(|| current.account_name.clone());
     let account = if current.imported_account_name.is_none() {
-        let auth_json = match serde_json::to_string(&serde_json::json!({
-            "id_token": current.id_token,
-            "access_token": current.access_token,
-            "refresh_token": current.refresh_token,
-            "account_id": current.account_id,
-        })) {
-            Ok(value) => value,
-            Err(_) => return internal_error("Failed to encode account auth").into_response(),
+        let auth = match codex_auth_from_fields(
+            current.account_id.as_deref(),
+            Some(&current.id_token),
+            Some(&current.access_token),
+            Some(&current.refresh_token),
+        ) {
+            Ok(auth) => auth,
+            Err(response) => return response.into_response(),
         };
         Some(NewAdminCodexAccount {
             name: imported_account_name.clone(),
-            account_id: current.account_id.clone(),
-            auth_json,
+            account_id: auth.account_id,
+            auth_json: auth.auth_json,
             map_gpt53_codex_to_spark: false,
             created_at_ms: action.updated_at_ms,
         })
@@ -2766,6 +2855,37 @@ fn review_queue_action(request: ReviewQueueActionRequest) -> AdminReviewQueueAct
     }
 }
 
+async fn required_codex_default_proxy(
+    state: &HttpState,
+) -> Result<core_store::ProviderProxyConfig, AdminHttpError> {
+    let bindings = state
+        .admin_proxy_store
+        .list_admin_proxy_bindings()
+        .await
+        .map_err(|_| internal_error("Failed to list llm gateway proxy bindings"))?;
+    let binding = bindings
+        .into_iter()
+        .find(|binding| binding.provider_type == PROVIDER_CODEX)
+        .ok_or_else(|| bad_request("default Codex proxy binding is not configured"))?;
+    if let Some(message) = binding
+        .error_message
+        .as_deref()
+        .and_then(normalize_optional_string)
+    {
+        return Err(bad_request(&format!("default Codex proxy binding is invalid: {message}")));
+    }
+    let proxy_url = binding
+        .effective_proxy_url
+        .as_deref()
+        .and_then(normalize_optional_string)
+        .ok_or_else(|| bad_request("default Codex proxy is required for validation"))?;
+    Ok(core_store::ProviderProxyConfig {
+        proxy_url,
+        proxy_username: binding.effective_proxy_username,
+        proxy_password: binding.effective_proxy_password,
+    })
+}
+
 impl From<&UsageEvent> for AdminUsageEventView {
     fn from(value: &UsageEvent) -> Self {
         let latency_ms = usage_latency_ms(value);
@@ -3143,6 +3263,122 @@ fn normalize_optional_string(raw: &str) -> Option<String> {
 
 fn normalize_optional_string_option(raw: Option<&str>) -> Option<String> {
     raw.and_then(normalize_optional_string)
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedCodexAuth {
+    auth_json: String,
+    account_id: Option<String>,
+    id_token: Option<String>,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+}
+
+impl NormalizedCodexAuth {
+    fn id_token_or_empty(&self) -> String {
+        self.id_token.clone().unwrap_or_default()
+    }
+
+    fn access_token_or_empty(&self) -> String {
+        self.access_token.clone().unwrap_or_default()
+    }
+
+    fn refresh_token_or_empty(&self) -> String {
+        self.refresh_token.clone().unwrap_or_default()
+    }
+}
+
+fn normalize_imported_codex_auth(
+    raw_auth_json: Option<serde_json::Value>,
+    tokens: Option<ImportLlmGatewayAccountTokens>,
+) -> Result<NormalizedCodexAuth, AdminHttpError> {
+    if let Some(value) = raw_auth_json {
+        return normalize_codex_auth_value(value);
+    }
+    let Some(tokens) = tokens else {
+        return Err(bad_request("auth_json or tokens is required"));
+    };
+    codex_auth_from_fields(
+        tokens.account_id.as_deref(),
+        tokens.id_token.as_deref(),
+        tokens.access_token.as_deref(),
+        tokens.refresh_token.as_deref(),
+    )
+}
+
+fn codex_auth_from_fields(
+    account_id: Option<&str>,
+    id_token: Option<&str>,
+    access_token: Option<&str>,
+    refresh_token: Option<&str>,
+) -> Result<NormalizedCodexAuth, AdminHttpError> {
+    let account_id = normalize_optional_string_option(account_id);
+    let id_token = normalize_optional_string_option(id_token);
+    let access_token = normalize_optional_string_option(access_token);
+    let refresh_token = normalize_optional_string_option(refresh_token);
+    if access_token.is_none() && refresh_token.is_none() {
+        return Err(bad_request("access_token or refresh_token is required"));
+    }
+    let mut object = serde_json::Map::new();
+    if let Some(value) = id_token.as_ref() {
+        object.insert("id_token".to_string(), serde_json::Value::String(value.clone()));
+    }
+    if let Some(value) = access_token.as_ref() {
+        object.insert("access_token".to_string(), serde_json::Value::String(value.clone()));
+    }
+    if let Some(value) = refresh_token.as_ref() {
+        object.insert("refresh_token".to_string(), serde_json::Value::String(value.clone()));
+    }
+    if let Some(value) = account_id.as_ref() {
+        object.insert("account_id".to_string(), serde_json::Value::String(value.clone()));
+    }
+    normalize_codex_auth_value(serde_json::Value::Object(object))
+}
+
+fn normalize_codex_auth_json(raw: &str) -> Result<NormalizedCodexAuth, AdminHttpError> {
+    let value = serde_json::from_str::<serde_json::Value>(raw)
+        .map_err(|_| bad_request("auth_json must be valid JSON"))?;
+    normalize_codex_auth_value(value)
+}
+
+fn normalize_codex_auth_value(
+    value: serde_json::Value,
+) -> Result<NormalizedCodexAuth, AdminHttpError> {
+    if !value.is_object() {
+        return Err(bad_request("auth_json must be a JSON object"));
+    }
+    let id_token = optional_auth_json_string(&value, &["id_token", "idToken"]);
+    let access_token = optional_auth_json_string(&value, &["access_token", "accessToken"]);
+    let refresh_token = optional_auth_json_string(&value, &["refresh_token", "refreshToken"]);
+    let account_id = optional_auth_json_string(&value, &["account_id", "accountId"]);
+    if access_token.is_none() && refresh_token.is_none() {
+        return Err(bad_request("auth_json must contain access_token or refresh_token"));
+    }
+    let auth_json = serde_json::to_string(&value)
+        .map_err(|_| internal_error("Failed to encode account auth"))?;
+    Ok(NormalizedCodexAuth {
+        auth_json,
+        account_id,
+        id_token,
+        access_token,
+        refresh_token,
+    })
+}
+
+fn optional_auth_json_string(value: &serde_json::Value, fields: &[&str]) -> Option<String> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(serde_json::Value::as_str))
+        .or_else(|| {
+            value.get("tokens").and_then(|tokens| {
+                fields
+                    .iter()
+                    .find_map(|field| tokens.get(*field).and_then(serde_json::Value::as_str))
+            })
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn normalize_account_name(raw: &str) -> Result<String, AdminHttpError> {
@@ -3984,5 +4220,27 @@ mod tests {
         assert_eq!(accounts[0].last_usage_checked_at, Some(1200));
         assert_eq!(accounts[0].last_usage_success_at, Some(1100));
         assert_eq!(accounts[0].usage_error_message.as_deref(), Some("upstream 503"));
+    }
+
+    #[test]
+    fn imported_codex_auth_accepts_partial_and_preserves_raw_json() {
+        let raw = serde_json::json!({
+            "tokens": {
+                "refreshToken": " refresh-token ",
+                "accountId": "acct-1"
+            },
+            "device_id": "device-1"
+        });
+
+        let auth = normalize_imported_codex_auth(Some(raw), None).expect("normalize auth json");
+        let stored: serde_json::Value =
+            serde_json::from_str(&auth.auth_json).expect("stored auth json");
+
+        assert_eq!(auth.account_id.as_deref(), Some("acct-1"));
+        assert_eq!(auth.refresh_token.as_deref(), Some("refresh-token"));
+        assert_eq!(auth.id_token, None);
+        assert_eq!(auth.access_token, None);
+        assert_eq!(stored["device_id"], "device-1");
+        assert_eq!(stored["tokens"]["refreshToken"], " refresh-token ");
     }
 }

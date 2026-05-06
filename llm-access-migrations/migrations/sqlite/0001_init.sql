@@ -252,7 +252,7 @@ CREATE TABLE IF NOT EXISTS llm_account_contribution_requests (
     contributor_message TEXT NOT NULL,
     github_id TEXT,
     frontend_page_url TEXT,
-    status TEXT NOT NULL CHECK (status IN ('pending', 'issued', 'rejected', 'failed')),
+    status TEXT NOT NULL CHECK (status IN ('pending', 'validated', 'issued', 'rejected', 'failed')),
     fingerprint TEXT NOT NULL,
     client_ip TEXT NOT NULL,
     ip_region TEXT NOT NULL,
