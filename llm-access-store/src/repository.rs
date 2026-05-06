@@ -8,19 +8,21 @@ use llm_access_core::{
     store::{
         AdminAccountContributionRequest, AdminAccountContributionRequestsPage, AdminAccountGroup,
         AdminAccountGroupPatch, AdminAccountGroupStore, AdminCodexAccount, AdminCodexAccountPatch,
-        AdminCodexAccountStore, AdminConfigStore, AdminKey, AdminKeyPatch, AdminKeyStore,
+        AdminCodexAccountStore, AdminCodexImportJobDetail, AdminCodexImportJobItemResult,
+        AdminCodexImportJobSummary, AdminConfigStore, AdminKey, AdminKeyPatch, AdminKeyStore,
         AdminKiroAccount, AdminKiroAccountPatch, AdminKiroAccountStore, AdminKiroBalanceView,
         AdminKiroStatusCacheUpdate, AdminProxyBinding, AdminProxyConfig, AdminProxyConfigPatch,
         AdminProxyStore, AdminReviewQueueAction, AdminReviewQueueQuery, AdminReviewQueueStore,
         AdminRuntimeConfig, AdminSponsorRequest, AdminSponsorRequestsPage, AdminTokenRequest,
         AdminTokenRequestsPage, AuthenticatedKey, CodexRateLimitStatus, ControlStore,
-        NewAdminAccountGroup, NewAdminCodexAccount, NewAdminKey, NewAdminKiroAccount,
-        NewAdminProxyConfig, NewPublicAccountContributionRequest, NewPublicSponsorRequest,
-        NewPublicTokenRequest, ProviderCodexAuthUpdate, ProviderCodexRoute, ProviderKiroAuthUpdate,
-        ProviderKiroRoute, ProviderRouteStore, PublicAccessKey, PublicAccessStore,
-        PublicAccountContribution, PublicCommunityStore, PublicSponsor, PublicStatusStore,
-        PublicSubmissionStore, PublicUsageLookupKey, PublicUsageStore, UsageEventSink,
-        DEFAULT_AUTH_CACHE_TTL_SECONDS, DEFAULT_CODEX_STATUS_REFRESH_SECONDS,
+        NewAdminAccountGroup, NewAdminCodexAccount, NewAdminCodexImportJob, NewAdminKey,
+        NewAdminKiroAccount, NewAdminProxyConfig, NewPublicAccountContributionRequest,
+        NewPublicSponsorRequest, NewPublicTokenRequest, ProviderCodexAuthUpdate,
+        ProviderCodexRoute, ProviderKiroAuthUpdate, ProviderKiroRoute, ProviderRouteStore,
+        PublicAccessKey, PublicAccessStore, PublicAccountContribution, PublicCommunityStore,
+        PublicSponsor, PublicStatusStore, PublicSubmissionStore, PublicUsageLookupKey,
+        PublicUsageStore, UsageEventSink, DEFAULT_AUTH_CACHE_TTL_SECONDS,
+        DEFAULT_CODEX_STATUS_REFRESH_SECONDS,
     },
     usage::UsageEvent,
 };
@@ -376,6 +378,38 @@ impl AdminCodexAccountStore for SqliteControlRepository {
         .context("sqlite control repository codex account list task failed")?
     }
 
+    async fn get_admin_codex_account(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<AdminCodexAccount>> {
+        let name = name.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.get_admin_codex_account(&name)
+        })
+        .await
+        .context("sqlite control repository codex account get task failed")?
+    }
+
+    async fn find_admin_codex_account_name_by_account_id(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let account_id = account_id.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.find_admin_codex_account_name_by_account_id(&account_id)
+        })
+        .await
+        .context("sqlite control repository codex account lookup by account id task failed")?
+    }
+
     async fn create_admin_codex_account(
         &self,
         account: NewAdminCodexAccount,
@@ -455,6 +489,123 @@ impl AdminCodexAccountStore for SqliteControlRepository {
         })
         .await
         .context("sqlite control repository codex account route task failed")?
+    }
+
+    async fn create_admin_codex_import_job(
+        &self,
+        job: NewAdminCodexImportJob,
+    ) -> anyhow::Result<AdminCodexImportJobDetail> {
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.create_admin_codex_import_job(&job)
+        })
+        .await
+        .context("sqlite control repository codex import job create task failed")?
+    }
+
+    async fn list_admin_codex_import_jobs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AdminCodexImportJobSummary>> {
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.list_admin_codex_import_jobs(limit)
+        })
+        .await
+        .context("sqlite control repository codex import job list task failed")?
+    }
+
+    async fn get_admin_codex_import_job(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<Option<AdminCodexImportJobDetail>> {
+        let job_id = job_id.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.get_admin_codex_import_job(&job_id)
+        })
+        .await
+        .context("sqlite control repository codex import job get task failed")?
+    }
+
+    async fn mark_admin_codex_import_job_running(
+        &self,
+        job_id: &str,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let job_id = job_id.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.mark_admin_codex_import_job_running(&job_id, updated_at_ms)
+        })
+        .await
+        .context("sqlite control repository codex import job mark running task failed")?
+    }
+
+    async fn mark_admin_codex_import_job_item_running(
+        &self,
+        job_id: &str,
+        item_index: usize,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let job_id = job_id.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.mark_admin_codex_import_job_item_running(&job_id, item_index, updated_at_ms)
+        })
+        .await
+        .context("sqlite control repository codex import job item mark running task failed")?
+    }
+
+    async fn complete_admin_codex_import_job_item(
+        &self,
+        job_id: &str,
+        result: AdminCodexImportJobItemResult,
+    ) -> anyhow::Result<Option<AdminCodexImportJobSummary>> {
+        let job_id = job_id.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.complete_admin_codex_import_job_item(&job_id, &result)
+        })
+        .await
+        .context("sqlite control repository codex import job item completion task failed")?
+    }
+
+    async fn fail_admin_codex_import_job(
+        &self,
+        job_id: &str,
+        error_message: &str,
+        finished_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let job_id = job_id.to_string();
+        let error_message = error_message.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.fail_admin_codex_import_job(&job_id, &error_message, finished_at_ms)
+        })
+        .await
+        .context("sqlite control repository codex import job fail task failed")?
     }
 }
 
@@ -1216,10 +1367,11 @@ mod tests {
         provider::{ProtocolFamily, ProviderType, RouteStrategy},
         store::{
             AdminAccountGroupPatch, AdminAccountGroupStore, AdminCodexAccountPatch,
-            AdminCodexAccountStore, AdminConfigStore, AdminKeyPatch, AdminKeyStore,
-            AdminProxyConfigPatch, AdminProxyStore, CodexCredits, CodexPublicAccountStatus,
-            CodexRateLimitBucket, CodexRateLimitStatus, CodexRateLimitWindow, ControlStore,
-            NewAdminAccountGroup, NewAdminCodexAccount, NewAdminKey, NewAdminProxyConfig,
+            AdminCodexAccountStore, AdminCodexImportJobItemResult, AdminConfigStore, AdminKeyPatch,
+            AdminKeyStore, AdminProxyConfigPatch, AdminProxyStore, CodexCredits,
+            CodexPublicAccountStatus, CodexRateLimitBucket, CodexRateLimitStatus,
+            CodexRateLimitWindow, ControlStore, NewAdminAccountGroup, NewAdminCodexAccount,
+            NewAdminCodexImportJob, NewAdminCodexImportJobItem, NewAdminKey, NewAdminProxyConfig,
             PublicAccessStore, PublicCommunityStore, PublicStatusStore, PublicUsageStore,
             UsageEventSink,
         },
@@ -1579,6 +1731,99 @@ mod tests {
             .await
             .expect("list codex accounts")
             .is_empty());
+    }
+
+    #[tokio::test]
+    async fn sqlite_repository_manages_admin_codex_import_job_lifecycle() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlRepository::new(conn);
+
+        let detail = repo
+            .create_admin_codex_import_job(NewAdminCodexImportJob {
+                job_id: "llm-import-1".to_string(),
+                provider_type: "codex".to_string(),
+                source_type: "local_json".to_string(),
+                validate_before_import: false,
+                items: vec![
+                    NewAdminCodexImportJobItem {
+                        requested_name: "codex-a".to_string(),
+                        requested_account_id: Some("acct-a".to_string()),
+                        raw_auth_json: r#"{"refresh_token":"rt-a"}"#.to_string(),
+                    },
+                    NewAdminCodexImportJobItem {
+                        requested_name: "codex-b".to_string(),
+                        requested_account_id: Some("acct-b".to_string()),
+                        raw_auth_json: r#"{"refresh_token":"rt-b"}"#.to_string(),
+                    },
+                ],
+                created_at_ms: 100,
+            })
+            .await
+            .expect("create import job");
+        assert_eq!(detail.summary.job_id, "llm-import-1");
+        assert_eq!(detail.summary.total_count, 2);
+        assert_eq!(detail.items.len(), 2);
+        assert_eq!(detail.items[0].status, "pending");
+
+        repo.mark_admin_codex_import_job_running("llm-import-1", 110)
+            .await
+            .expect("mark job running");
+        repo.mark_admin_codex_import_job_item_running("llm-import-1", 0, 111)
+            .await
+            .expect("mark item 0 running");
+        repo.complete_admin_codex_import_job_item("llm-import-1", AdminCodexImportJobItemResult {
+            item_index: 0,
+            status: "imported".to_string(),
+            error_message: None,
+            imported_account_name: Some("codex-a".to_string()),
+            final_account_id: Some("acct-a".to_string()),
+            validated_at_ms: Some(112),
+            imported_at_ms: Some(113),
+            completed_delta: 1,
+            succeeded_delta: 1,
+            skipped_delta: 0,
+            failed_delta: 0,
+            updated_at_ms: 113,
+        })
+        .await
+        .expect("complete item 0");
+        repo.mark_admin_codex_import_job_item_running("llm-import-1", 1, 114)
+            .await
+            .expect("mark item 1 running");
+        let summary = repo
+            .complete_admin_codex_import_job_item("llm-import-1", AdminCodexImportJobItemResult {
+                item_index: 1,
+                status: "conflict".to_string(),
+                error_message: Some("account name already exists".to_string()),
+                imported_account_name: None,
+                final_account_id: Some("acct-b".to_string()),
+                validated_at_ms: None,
+                imported_at_ms: None,
+                completed_delta: 1,
+                succeeded_delta: 0,
+                skipped_delta: 0,
+                failed_delta: 1,
+                updated_at_ms: 115,
+            })
+            .await
+            .expect("complete item 1")
+            .expect("job summary exists");
+        assert_eq!(summary.status, "completed");
+        assert_eq!(summary.completed_count, 2);
+        assert_eq!(summary.succeeded_count, 1);
+        assert_eq!(summary.failed_count, 1);
+
+        let detail = repo
+            .get_admin_codex_import_job("llm-import-1")
+            .await
+            .expect("load import job")
+            .expect("job exists");
+        assert_eq!(detail.summary.finished_at_ms, Some(115));
+        assert_eq!(detail.items[0].status, "imported");
+        assert_eq!(detail.items[0].imported_account_name.as_deref(), Some("codex-a"));
+        assert_eq!(detail.items[1].status, "conflict");
+        assert_eq!(detail.items[1].error_message.as_deref(), Some("account name already exists"));
     }
 
     #[tokio::test]

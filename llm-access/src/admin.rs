@@ -1,13 +1,14 @@
 //! Local admin endpoints for the standalone LLM access service.
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs,
     net::IpAddr,
     path::PathBuf,
     time::{Duration, Instant},
 };
 
+use anyhow::Context;
 use axum::{
     extract::{Path, Query, State},
     http::{header, HeaderMap, StatusCode},
@@ -17,12 +18,13 @@ use axum::{
 use llm_access_core::{
     provider::RouteStrategy,
     store::{
-        self as core_store, AdminAccountGroupPatch, AdminCodexAccountPatch, AdminKeyPatch,
-        AdminProxyConfigPatch, AdminReviewQueueAction, AdminRuntimeConfig, NewAdminAccountGroup,
-        NewAdminCodexAccount, NewAdminKey, NewAdminKiroAccount, NewAdminProxyConfig,
-        UpdateAdminRuntimeConfig, UsageEventQuery, UsageEventSource, KEY_STATUS_ACTIVE,
-        KEY_STATUS_DISABLED, KIRO_PREFIX_CACHE_MODE_FORMULA, PROTOCOL_ANTHROPIC, PROTOCOL_OPENAI,
-        PROVIDER_CODEX, PROVIDER_KIRO,
+        self as core_store, AdminAccountGroupPatch, AdminCodexAccountPatch,
+        AdminCodexImportJobItemResult, AdminKeyPatch, AdminProxyConfigPatch,
+        AdminReviewQueueAction, AdminRuntimeConfig, NewAdminAccountGroup, NewAdminCodexAccount,
+        NewAdminCodexImportJob, NewAdminCodexImportJobItem, NewAdminKey, NewAdminKiroAccount,
+        NewAdminProxyConfig, UpdateAdminRuntimeConfig, UsageEventQuery, UsageEventSource,
+        KEY_STATUS_ACTIVE, KEY_STATUS_DISABLED, KIRO_PREFIX_CACHE_MODE_FORMULA, PROTOCOL_ANTHROPIC,
+        PROTOCOL_OPENAI, PROVIDER_CODEX, PROVIDER_KIRO,
     },
     usage::UsageEvent,
 };
@@ -65,6 +67,8 @@ const MAX_CODEX_KEY_REQUEST_MAX_CONCURRENCY: u64 = 1_024;
 const MAX_CODEX_KEY_REQUEST_MIN_START_INTERVAL_MS: u64 = 300_000;
 const DEFAULT_ADMIN_REVIEW_QUEUE_LIMIT: usize = 50;
 const MAX_ADMIN_REVIEW_QUEUE_LIMIT: usize = 200;
+const DEFAULT_ADMIN_IMPORT_JOB_LIMIT: usize = 20;
+const MAX_ADMIN_IMPORT_JOB_LIMIT: usize = 50;
 const DEFAULT_ADMIN_USAGE_LIMIT: usize = 20;
 const MAX_ADMIN_USAGE_LIMIT: usize = 20;
 const MAX_ADMIN_USAGE_OFFSET: usize = 200;
@@ -111,6 +115,12 @@ struct AdminProxyBindingsResponse {
 #[derive(Debug, Serialize)]
 struct AdminAccountsResponse {
     accounts: Vec<core_store::AdminCodexAccount>,
+    generated_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminCodexImportJobsResponse {
+    jobs: Vec<core_store::AdminCodexImportJobSummary>,
     generated_at: i64,
 }
 
@@ -422,6 +432,30 @@ pub(crate) struct ImportLlmGatewayAccountTokens {
     refresh_token: Option<String>,
     #[serde(default)]
     account_id: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreateCodexBatchImportJobRequest {
+    provider_type: String,
+    source_type: String,
+    #[serde(default)]
+    validate_before_import: bool,
+    items: Vec<CreateCodexBatchImportJobItemRequest>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct CreateCodexBatchImportJobItemRequest {
+    name: String,
+    #[serde(default)]
+    tokens: Option<ImportLlmGatewayAccountTokens>,
+    #[serde(default)]
+    auth_json: Option<serde_json::Value>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+pub(crate) struct ListCodexImportJobsRequest {
+    #[serde(default)]
+    limit: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1189,6 +1223,108 @@ pub(crate) async fn import_llm_gateway_account(
     {
         Ok(account) => Json(account).into_response(),
         Err(_) => internal_error("Failed to import llm gateway account").into_response(),
+    }
+}
+
+pub(crate) async fn create_llm_gateway_account_import_job(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<CreateCodexBatchImportJobRequest>,
+) -> Response {
+    if let Err(response) = ensure_admin_access(&headers) {
+        return response.into_response();
+    }
+    let request = match normalize_codex_batch_import_request(request) {
+        Ok(request) => request,
+        Err(response) => return response.into_response(),
+    };
+    let created_at_ms = now_ms();
+    let job_id = generate_id("llm-import");
+    let persisted = NewAdminCodexImportJob {
+        job_id: job_id.clone(),
+        provider_type: request.provider_type.clone(),
+        source_type: request.source_type.clone(),
+        validate_before_import: request.validate_before_import,
+        items: request
+            .items
+            .iter()
+            .map(|item| NewAdminCodexImportJobItem {
+                requested_name: item.requested_name.clone(),
+                requested_account_id: item.requested_account_id.clone(),
+                raw_auth_json: item.raw_auth_json.clone(),
+            })
+            .collect(),
+        created_at_ms,
+    };
+    let detail = match state
+        .admin_codex_account_store
+        .create_admin_codex_import_job(persisted)
+        .await
+    {
+        Ok(detail) => detail,
+        Err(_) => {
+            return internal_error("Failed to create llm gateway account import job")
+                .into_response();
+        },
+    };
+
+    let worker_state = state.clone();
+    tokio::spawn(async move {
+        if let Err(err) =
+            run_codex_batch_import_job(worker_state.clone(), job_id.clone(), request).await
+        {
+            let _ = worker_state
+                .admin_codex_account_store
+                .fail_admin_codex_import_job(&job_id, &err.to_string(), now_ms())
+                .await;
+        }
+    });
+
+    Json(detail).into_response()
+}
+
+pub(crate) async fn list_llm_gateway_account_import_jobs(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Query(query): Query<ListCodexImportJobsRequest>,
+) -> Response {
+    if let Err(response) = ensure_admin_access(&headers) {
+        return response.into_response();
+    }
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_ADMIN_IMPORT_JOB_LIMIT)
+        .clamp(1, MAX_ADMIN_IMPORT_JOB_LIMIT);
+    match state
+        .admin_codex_account_store
+        .list_admin_codex_import_jobs(limit)
+        .await
+    {
+        Ok(jobs) => Json(AdminCodexImportJobsResponse {
+            jobs,
+            generated_at: now_ms(),
+        })
+        .into_response(),
+        Err(_) => internal_error("Failed to list llm gateway account import jobs").into_response(),
+    }
+}
+
+pub(crate) async fn get_llm_gateway_account_import_job(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(job_id): Path<String>,
+) -> Response {
+    if let Err(response) = ensure_admin_access(&headers) {
+        return response.into_response();
+    }
+    match state
+        .admin_codex_account_store
+        .get_admin_codex_import_job(&job_id)
+        .await
+    {
+        Ok(Some(detail)) => Json(detail).into_response(),
+        Ok(None) => not_found("LLM gateway account import job not found").into_response(),
+        Err(_) => internal_error("Failed to load llm gateway account import job").into_response(),
     }
 }
 
@@ -2886,6 +3022,320 @@ async fn required_codex_default_proxy(
     })
 }
 
+async fn run_codex_batch_import_job(
+    state: HttpState,
+    job_id: String,
+    request: NormalizedCodexBatchImportJobRequest,
+) -> anyhow::Result<()> {
+    state
+        .admin_codex_account_store
+        .mark_admin_codex_import_job_running(&job_id, now_ms())
+        .await
+        .with_context(|| format!("mark codex import job `{job_id}` running"))?;
+
+    let mut seen_names = HashSet::new();
+    for item in request.items {
+        let item_updated_at_ms = now_ms();
+        state
+            .admin_codex_account_store
+            .mark_admin_codex_import_job_item_running(&job_id, item.item_index, item_updated_at_ms)
+            .await
+            .with_context(|| {
+                format!("mark codex import job `{job_id}` item {} running", item.item_index)
+            })?;
+
+        if !seen_names.insert(item.requested_name.clone()) {
+            state
+                .admin_codex_account_store
+                .complete_admin_codex_import_job_item(
+                    &job_id,
+                    codex_import_job_failure_result(
+                        item.item_index,
+                        "conflict",
+                        Some("account name is duplicated within the batch".to_string()),
+                        item.requested_account_id.clone(),
+                        None,
+                        None,
+                    ),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "complete duplicated codex import job `{job_id}` item {}",
+                        item.item_index
+                    )
+                })?;
+            continue;
+        }
+
+        if state
+            .admin_codex_account_store
+            .get_admin_codex_account(&item.requested_name)
+            .await
+            .with_context(|| format!("load codex account `{}`", item.requested_name))?
+            .is_some()
+        {
+            state
+                .admin_codex_account_store
+                .complete_admin_codex_import_job_item(
+                    &job_id,
+                    codex_import_job_failure_result(
+                        item.item_index,
+                        "conflict",
+                        Some("account name already exists".to_string()),
+                        item.requested_account_id.clone(),
+                        None,
+                        None,
+                    ),
+                )
+                .await
+                .with_context(|| {
+                    format!(
+                        "complete existing-name conflict for codex import job `{job_id}` item {}",
+                        item.item_index
+                    )
+                })?;
+            continue;
+        }
+
+        if let Some(account_id) = item.requested_account_id.as_deref() {
+            if let Some(existing_name) = state
+                .admin_codex_account_store
+                .find_admin_codex_account_name_by_account_id(account_id)
+                .await
+                .with_context(|| format!("lookup codex account id `{account_id}`"))?
+            {
+                if existing_name != item.requested_name {
+                    state
+                        .admin_codex_account_store
+                        .complete_admin_codex_import_job_item(
+                            &job_id,
+                            codex_import_job_failure_result(
+                                item.item_index,
+                                "conflict",
+                                Some("account_id already belongs to another account".to_string()),
+                                Some(account_id.to_string()),
+                                None,
+                                None,
+                            ),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "complete account-id conflict for codex import job `{job_id}` \
+                                 item {}",
+                                item.item_index
+                            )
+                        })?;
+                    continue;
+                }
+            }
+        }
+
+        let (auth, validated_at_ms) = if request.validate_before_import {
+            match refresh_validated_codex_batch_import_auth(&state, &item).await {
+                Ok(auth) => (auth, Some(now_ms())),
+                Err(err) => {
+                    state
+                        .admin_codex_account_store
+                        .complete_admin_codex_import_job_item(
+                            &job_id,
+                            codex_import_job_failure_result(
+                                item.item_index,
+                                "failed",
+                                Some(err.to_string()),
+                                item.requested_account_id.clone(),
+                                None,
+                                None,
+                            ),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "complete validation failure for codex import job `{job_id}` item \
+                                 {}",
+                                item.item_index
+                            )
+                        })?;
+                    continue;
+                },
+            }
+        } else {
+            (item.auth.clone(), None)
+        };
+
+        if let Some(account_id) = auth.account_id.as_deref() {
+            if let Some(existing_name) = state
+                .admin_codex_account_store
+                .find_admin_codex_account_name_by_account_id(account_id)
+                .await
+                .with_context(|| format!("lookup refreshed codex account id `{account_id}`"))?
+            {
+                if existing_name != item.requested_name {
+                    state
+                        .admin_codex_account_store
+                        .complete_admin_codex_import_job_item(
+                            &job_id,
+                            codex_import_job_failure_result(
+                                item.item_index,
+                                "conflict",
+                                Some(
+                                    "validated account_id already belongs to another account"
+                                        .to_string(),
+                                ),
+                                Some(account_id.to_string()),
+                                validated_at_ms,
+                                None,
+                            ),
+                        )
+                        .await
+                        .with_context(|| {
+                            format!(
+                                "complete validated account-id conflict for codex import job \
+                                 `{job_id}` item {}",
+                                item.item_index
+                            )
+                        })?;
+                    continue;
+                }
+            }
+        }
+
+        let imported_at_ms = now_ms();
+        match state
+            .admin_codex_account_store
+            .create_admin_codex_account(NewAdminCodexAccount {
+                name: item.requested_name.clone(),
+                account_id: auth.account_id.clone(),
+                auth_json: auth.auth_json.clone(),
+                map_gpt53_codex_to_spark: false,
+                created_at_ms: imported_at_ms,
+            })
+            .await
+        {
+            Ok(account) => {
+                state
+                    .admin_codex_account_store
+                    .complete_admin_codex_import_job_item(
+                        &job_id,
+                        codex_import_job_success_result(
+                            item.item_index,
+                            account.name,
+                            account.account_id.or(auth.account_id.clone()),
+                            validated_at_ms,
+                            imported_at_ms,
+                        ),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "complete imported codex import job `{job_id}` item {}",
+                            item.item_index
+                        )
+                    })?;
+            },
+            Err(err) => {
+                state
+                    .admin_codex_account_store
+                    .complete_admin_codex_import_job_item(
+                        &job_id,
+                        codex_import_job_failure_result(
+                            item.item_index,
+                            "failed",
+                            Some(err.to_string()),
+                            auth.account_id.clone(),
+                            validated_at_ms,
+                            None,
+                        ),
+                    )
+                    .await
+                    .with_context(|| {
+                        format!(
+                            "complete create failure for codex import job `{job_id}` item {}",
+                            item.item_index
+                        )
+                    })?;
+            },
+        }
+    }
+
+    Ok(())
+}
+
+async fn refresh_validated_codex_batch_import_auth(
+    state: &HttpState,
+    item: &NormalizedCodexBatchImportJobItem,
+) -> anyhow::Result<NormalizedCodexAuth> {
+    let proxy = required_codex_default_proxy(state)
+        .await
+        .map_err(|err| anyhow::anyhow!(err.message))?;
+    let route = core_store::ProviderCodexRoute {
+        account_name: item.requested_name.clone(),
+        account_group_id_at_event: None,
+        route_strategy_at_event: RouteStrategy::Fixed,
+        auth_json: item.auth.auth_json.clone(),
+        map_gpt53_codex_to_spark: false,
+        request_max_concurrency: None,
+        request_min_start_interval_ms: None,
+        account_request_max_concurrency: None,
+        account_request_min_start_interval_ms: None,
+        proxy: Some(proxy),
+    };
+    let refreshed = codex_refresh::refresh_auth_json_for_route(&route)
+        .await
+        .with_context(|| {
+            format!("refresh auth for codex batch import account `{}`", item.requested_name)
+        })?;
+    normalize_codex_auth_json(&refreshed.auth_json).map_err(|err| anyhow::anyhow!(err.message))
+}
+
+fn codex_import_job_failure_result(
+    item_index: usize,
+    status: &str,
+    error_message: Option<String>,
+    final_account_id: Option<String>,
+    validated_at_ms: Option<i64>,
+    imported_at_ms: Option<i64>,
+) -> AdminCodexImportJobItemResult {
+    AdminCodexImportJobItemResult {
+        item_index,
+        status: status.to_string(),
+        error_message,
+        imported_account_name: None,
+        final_account_id,
+        validated_at_ms,
+        imported_at_ms,
+        completed_delta: 1,
+        succeeded_delta: 0,
+        skipped_delta: 0,
+        failed_delta: 1,
+        updated_at_ms: now_ms(),
+    }
+}
+
+fn codex_import_job_success_result(
+    item_index: usize,
+    imported_account_name: String,
+    final_account_id: Option<String>,
+    validated_at_ms: Option<i64>,
+    imported_at_ms: i64,
+) -> AdminCodexImportJobItemResult {
+    AdminCodexImportJobItemResult {
+        item_index,
+        status: "imported".to_string(),
+        error_message: None,
+        imported_account_name: Some(imported_account_name),
+        final_account_id,
+        validated_at_ms,
+        imported_at_ms: Some(imported_at_ms),
+        completed_delta: 1,
+        succeeded_delta: 1,
+        skipped_delta: 0,
+        failed_delta: 0,
+        updated_at_ms: now_ms(),
+    }
+}
+
 impl From<&UsageEvent> for AdminUsageEventView {
     fn from(value: &UsageEvent) -> Self {
         let latency_ms = usage_latency_ms(value);
@@ -3286,6 +3736,55 @@ impl NormalizedCodexAuth {
     fn refresh_token_or_empty(&self) -> String {
         self.refresh_token.clone().unwrap_or_default()
     }
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedCodexBatchImportJobRequest {
+    provider_type: String,
+    source_type: String,
+    validate_before_import: bool,
+    items: Vec<NormalizedCodexBatchImportJobItem>,
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedCodexBatchImportJobItem {
+    item_index: usize,
+    requested_name: String,
+    requested_account_id: Option<String>,
+    raw_auth_json: String,
+    auth: NormalizedCodexAuth,
+}
+
+fn normalize_codex_batch_import_request(
+    request: CreateCodexBatchImportJobRequest,
+) -> Result<NormalizedCodexBatchImportJobRequest, AdminHttpError> {
+    if request.provider_type.trim() != PROVIDER_CODEX {
+        return Err(bad_request("provider_type must be codex"));
+    }
+    if request.source_type.trim() != "local_json" {
+        return Err(bad_request("source_type must be local_json"));
+    }
+    if request.items.is_empty() {
+        return Err(bad_request("items must not be empty"));
+    }
+    let mut items = Vec::with_capacity(request.items.len());
+    for (item_index, item) in request.items.into_iter().enumerate() {
+        let requested_name = normalize_account_name(&item.name)?;
+        let auth = normalize_imported_codex_auth(item.auth_json, item.tokens)?;
+        items.push(NormalizedCodexBatchImportJobItem {
+            item_index,
+            requested_name,
+            requested_account_id: auth.account_id.clone(),
+            raw_auth_json: auth.auth_json.clone(),
+            auth,
+        });
+    }
+    Ok(NormalizedCodexBatchImportJobRequest {
+        provider_type: PROVIDER_CODEX.to_string(),
+        source_type: "local_json".to_string(),
+        validate_before_import: request.validate_before_import,
+        items,
+    })
 }
 
 fn normalize_imported_codex_auth(
@@ -4242,5 +4741,45 @@ mod tests {
         assert_eq!(auth.access_token, None);
         assert_eq!(stored["device_id"], "device-1");
         assert_eq!(stored["tokens"]["refreshToken"], " refresh-token ");
+    }
+
+    #[test]
+    fn codex_batch_import_request_rejects_empty_items() {
+        let err = normalize_codex_batch_import_request(CreateCodexBatchImportJobRequest {
+            provider_type: "codex".to_string(),
+            source_type: "local_json".to_string(),
+            validate_before_import: false,
+            items: Vec::new(),
+        })
+        .expect_err("empty items must fail");
+
+        assert_eq!(err.status, StatusCode::BAD_REQUEST);
+        assert!(err.message.contains("items"));
+    }
+
+    #[test]
+    fn codex_batch_import_item_reuses_auth_json_normalization() {
+        let normalized = normalize_codex_batch_import_request(CreateCodexBatchImportJobRequest {
+            provider_type: "codex".to_string(),
+            source_type: "local_json".to_string(),
+            validate_before_import: false,
+            items: vec![CreateCodexBatchImportJobItemRequest {
+                name: "codex_primary".to_string(),
+                tokens: None,
+                auth_json: Some(serde_json::json!({
+                    "tokens": {
+                        "refreshToken": " refresh-token ",
+                        "accountId": "acct-1"
+                    },
+                    "device_id": "device-1"
+                })),
+            }],
+        })
+        .expect("normalize batch request");
+
+        assert_eq!(normalized.items.len(), 1);
+        assert_eq!(normalized.items[0].requested_name, "codex_primary");
+        assert_eq!(normalized.items[0].requested_account_id.as_deref(), Some("acct-1"));
+        assert!(normalized.items[0].raw_auth_json.contains("device_id"));
     }
 }

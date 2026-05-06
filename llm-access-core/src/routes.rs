@@ -209,6 +209,14 @@ pub const ADMIN_ROUTES: &[RouteSpec] = &[
         path: "/admin/llm-gateway/accounts",
     },
     RouteSpec {
+        method: "GET|POST",
+        path: "/admin/llm-gateway/accounts/import-jobs",
+    },
+    RouteSpec {
+        method: "GET",
+        path: "/admin/llm-gateway/accounts/import-jobs/:job_id",
+    },
+    RouteSpec {
         method: "PATCH|DELETE",
         path: "/admin/llm-gateway/accounts/:name",
     },
@@ -325,6 +333,8 @@ mod tests {
             .map(|route| route.path)
             .collect::<Vec<_>>();
         assert!(paths.contains(&"/admin/llm-gateway/keys"));
+        assert!(paths.contains(&"/admin/llm-gateway/accounts/import-jobs"));
+        assert!(paths.contains(&"/admin/llm-gateway/accounts/import-jobs/:job_id"));
         assert!(paths.contains(&"/admin/llm-gateway/accounts/:name/refresh"));
         assert!(paths.contains(&"/admin/kiro-gateway/keys/:key_id"));
         assert!(paths.contains(&"/admin/kiro-gateway/accounts/:name/balance"));

@@ -39,6 +39,11 @@ const SQLITE_MIGRATIONS: &[SqlMigration] = &[
         name: "account_contribution_validated_status",
         sql: include_str!("../migrations/sqlite/0005_account_contribution_validated_status.sql"),
     },
+    SqlMigration {
+        version: 6,
+        name: "codex_account_import_jobs",
+        sql: include_str!("../migrations/sqlite/0006_codex_account_import_jobs.sql"),
+    },
 ];
 
 const DUCKDB_MIGRATIONS: &[SqlMigration] = &[
@@ -129,7 +134,7 @@ mod tests {
     fn sqlite_migrations_are_file_backed_and_versioned() {
         let migrations = super::sqlite_migrations();
 
-        assert_eq!(migrations.len(), 5);
+        assert_eq!(migrations.len(), 6);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(migrations[0].name, "init");
         assert!(migrations[0]
@@ -154,6 +159,11 @@ mod tests {
         assert_eq!(migrations[4].version, 5);
         assert_eq!(migrations[4].name, "account_contribution_validated_status");
         assert!(migrations[4].sql.contains("'validated'"));
+        assert_eq!(migrations[5].version, 6);
+        assert_eq!(migrations[5].name, "codex_account_import_jobs");
+        assert!(migrations[5]
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS llm_account_import_jobs"));
     }
 
     #[test]
@@ -187,7 +197,7 @@ mod tests {
         let applied_count: i64 = conn
             .query_row("SELECT count(*) FROM llm_access_schema_migrations", [], |row| row.get(0))
             .expect("count migrations");
-        assert_eq!(applied_count, 5);
+        assert_eq!(applied_count, 6);
 
         let full_logging_column_count: i64 = conn
             .query_row(
@@ -226,5 +236,29 @@ mod tests {
             [],
         )
         .expect("validated account contribution status is allowed");
+
+        conn.execute(
+            "INSERT INTO llm_account_import_jobs (
+                job_id, provider_type, source_type, validate_before_import, status,
+                total_count, completed_count, succeeded_count, skipped_count, failed_count,
+                created_at_ms, updated_at_ms
+            ) VALUES (
+                'llm-import-test', 'codex', 'local_json', 1, 'pending',
+                1, 0, 0, 0, 0, 1, 1
+            )",
+            [],
+        )
+        .expect("codex import job row is allowed");
+        conn.execute(
+            "INSERT INTO llm_account_import_job_items (
+                job_id, item_index, requested_name, requested_account_id, raw_auth_json,
+                status, created_at_ms, updated_at_ms
+            ) VALUES (
+                'llm-import-test', 0, 'codex-a', 'acct-a', '{\"refresh_token\":\"rt\"}',
+                'pending', 1, 1
+            )",
+            [],
+        )
+        .expect("codex import job item row is allowed");
     }
 }

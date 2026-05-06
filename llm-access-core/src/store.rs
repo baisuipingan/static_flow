@@ -675,6 +675,128 @@ pub struct AdminCodexAccountPatch {
     pub updated_at_ms: i64,
 }
 
+/// Admin-facing summary for one Codex batch import job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminCodexImportJobSummary {
+    /// Batch job id.
+    pub job_id: String,
+    /// Provider type.
+    pub provider_type: String,
+    /// Import source type.
+    pub source_type: String,
+    /// Whether refresh validation runs before import.
+    pub validate_before_import: bool,
+    /// Current batch status.
+    pub status: String,
+    /// Total queued item count.
+    pub total_count: usize,
+    /// Number of terminal items.
+    pub completed_count: usize,
+    /// Number of imported items.
+    pub succeeded_count: usize,
+    /// Number of skipped items.
+    pub skipped_count: usize,
+    /// Number of failed/conflict items.
+    pub failed_count: usize,
+    /// Batch-level failure reason when the worker aborts early.
+    pub batch_error_message: Option<String>,
+    /// Creation timestamp.
+    pub created_at_ms: i64,
+    /// Last update timestamp.
+    pub updated_at_ms: i64,
+    /// Finish timestamp once terminal.
+    pub finished_at_ms: Option<i64>,
+}
+
+/// Admin-facing result row for one Codex batch import item.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminCodexImportJobItem {
+    /// Zero-based item index within the batch.
+    pub item_index: usize,
+    /// Requested account name.
+    pub requested_name: String,
+    /// Requested upstream account id when present.
+    pub requested_account_id: Option<String>,
+    /// Current item status.
+    pub status: String,
+    /// Terminal error message when the item fails.
+    pub error_message: Option<String>,
+    /// Imported account name when successful.
+    pub imported_account_name: Option<String>,
+    /// Final upstream account id after validation/import.
+    pub final_account_id: Option<String>,
+    /// Validation timestamp when refresh validation succeeds.
+    pub validated_at_ms: Option<i64>,
+    /// Import timestamp when the account row is created.
+    pub imported_at_ms: Option<i64>,
+}
+
+/// Full admin-facing detail for one Codex batch import job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminCodexImportJobDetail {
+    /// Job summary row.
+    pub summary: AdminCodexImportJobSummary,
+    /// Per-item states ordered by item index.
+    pub items: Vec<AdminCodexImportJobItem>,
+}
+
+/// New batch import job persisted before background execution starts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAdminCodexImportJob {
+    /// Batch job id.
+    pub job_id: String,
+    /// Provider type.
+    pub provider_type: String,
+    /// Import source type.
+    pub source_type: String,
+    /// Whether refresh validation runs before import.
+    pub validate_before_import: bool,
+    /// Submitted items.
+    pub items: Vec<NewAdminCodexImportJobItem>,
+    /// Creation timestamp.
+    pub created_at_ms: i64,
+}
+
+/// One submitted item persisted as part of a new batch import job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewAdminCodexImportJobItem {
+    /// Requested account name.
+    pub requested_name: String,
+    /// Requested upstream account id when present.
+    pub requested_account_id: Option<String>,
+    /// Stored raw auth JSON for background processing.
+    pub raw_auth_json: String,
+}
+
+/// Terminal update written after processing one batch import item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminCodexImportJobItemResult {
+    /// Zero-based item index within the batch.
+    pub item_index: usize,
+    /// Terminal item status.
+    pub status: String,
+    /// Terminal error message when the item fails.
+    pub error_message: Option<String>,
+    /// Imported account name when successful.
+    pub imported_account_name: Option<String>,
+    /// Final upstream account id after validation/import.
+    pub final_account_id: Option<String>,
+    /// Validation timestamp when refresh validation succeeds.
+    pub validated_at_ms: Option<i64>,
+    /// Import timestamp when the account row is created.
+    pub imported_at_ms: Option<i64>,
+    /// Completed-item counter increment.
+    pub completed_delta: usize,
+    /// Imported-item counter increment.
+    pub succeeded_delta: usize,
+    /// Skipped-item counter increment.
+    pub skipped_delta: usize,
+    /// Failed/conflict-item counter increment.
+    pub failed_delta: usize,
+    /// Last update timestamp.
+    pub updated_at_ms: i64,
+}
+
 /// Admin-facing Kiro account balance snapshot.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub struct AdminKiroBalanceView {
@@ -1750,6 +1872,18 @@ pub trait AdminCodexAccountStore: Send + Sync {
     /// List all imported Codex accounts.
     async fn list_admin_codex_accounts(&self) -> anyhow::Result<Vec<AdminCodexAccount>>;
 
+    /// Get one imported Codex account by name.
+    async fn get_admin_codex_account(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<AdminCodexAccount>>;
+
+    /// Resolve one existing Codex account name by upstream account id.
+    async fn find_admin_codex_account_name_by_account_id(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<Option<String>>;
+
     /// Import one Codex account.
     async fn create_admin_codex_account(
         &self,
@@ -1781,6 +1915,54 @@ pub trait AdminCodexAccountStore: Send + Sync {
         &self,
         name: &str,
     ) -> anyhow::Result<Option<ProviderCodexRoute>>;
+
+    /// Persist one new Codex batch import job and its queued items.
+    async fn create_admin_codex_import_job(
+        &self,
+        job: NewAdminCodexImportJob,
+    ) -> anyhow::Result<AdminCodexImportJobDetail>;
+
+    /// List recent Codex batch import jobs ordered newest first.
+    async fn list_admin_codex_import_jobs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AdminCodexImportJobSummary>>;
+
+    /// Load one Codex batch import job with all item states.
+    async fn get_admin_codex_import_job(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<Option<AdminCodexImportJobDetail>>;
+
+    /// Mark one batch job as actively running.
+    async fn mark_admin_codex_import_job_running(
+        &self,
+        job_id: &str,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()>;
+
+    /// Mark one batch item as actively running.
+    async fn mark_admin_codex_import_job_item_running(
+        &self,
+        job_id: &str,
+        item_index: usize,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()>;
+
+    /// Complete one batch item and roll up job counters.
+    async fn complete_admin_codex_import_job_item(
+        &self,
+        job_id: &str,
+        result: AdminCodexImportJobItemResult,
+    ) -> anyhow::Result<Option<AdminCodexImportJobSummary>>;
+
+    /// Mark one batch job as failed before all items could complete.
+    async fn fail_admin_codex_import_job(
+        &self,
+        job_id: &str,
+        error_message: &str,
+        finished_at_ms: i64,
+    ) -> anyhow::Result<()>;
 }
 
 /// Admin Kiro account management queries used by the current frontend.
@@ -2306,6 +2488,20 @@ impl AdminCodexAccountStore for EmptyAdminCodexAccountStore {
         Ok(Vec::new())
     }
 
+    async fn get_admin_codex_account(
+        &self,
+        _name: &str,
+    ) -> anyhow::Result<Option<AdminCodexAccount>> {
+        Ok(None)
+    }
+
+    async fn find_admin_codex_account_name_by_account_id(
+        &self,
+        _account_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
     async fn create_admin_codex_account(
         &self,
         account: NewAdminCodexAccount,
@@ -2360,6 +2556,94 @@ impl AdminCodexAccountStore for EmptyAdminCodexAccountStore {
         _name: &str,
     ) -> anyhow::Result<Option<ProviderCodexRoute>> {
         Ok(None)
+    }
+
+    async fn create_admin_codex_import_job(
+        &self,
+        job: NewAdminCodexImportJob,
+    ) -> anyhow::Result<AdminCodexImportJobDetail> {
+        Ok(AdminCodexImportJobDetail {
+            summary: AdminCodexImportJobSummary {
+                job_id: job.job_id,
+                provider_type: job.provider_type,
+                source_type: job.source_type,
+                validate_before_import: job.validate_before_import,
+                status: "pending".to_string(),
+                total_count: job.items.len(),
+                completed_count: 0,
+                succeeded_count: 0,
+                skipped_count: 0,
+                failed_count: 0,
+                batch_error_message: None,
+                created_at_ms: job.created_at_ms,
+                updated_at_ms: job.created_at_ms,
+                finished_at_ms: None,
+            },
+            items: job
+                .items
+                .into_iter()
+                .enumerate()
+                .map(|(item_index, item)| AdminCodexImportJobItem {
+                    item_index,
+                    requested_name: item.requested_name,
+                    requested_account_id: item.requested_account_id,
+                    status: "pending".to_string(),
+                    error_message: None,
+                    imported_account_name: None,
+                    final_account_id: None,
+                    validated_at_ms: None,
+                    imported_at_ms: None,
+                })
+                .collect(),
+        })
+    }
+
+    async fn list_admin_codex_import_jobs(
+        &self,
+        _limit: usize,
+    ) -> anyhow::Result<Vec<AdminCodexImportJobSummary>> {
+        Ok(Vec::new())
+    }
+
+    async fn get_admin_codex_import_job(
+        &self,
+        _job_id: &str,
+    ) -> anyhow::Result<Option<AdminCodexImportJobDetail>> {
+        Ok(None)
+    }
+
+    async fn mark_admin_codex_import_job_running(
+        &self,
+        _job_id: &str,
+        _updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn mark_admin_codex_import_job_item_running(
+        &self,
+        _job_id: &str,
+        _item_index: usize,
+        _updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn complete_admin_codex_import_job_item(
+        &self,
+        _job_id: &str,
+        _result: AdminCodexImportJobItemResult,
+    ) -> anyhow::Result<Option<AdminCodexImportJobSummary>> {
+        Ok(None)
+    }
+
+    async fn fail_admin_codex_import_job(
+        &self,
+        _job_id: &str,
+        _error_message: &str,
+        _finished_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        Ok(())
     }
 }
 

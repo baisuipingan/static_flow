@@ -190,6 +190,15 @@ pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
             get(admin::list_llm_gateway_accounts).post(admin::import_llm_gateway_account),
         )
         .route(
+            "/admin/llm-gateway/accounts/import-jobs",
+            get(admin::list_llm_gateway_account_import_jobs)
+                .post(admin::create_llm_gateway_account_import_job),
+        )
+        .route(
+            "/admin/llm-gateway/accounts/import-jobs/:job_id",
+            get(admin::get_llm_gateway_account_import_job),
+        )
+        .route(
             "/admin/llm-gateway/accounts/:name",
             axum::routing::patch(admin::patch_llm_gateway_account)
                 .delete(admin::delete_llm_gateway_account),
@@ -568,6 +577,36 @@ mod tests {
             .await
             .expect("open runtime");
         (super::router(runtime), root)
+    }
+
+    async fn wait_for_codex_batch_import_job_terminal_state(
+        router: axum::Router,
+        job_id: &str,
+    ) -> serde_json::Value {
+        let started = std::time::Instant::now();
+        loop {
+            let response = router
+                .clone()
+                .oneshot(
+                    Request::builder()
+                        .uri(format!("/admin/llm-gateway/accounts/import-jobs/{job_id}"))
+                        .header(header::HOST, "localhost")
+                        .body(Body::empty())
+                        .expect("request"),
+                )
+                .await
+                .expect("detail response");
+            let body = to_bytes(response.into_body(), usize::MAX)
+                .await
+                .expect("detail body");
+            let value: serde_json::Value = serde_json::from_slice(&body).expect("detail json");
+            let status = value["summary"]["status"].as_str().unwrap_or_default();
+            if status == "completed" || status == "failed" {
+                return value;
+            }
+            assert!(started.elapsed() < std::time::Duration::from_secs(2));
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
     }
 
     async fn fake_kiro_usage_limits() -> Json<serde_json::Value> {
@@ -1598,6 +1637,148 @@ mod tests {
         assert_eq!(value["status"], "active");
         assert_eq!(value["account_id"], "acct-1");
         assert_eq!(value["proxy_mode"], "inherit");
+    }
+
+    #[tokio::test]
+    async fn router_creates_and_completes_codex_batch_import_job() {
+        let (router, root) = persistent_test_router("codex-batch-import-success").await;
+
+        let create_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-gateway/accounts/import-jobs")
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "provider_type": "codex",
+                            "source_type": "local_json",
+                            "validate_before_import": false,
+                            "items": [{
+                                "name": "codex_primary",
+                                "auth_json": {
+                                    "refresh_token": "rt-1",
+                                    "account_id": "acct-1"
+                                }
+                            }]
+                        }"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let body = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .expect("create body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("create json");
+        let job_id = value["summary"]["job_id"]
+            .as_str()
+            .expect("job id")
+            .to_string();
+
+        let detail = wait_for_codex_batch_import_job_terminal_state(router.clone(), &job_id).await;
+        assert_eq!(detail["summary"]["succeeded_count"], 1);
+        assert_eq!(detail["items"][0]["status"], "imported");
+
+        let accounts_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/llm-gateway/accounts")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("accounts response");
+        assert_eq!(accounts_response.status(), StatusCode::OK);
+        let accounts_body = to_bytes(accounts_response.into_body(), usize::MAX)
+            .await
+            .expect("accounts body");
+        let accounts_value: serde_json::Value =
+            serde_json::from_slice(&accounts_body).expect("accounts json");
+        assert!(accounts_value["accounts"]
+            .as_array()
+            .expect("accounts array")
+            .iter()
+            .any(|item| item["name"] == "codex_primary"));
+
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
+    }
+
+    #[tokio::test]
+    async fn router_marks_existing_account_name_as_conflict_in_codex_batch_import() {
+        let (router, root) = persistent_test_router("codex-batch-import-conflict").await;
+
+        let seed_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-gateway/accounts")
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "name": "codex_primary",
+                            "tokens": {
+                                "refresh_token": "seed-refresh",
+                                "account_id": "acct-seed"
+                            }
+                        }"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("seed response");
+        assert_eq!(seed_response.status(), StatusCode::OK);
+
+        let create_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-gateway/accounts/import-jobs")
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "provider_type": "codex",
+                            "source_type": "local_json",
+                            "validate_before_import": false,
+                            "items": [{
+                                "name": "codex_primary",
+                                "auth_json": {
+                                    "refresh_token": "rt-2",
+                                    "account_id": "acct-2"
+                                }
+                            }]
+                        }"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("create response");
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let body = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .expect("create body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("create json");
+        let job_id = value["summary"]["job_id"]
+            .as_str()
+            .expect("job id")
+            .to_string();
+
+        let detail = wait_for_codex_batch_import_job_terminal_state(router.clone(), &job_id).await;
+        assert_eq!(detail["items"][0]["status"], "conflict");
+        assert!(detail["items"][0]["error_message"]
+            .as_str()
+            .is_some_and(|value| value.contains("account name already exists")));
+
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 use std::collections::{BTreeMap, HashSet};
 
-use gloo_timers::callback::Timeout;
+use gloo_timers::callback::{Interval, Timeout};
 use js_sys::Date;
 use wasm_bindgen::prelude::*;
 use web_sys::{HtmlElement, HtmlInputElement, HtmlSelectElement};
@@ -16,12 +16,13 @@ use crate::{
         admin_reject_llm_gateway_token_request,
         admin_validate_llm_gateway_account_contribution_request,
         check_admin_llm_gateway_proxy_config, create_admin_llm_gateway_account_group,
-        create_admin_llm_gateway_key, create_admin_llm_gateway_proxy_config,
-        delete_admin_llm_gateway_account, delete_admin_llm_gateway_account_group,
-        delete_admin_llm_gateway_key, delete_admin_llm_gateway_proxy_config,
-        delete_admin_llm_gateway_sponsor_request,
+        create_admin_llm_gateway_account_import_job, create_admin_llm_gateway_key,
+        create_admin_llm_gateway_proxy_config, delete_admin_llm_gateway_account,
+        delete_admin_llm_gateway_account_group, delete_admin_llm_gateway_key,
+        delete_admin_llm_gateway_proxy_config, delete_admin_llm_gateway_sponsor_request,
         fetch_admin_llm_gateway_account_contribution_requests,
-        fetch_admin_llm_gateway_account_groups, fetch_admin_llm_gateway_accounts,
+        fetch_admin_llm_gateway_account_groups, fetch_admin_llm_gateway_account_import_job,
+        fetch_admin_llm_gateway_account_import_jobs, fetch_admin_llm_gateway_accounts,
         fetch_admin_llm_gateway_config, fetch_admin_llm_gateway_keys,
         fetch_admin_llm_gateway_proxy_bindings, fetch_admin_llm_gateway_proxy_configs,
         fetch_admin_llm_gateway_sponsor_requests, fetch_admin_llm_gateway_token_requests,
@@ -38,7 +39,8 @@ use crate::{
         AdminLlmGatewayUsageEventDetailView, AdminLlmGatewayUsageEventView,
         AdminLlmGatewayUsageEventsQuery, AdminUpstreamProxyBindingView,
         AdminUpstreamProxyCheckResponse, AdminUpstreamProxyCheckTargetView,
-        AdminUpstreamProxyConfigView, CreateAdminAccountGroupInput,
+        AdminUpstreamProxyConfigView, CodexAccountImportJobDetailView,
+        CodexAccountImportJobSummaryView, CreateAdminAccountGroupInput,
         CreateAdminUpstreamProxyConfigInput, LlmGatewayRuntimeConfig, PatchAdminAccountGroupInput,
         PatchAdminLlmGatewayAccountInput, PatchAdminLlmGatewayKeyRequest,
         PatchAdminUpstreamProxyConfigInput, DEFAULT_LLM_GATEWAY_CODEX_CLIENT_VERSION,
@@ -63,6 +65,7 @@ const USAGE_SOURCE_ALL: &str = "all";
 const TOKEN_REQUEST_PAGE_SIZE: usize = 20;
 const ACCOUNT_CONTRIBUTION_REQUEST_PAGE_SIZE: usize = 20;
 const SPONSOR_REQUEST_PAGE_SIZE: usize = 20;
+const ADMIN_CODEX_IMPORT_JOB_LIST_LIMIT: usize = 10;
 
 const TAB_OVERVIEW: &str = "overview";
 const TAB_KEYS: &str = "keys";
@@ -131,6 +134,75 @@ fn optional_auth_json_string(value: &serde_json::Value, fields: &[&str]) -> Opti
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string)
+}
+
+fn parse_admin_codex_batch_import_json(raw: &str) -> Result<Vec<serde_json::Value>, String> {
+    let value: serde_json::Value =
+        serde_json::from_str(raw).map_err(|_| "批量导入内容不是合法 JSON".to_string())?;
+    let items = value
+        .as_array()
+        .ok_or_else(|| "批量导入内容必须是 JSON array".to_string())?;
+    if items.is_empty() {
+        return Err("批量导入内容不能为空".to_string());
+    }
+    let mut normalized = Vec::with_capacity(items.len());
+    for (index, item) in items.iter().enumerate() {
+        let Some(mut object) = item.as_object().cloned() else {
+            return Err(format!("第 {} 项必须是 JSON object", index + 1));
+        };
+        let name = object
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .ok_or_else(|| format!("第 {} 项缺少有效的 name", index + 1))?;
+        let auth_json = object.get("auth_json");
+        let tokens = object.get("tokens");
+        if auth_json.is_none() && tokens.is_none() {
+            return Err(format!("第 {} 项缺少 auth_json 或 tokens", index + 1));
+        }
+        if let Some(value) = auth_json {
+            if !value.is_object() {
+                return Err(format!("第 {} 项的 auth_json 必须是 JSON object", index + 1));
+            }
+        }
+        if let Some(value) = tokens {
+            if !value.is_object() {
+                return Err(format!("第 {} 项的 tokens 必须是 JSON object", index + 1));
+            }
+        }
+        object.insert("name".to_string(), serde_json::Value::String(name.to_string()));
+        normalized.push(serde_json::Value::Object(object));
+    }
+    Ok(normalized)
+}
+
+fn codex_import_status_tone(status: &str) -> &'static str {
+    match status {
+        "completed" | "imported" => "text-emerald-600 dark:text-emerald-300",
+        "failed" | "conflict" => "text-red-600 dark:text-red-300",
+        "running" | "queued" => "text-amber-600 dark:text-amber-300",
+        "skipped" => "text-[var(--muted)]",
+        _ => "text-[var(--muted)]",
+    }
+}
+
+fn codex_import_job_is_terminal(status: &str) -> bool {
+    matches!(status, "completed" | "failed")
+}
+
+fn upsert_codex_import_job_summary(
+    jobs: &[CodexAccountImportJobSummaryView],
+    summary: CodexAccountImportJobSummaryView,
+) -> Vec<CodexAccountImportJobSummaryView> {
+    let mut next = jobs
+        .iter()
+        .filter(|job| job.job_id != summary.job_id)
+        .cloned()
+        .collect::<Vec<_>>();
+    next.insert(0, summary);
+    next.truncate(ADMIN_CODEX_IMPORT_JOB_LIST_LIMIT);
+    next
 }
 
 fn account_proxy_select_value(account: &AccountSummaryView) -> String {
@@ -1865,6 +1937,13 @@ pub fn admin_llm_gateway_page() -> Html {
     let import_raw_auth_json = use_state(String::new);
     let import_raw_auth_feedback = use_state(|| None::<(String, bool)>);
     let importing = use_state(|| false);
+    let show_batch_import_form = use_state(|| false);
+    let batch_import_raw_json = use_state(String::new);
+    let batch_import_feedback = use_state(|| None::<(String, bool)>);
+    let batch_import_validate_before_import = use_state(|| true);
+    let batch_importing = use_state(|| false);
+    let recent_import_jobs = use_state(Vec::<CodexAccountImportJobSummaryView>::new);
+    let active_import_job = use_state(|| None::<CodexAccountImportJobDetailView>);
     let account_action_inflight = use_state(HashSet::<String>::new);
     let account_proxy_inputs = use_state(BTreeMap::<String, String>::new);
     let account_request_max_inputs = use_state(BTreeMap::<String, String>::new);
@@ -2094,6 +2173,7 @@ pub fn admin_llm_gateway_page() -> Html {
         let usage_page = usage_page.clone();
         let usage_key_filter = usage_key_filter.clone();
         let accounts = accounts.clone();
+        let recent_import_jobs = recent_import_jobs.clone();
         let account_proxy_inputs = account_proxy_inputs.clone();
         let account_request_max_inputs = account_request_max_inputs.clone();
         let account_request_min_inputs = account_request_min_inputs.clone();
@@ -2127,6 +2207,7 @@ pub fn admin_llm_gateway_page() -> Html {
             let usage_page = usage_page.clone();
             let usage_key_filter = usage_key_filter.clone();
             let accounts = accounts.clone();
+            let recent_import_jobs = recent_import_jobs.clone();
             let account_proxy_inputs = account_proxy_inputs.clone();
             let account_request_max_inputs = account_request_max_inputs.clone();
             let account_request_min_inputs = account_request_min_inputs.clone();
@@ -2143,6 +2224,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         proxy_configs_result,
                         proxy_bindings_result,
                         accounts_result,
+                        import_jobs_result,
                     ) = futures::join!(
                         fetch_admin_llm_gateway_config(),
                         fetch_admin_llm_gateway_keys(),
@@ -2150,6 +2232,9 @@ pub fn admin_llm_gateway_page() -> Html {
                         fetch_admin_llm_gateway_proxy_configs(),
                         fetch_admin_llm_gateway_proxy_bindings(),
                         fetch_admin_llm_gateway_accounts(),
+                        fetch_admin_llm_gateway_account_import_jobs(Some(
+                            ADMIN_CODEX_IMPORT_JOB_LIST_LIMIT,
+                        )),
                     );
                     let cfg = cfg_result?;
                     let keys_resp = keys_result?;
@@ -2157,6 +2242,7 @@ pub fn admin_llm_gateway_page() -> Html {
                     let proxy_configs_resp = proxy_configs_result?;
                     let proxy_bindings_resp = proxy_bindings_result?;
                     let accounts_resp = accounts_result?;
+                    let import_jobs = import_jobs_result?;
                     let effective_key_filter = if current_key_filter.is_empty()
                         || keys_resp
                             .keys
@@ -2175,6 +2261,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         proxy_bindings_resp.bindings,
                         effective_key_filter,
                         accounts_resp,
+                        import_jobs,
                     ))
                 }
                 .await;
@@ -2188,6 +2275,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         proxy_binding_items,
                         effective_key_filter,
                         accounts_resp,
+                        import_jobs,
                     )) => {
                         let usage_filter_for_reload = effective_key_filter.clone();
                         ttl_input.set(cfg.auth_cache_ttl_seconds.to_string());
@@ -2269,6 +2357,7 @@ pub fn admin_llm_gateway_page() -> Html {
                             })
                             .collect::<BTreeMap<_, _>>();
                         accounts.set(accounts_resp.accounts);
+                        recent_import_jobs.set(import_jobs);
                         account_proxy_inputs.set(next_proxy_inputs);
                         account_request_max_inputs.set(next_request_max_inputs);
                         account_request_min_inputs.set(next_request_min_inputs);
@@ -2298,6 +2387,46 @@ pub fn admin_llm_gateway_page() -> Html {
             reload_account_contribution_requests.emit((Some(1), Some(String::new())));
             reload_sponsor_requests.emit((Some(1), Some(String::new())));
             || ()
+        });
+    }
+
+    {
+        let active_import_job = active_import_job.clone();
+        let recent_import_jobs = recent_import_jobs.clone();
+        let reload = reload.clone();
+        let load_error = load_error.clone();
+        use_effect_with((*active_import_job).clone(), move |job_detail| {
+            let interval = job_detail.clone().and_then(|job_detail| {
+                if codex_import_job_is_terminal(&job_detail.summary.status) {
+                    return None;
+                }
+                let job_id = job_detail.summary.job_id.clone();
+                Some(Interval::new(1500, move || {
+                    let active_import_job = active_import_job.clone();
+                    let recent_import_jobs = recent_import_jobs.clone();
+                    let reload = reload.clone();
+                    let load_error = load_error.clone();
+                    let job_id = job_id.clone();
+                    wasm_bindgen_futures::spawn_local(async move {
+                        match fetch_admin_llm_gateway_account_import_job(&job_id).await {
+                            Ok(detail) => {
+                                let summary = detail.summary.clone();
+                                let is_terminal = codex_import_job_is_terminal(&summary.status);
+                                active_import_job.set(Some(detail));
+                                recent_import_jobs.set(upsert_codex_import_job_summary(
+                                    &recent_import_jobs,
+                                    summary,
+                                ));
+                                if is_terminal {
+                                    reload.emit(());
+                                }
+                            },
+                            Err(err) => load_error.set(Some(err)),
+                        }
+                    });
+                }))
+            });
+            move || drop(interval)
         });
     }
 
@@ -3626,6 +3755,75 @@ pub fn admin_llm_gateway_page() -> Html {
                     Err(err) => load_error.set(Some(err)),
                 }
                 importing.set(false);
+            });
+        })
+    };
+
+    let on_import_account_batch = {
+        let batch_import_raw_json = batch_import_raw_json.clone();
+        let batch_import_feedback = batch_import_feedback.clone();
+        let batch_import_validate_before_import = batch_import_validate_before_import.clone();
+        let batch_importing = batch_importing.clone();
+        let recent_import_jobs = recent_import_jobs.clone();
+        let active_import_job = active_import_job.clone();
+        let load_error = load_error.clone();
+        Callback::from(move |_| {
+            let raw_json = (*batch_import_raw_json).trim().to_string();
+            let items = match parse_admin_codex_batch_import_json(&raw_json) {
+                Ok(items) => items,
+                Err(err) => {
+                    batch_import_feedback.set(Some((err, true)));
+                    return;
+                },
+            };
+            let validate_before_import = *batch_import_validate_before_import;
+            let batch_import_raw_json = batch_import_raw_json.clone();
+            let batch_import_feedback = batch_import_feedback.clone();
+            let batch_importing = batch_importing.clone();
+            let recent_import_jobs = recent_import_jobs.clone();
+            let active_import_job = active_import_job.clone();
+            let load_error = load_error.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                batch_importing.set(true);
+                batch_import_feedback.set(None);
+                match create_admin_llm_gateway_account_import_job(validate_before_import, &items)
+                    .await
+                {
+                    Ok(detail) => {
+                        let summary = detail.summary.clone();
+                        let next_jobs =
+                            upsert_codex_import_job_summary(&recent_import_jobs, summary.clone());
+                        active_import_job.set(Some(detail));
+                        recent_import_jobs.set(next_jobs);
+                        batch_import_raw_json.set(String::new());
+                        batch_import_feedback
+                            .set(Some((format!("已创建批量导入作业 {}", summary.job_id), false)));
+                        load_error.set(None);
+                    },
+                    Err(err) => {
+                        batch_import_feedback.set(Some((err.clone(), true)));
+                        load_error.set(Some(err));
+                    },
+                }
+                batch_importing.set(false);
+            });
+        })
+    };
+
+    let on_load_import_job = {
+        let active_import_job = active_import_job.clone();
+        let load_error = load_error.clone();
+        Callback::from(move |job_id: String| {
+            let active_import_job = active_import_job.clone();
+            let load_error = load_error.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match fetch_admin_llm_gateway_account_import_job(&job_id).await {
+                    Ok(detail) => {
+                        active_import_job.set(Some(detail));
+                        load_error.set(None);
+                    },
+                    Err(err) => load_error.set(Some(err)),
+                }
             });
         })
     };
@@ -5206,8 +5404,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         </button>
                     </div>
 
-                    // Import form toggle
-                    <div class={classes!("mt-3")}>
+                    <div class={classes!("mt-3", "flex", "gap-2", "flex-wrap")}>
                         <button
                             type="button"
                             class={classes!("btn-terminal")}
@@ -5217,13 +5414,23 @@ pub fn admin_llm_gateway_page() -> Html {
                             }}
                         >
                             <i class={classes!("fas", if *show_import_form { "fa-chevron-up" } else { "fa-plus" })}></i>
-                            { if *show_import_form { "收起导入表单" } else { "导入账号" } }
+                            { if *show_import_form { "收起单账号导入" } else { "导入单账号" } }
+                        </button>
+                        <button
+                            type="button"
+                            class={classes!("btn-terminal")}
+                            onclick={{
+                                let show_batch_import_form = show_batch_import_form.clone();
+                                Callback::from(move |_| show_batch_import_form.set(!*show_batch_import_form))
+                            }}
+                        >
+                            <i class={classes!("fas", if *show_batch_import_form { "fa-chevron-up" } else { "fa-layer-group" })}></i>
+                            { if *show_batch_import_form { "收起批量导入" } else { "批量导入" } }
                         </button>
                     </div>
 
                     if *show_import_form {
-                    // Import form
-                    <div class={classes!("mt-3", "grid", "gap-3")}>
+                    <div class={classes!("mt-3", "grid", "gap-3", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface-alt)]", "p-4")}>
                         <div class={classes!("grid", "gap-3", "md:grid-cols-2")}>
                             <label class={classes!("text-sm")}>
                                 <span class={classes!("text-[var(--muted)]")}>{ "名称 (唯一)" }</span>
@@ -5365,6 +5572,222 @@ pub fn admin_llm_gateway_page() -> Html {
                         </div>
                     </div>
                     } // end show_import_form
+
+                    if *show_batch_import_form {
+                    <div class={classes!("mt-3", "grid", "gap-3", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface-alt)]", "p-4")}>
+                        <div class={classes!("flex", "items-start", "justify-between", "gap-3", "flex-wrap")}>
+                            <div>
+                                <h3 class={classes!("m-0", "text-sm", "font-semibold", "text-[var(--text)]")}>{ "本地 JSON 数组批量导入" }</h3>
+                                <p class={classes!("mt-1", "mb-0", "text-xs", "text-[var(--muted)]")}>
+                                    { "每项至少带 name 和 auth_json/tokens。开启验证后会先走默认 Codex 代理做 refresh 校验，再真正入库。" }
+                                </p>
+                            </div>
+                            <label class={classes!("flex", "items-center", "gap-2", "text-xs", "text-[var(--muted)]")}>
+                                <input
+                                    type="checkbox"
+                                    checked={*batch_import_validate_before_import}
+                                    onchange={{
+                                        let batch_import_validate_before_import =
+                                            batch_import_validate_before_import.clone();
+                                        Callback::from(move |event: Event| {
+                                            if let Some(target) = event.target_dyn_into::<HtmlInputElement>() {
+                                                batch_import_validate_before_import.set(target.checked());
+                                            }
+                                        })
+                                    }}
+                                />
+                                <span>{ "提交前 refresh 验证" }</span>
+                            </label>
+                        </div>
+                        <textarea
+                            rows="12"
+                            placeholder={r#"[
+  {
+    "name": "codex-a",
+    "auth_json": { "refresh_token": "rt-a", "account_id": "acct-a" }
+  },
+  {
+    "name": "codex-b",
+    "tokens": { "refresh_token": "rt-b" }
+  }
+]"#}
+                            class={classes!("w-full", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2", "font-mono", "text-xs")}
+                            value={(*batch_import_raw_json).clone()}
+                            oninput={{
+                                let batch_import_raw_json = batch_import_raw_json.clone();
+                                let batch_import_feedback = batch_import_feedback.clone();
+                                Callback::from(move |event: InputEvent| {
+                                    if let Some(target) = event.target_dyn_into::<web_sys::HtmlTextAreaElement>() {
+                                        batch_import_raw_json.set(target.value());
+                                        batch_import_feedback.set(None);
+                                    }
+                                })
+                            }}
+                        />
+                        if let Some((message, is_error)) = (*batch_import_feedback).clone() {
+                            <div class={classes!("font-mono", "text-[11px]", if is_error { "text-red-600 dark:text-red-300" } else { "text-emerald-600 dark:text-emerald-300" })}>
+                                { message }
+                            </div>
+                        }
+                        <div class={classes!("flex", "justify-end")}>
+                            <button
+                                class={classes!("btn-terminal", "btn-terminal-primary")}
+                                onclick={on_import_account_batch}
+                                disabled={*batch_importing}
+                            >
+                                { if *batch_importing { "创建导入作业中..." } else { "开始批量导入" } }
+                            </button>
+                        </div>
+                    </div>
+                    }
+
+                    if !recent_import_jobs.is_empty() || active_import_job.is_some() {
+                        <div class={classes!("mt-4", "grid", "gap-4", "xl:grid-cols-2")}>
+                            <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface-alt)]", "p-4")}>
+                                <div class={classes!("flex", "items-center", "justify-between", "gap-3", "flex-wrap")}>
+                                    <div>
+                                        <h3 class={classes!("m-0", "text-sm", "font-semibold", "text-[var(--text)]")}>{ "最近导入作业" }</h3>
+                                        <p class={classes!("mt-1", "mb-0", "text-xs", "text-[var(--muted)]")}>
+                                            { format!("最多展示最近 {} 个作业。", ADMIN_CODEX_IMPORT_JOB_LIST_LIMIT) }
+                                        </p>
+                                    </div>
+                                    if let Some(active_detail) = (*active_import_job).clone() {
+                                        <span class={classes!("font-mono", "text-[11px]", codex_import_status_tone(&active_detail.summary.status))}>
+                                            { format!("当前查看: {}", active_detail.summary.job_id) }
+                                        </span>
+                                    }
+                                </div>
+                                <div class={classes!("mt-3", "space-y-2")}>
+                                    { for recent_import_jobs.iter().map(|job| {
+                                        let job_id = job.job_id.clone();
+                                        let is_selected = (*active_import_job)
+                                            .as_ref()
+                                            .map(|detail| detail.summary.job_id == job.job_id)
+                                            .unwrap_or(false);
+                                        let progress = format!(
+                                            "{}/{} done · ok {} · skipped {} · failed {}",
+                                            job.completed_count,
+                                            job.total_count,
+                                            job.succeeded_count,
+                                            job.skipped_count,
+                                            job.failed_count
+                                        );
+                                        html! {
+                                            <button
+                                                type="button"
+                                                class={classes!(
+                                                    "w-full", "rounded-lg", "border", "px-3", "py-2.5", "text-left",
+                                                    if is_selected {
+                                                        "border-sky-500/30 bg-sky-500/8"
+                                                    } else {
+                                                        "border-[var(--border)] bg-[var(--surface)]"
+                                                    }
+                                                )}
+                                                onclick={{
+                                                    let on_load_import_job = on_load_import_job.clone();
+                                                    Callback::from(move |_| on_load_import_job.emit(job_id.clone()))
+                                                }}
+                                            >
+                                                <div class={classes!("flex", "items-center", "justify-between", "gap-3", "flex-wrap")}>
+                                                    <span class={classes!("font-mono", "text-xs", "font-semibold", "text-[var(--text)]")}>{ job.job_id.clone() }</span>
+                                                    <span class={classes!("font-mono", "text-[11px]", codex_import_status_tone(&job.status))}>{ job.status.clone() }</span>
+                                                </div>
+                                                <div class={classes!("mt-1", "text-xs", "text-[var(--muted)]")}>
+                                                    { progress }
+                                                </div>
+                                                <div class={classes!("mt-1", "font-mono", "text-[11px]", "text-[var(--muted)]")}>
+                                                    { format!("{} · {}", job.source_type, format_ms(job.created_at_ms)) }
+                                                </div>
+                                            </button>
+                                        }
+                                    }) }
+                                </div>
+                            </div>
+                            <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface-alt)]", "p-4")}>
+                                if let Some(job_detail) = (*active_import_job).clone() {
+                                    <div class={classes!("flex", "items-start", "justify-between", "gap-3", "flex-wrap")}>
+                                        <div>
+                                            <h3 class={classes!("m-0", "text-sm", "font-semibold", "text-[var(--text)]")}>{ "导入作业详情" }</h3>
+                                            <p class={classes!("mt-1", "mb-0", "font-mono", "text-[11px]", "text-[var(--muted)]")}>
+                                                { format!("{} · {} · validate={}", job_detail.summary.job_id, job_detail.summary.source_type, job_detail.summary.validate_before_import) }
+                                            </p>
+                                        </div>
+                                        <span class={classes!("font-mono", "text-[11px]", codex_import_status_tone(&job_detail.summary.status))}>
+                                            { job_detail.summary.status.clone() }
+                                        </span>
+                                    </div>
+                                    <div class={classes!("mt-3", "grid", "gap-2", "sm:grid-cols-2", "xl:grid-cols-4")}>
+                                        <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2")}>
+                                            <div class={classes!("text-[11px]", "text-[var(--muted)]")}>{ "总数" }</div>
+                                            <div class={classes!("mt-1", "font-mono", "text-sm", "font-semibold")}>{ job_detail.summary.total_count }</div>
+                                        </div>
+                                        <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2")}>
+                                            <div class={classes!("text-[11px]", "text-[var(--muted)]")}>{ "成功" }</div>
+                                            <div class={classes!("mt-1", "font-mono", "text-sm", "font-semibold", "text-emerald-600", "dark:text-emerald-300")}>{ job_detail.summary.succeeded_count }</div>
+                                        </div>
+                                        <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2")}>
+                                            <div class={classes!("text-[11px]", "text-[var(--muted)]")}>{ "跳过" }</div>
+                                            <div class={classes!("mt-1", "font-mono", "text-sm", "font-semibold")}>{ job_detail.summary.skipped_count }</div>
+                                        </div>
+                                        <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2")}>
+                                            <div class={classes!("text-[11px]", "text-[var(--muted)]")}>{ "失败/冲突" }</div>
+                                            <div class={classes!("mt-1", "font-mono", "text-sm", "font-semibold", "text-red-600", "dark:text-red-300")}>{ job_detail.summary.failed_count }</div>
+                                        </div>
+                                    </div>
+                                    if let Some(batch_error_message) = job_detail.summary.batch_error_message.clone() {
+                                        <div class={classes!("mt-3", "rounded-lg", "border", "border-red-500/30", "bg-red-500/5", "px-3", "py-2", "font-mono", "text-[11px]", "text-red-600", "dark:text-red-300")}>
+                                            { batch_error_message }
+                                        </div>
+                                    }
+                                    <div class={classes!("mt-3", "overflow-x-auto")}>
+                                        <table class={classes!("min-w-full", "text-sm")}>
+                                            <thead class={classes!("text-left", "text-[11px]", "uppercase", "tracking-wide", "text-[var(--muted)]")}>
+                                                <tr>
+                                                    <th class={classes!("px-2", "py-2")}>{ "#" }</th>
+                                                    <th class={classes!("px-2", "py-2")}>{ "name" }</th>
+                                                    <th class={classes!("px-2", "py-2")}>{ "status" }</th>
+                                                    <th class={classes!("px-2", "py-2")}>{ "account" }</th>
+                                                    <th class={classes!("px-2", "py-2")}>{ "result" }</th>
+                                                </tr>
+                                            </thead>
+                                            <tbody>
+                                                { for job_detail.items.iter().map(|item| {
+                                                    let account_line = item
+                                                        .final_account_id
+                                                        .clone()
+                                                        .or_else(|| item.requested_account_id.clone())
+                                                        .unwrap_or_else(|| "-".to_string());
+                                                    let result_line = item
+                                                        .imported_account_name
+                                                        .clone()
+                                                        .or_else(|| item.error_message.clone())
+                                                        .unwrap_or_else(|| "-".to_string());
+                                                    html! {
+                                                        <tr class={classes!("border-t", "border-[var(--border)]", "align-top")}>
+                                                            <td class={classes!("px-2", "py-2", "font-mono", "text-[11px]", "text-[var(--muted)]")}>{ item.item_index }</td>
+                                                            <td class={classes!("px-2", "py-2")}>
+                                                                <div class={classes!("font-mono", "text-xs", "text-[var(--text)]")}>{ item.requested_name.clone() }</div>
+                                                                <div class={classes!("mt-1", "text-[11px]", "text-[var(--muted)]")}>
+                                                                    { item.validated_at_ms.map(format_ms).unwrap_or_else(|| "-".to_string()) }
+                                                                </div>
+                                                            </td>
+                                                            <td class={classes!("px-2", "py-2", "font-mono", "text-[11px]", codex_import_status_tone(&item.status))}>{ item.status.clone() }</td>
+                                                            <td class={classes!("px-2", "py-2", "font-mono", "text-[11px]", "text-[var(--muted)]")}>{ account_line }</td>
+                                                            <td class={classes!("px-2", "py-2", "font-mono", "text-[11px]", "text-[var(--muted)]")}>{ result_line }</td>
+                                                        </tr>
+                                                    }
+                                                }) }
+                                            </tbody>
+                                        </table>
+                                    </div>
+                                } else {
+                                    <div class={classes!("rounded-lg", "border", "border-dashed", "border-[var(--border)]", "px-4", "py-10", "text-center", "text-[var(--muted)]")}>
+                                        { "选择一个导入作业后，这里会显示逐条处理结果。" }
+                                    </div>
+                                }
+                            </div>
+                        </div>
+                    }
 
                     // Account list
                     if !accounts.is_empty() {
@@ -6700,5 +7123,41 @@ mod tests {
 
         assert_eq!(filter_gateway_keys_for_query(&keys, "   "), keys);
         assert_eq!(filter_gateway_keys_for_query(&keys, "  codex  "), vec![keys[0].clone()]);
+    }
+
+    #[test]
+    fn parse_admin_codex_batch_import_json_accepts_local_json_array() {
+        let items = parse_admin_codex_batch_import_json(
+            r#"[
+                {
+                    "name": "codex-a",
+                    "auth_json": { "refresh_token": "rt-a", "account_id": "acct-a" }
+                },
+                {
+                    "name": "codex-b",
+                    "tokens": { "refresh_token": "rt-b" }
+                }
+            ]"#,
+        )
+        .expect("valid local batch import json");
+
+        assert_eq!(items.len(), 2);
+        assert_eq!(items[0]["name"], "codex-a");
+        assert!(items[0]["auth_json"].is_object());
+        assert!(items[1]["tokens"].is_object());
+    }
+
+    #[test]
+    fn parse_admin_codex_batch_import_json_rejects_missing_name() {
+        let err = parse_admin_codex_batch_import_json(
+            r#"[
+                {
+                    "auth_json": { "refresh_token": "rt-a" }
+                }
+            ]"#,
+        )
+        .expect_err("missing name must fail");
+
+        assert!(err.contains("name"));
     }
 }

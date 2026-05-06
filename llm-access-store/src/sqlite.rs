@@ -8,12 +8,14 @@ use llm_access_core::{
     store::{
         self as core_store, AdminAccountContributionRequest, AdminAccountContributionRequestsPage,
         AdminAccountGroup, AdminAccountGroupPatch, AdminCodexAccount, AdminCodexAccountPatch,
-        AdminKey, AdminKeyPatch, AdminKiroAccount, AdminKiroAccountPatch, AdminKiroBalanceView,
-        AdminKiroCacheView, AdminKiroStatusCacheUpdate, AdminLegacyKiroProxyMigration,
-        AdminProxyBinding, AdminProxyConfig, AdminProxyConfigPatch, AdminReviewQueueAction,
-        AdminReviewQueueQuery, AdminRuntimeConfig, AdminSponsorRequest, AdminSponsorRequestsPage,
-        AdminTokenRequest, AdminTokenRequestsPage, AuthenticatedKey, CodexRateLimitStatus,
-        NewAdminAccountGroup, NewAdminCodexAccount, NewAdminKey, NewAdminKiroAccount,
+        AdminCodexImportJobDetail, AdminCodexImportJobItem, AdminCodexImportJobItemResult,
+        AdminCodexImportJobSummary, AdminKey, AdminKeyPatch, AdminKiroAccount,
+        AdminKiroAccountPatch, AdminKiroBalanceView, AdminKiroCacheView,
+        AdminKiroStatusCacheUpdate, AdminLegacyKiroProxyMigration, AdminProxyBinding,
+        AdminProxyConfig, AdminProxyConfigPatch, AdminReviewQueueAction, AdminReviewQueueQuery,
+        AdminRuntimeConfig, AdminSponsorRequest, AdminSponsorRequestsPage, AdminTokenRequest,
+        AdminTokenRequestsPage, AuthenticatedKey, CodexRateLimitStatus, NewAdminAccountGroup,
+        NewAdminCodexAccount, NewAdminCodexImportJob, NewAdminKey, NewAdminKiroAccount,
         NewAdminProxyConfig, NewPublicAccountContributionRequest, NewPublicSponsorRequest,
         NewPublicTokenRequest, ProviderCodexAuthUpdate, ProviderCodexRoute, ProviderKiroAuthUpdate,
         ProviderProxyConfig, PublicAccessKey, PublicAccountContribution, PublicSponsor,
@@ -1549,6 +1551,32 @@ impl SqliteControlStore {
             .collect()
     }
 
+    /// Load one imported Codex account for the admin UI.
+    pub fn get_admin_codex_account(&self, name: &str) -> anyhow::Result<Option<AdminCodexAccount>> {
+        self.get_codex_account(name)?
+            .map(|record| self.admin_codex_account_from_record(&record))
+            .transpose()
+    }
+
+    /// Resolve one existing Codex account name by upstream account id.
+    pub fn find_admin_codex_account_name_by_account_id(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT account_name
+                 FROM llm_codex_accounts
+                 WHERE account_id = ?1
+                 ORDER BY account_name
+                 LIMIT 1",
+                [account_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .context("load codex account name by account id")
+    }
+
     /// Import one Codex account.
     pub fn create_admin_codex_account(
         &self,
@@ -1686,6 +1714,251 @@ impl SqliteControlStore {
         }))
     }
 
+    /// Persist one new Codex batch import job and its queued items.
+    pub fn create_admin_codex_import_job(
+        &self,
+        job: &NewAdminCodexImportJob,
+    ) -> anyhow::Result<AdminCodexImportJobDetail> {
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin codex import job transaction")?;
+        tx.execute(
+            "INSERT INTO llm_account_import_jobs (
+                job_id, provider_type, source_type, validate_before_import, status,
+                total_count, completed_count, succeeded_count, skipped_count, failed_count,
+                batch_error_message, created_at_ms, updated_at_ms, finished_at_ms
+            ) VALUES (
+                ?1, ?2, ?3, ?4, 'pending',
+                ?5, 0, 0, 0, 0,
+                NULL, ?6, ?6, NULL
+            )",
+            params![
+                &job.job_id,
+                &job.provider_type,
+                &job.source_type,
+                if job.validate_before_import { 1 } else { 0 },
+                job.items.len() as i64,
+                job.created_at_ms,
+            ],
+        )
+        .context("insert codex import job")?;
+        let mut stmt = tx
+            .prepare(
+                "INSERT INTO llm_account_import_job_items (
+                    job_id, item_index, requested_name, requested_account_id, raw_auth_json,
+                    status, error_message, imported_account_name, final_account_id,
+                    validated_at_ms, imported_at_ms, created_at_ms, updated_at_ms
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5,
+                    'pending', NULL, NULL, NULL,
+                    NULL, NULL, ?6, ?6
+                )",
+            )
+            .context("prepare codex import job item insert")?;
+        for (item_index, item) in job.items.iter().enumerate() {
+            stmt.execute(params![
+                &job.job_id,
+                item_index as i64,
+                &item.requested_name,
+                &item.requested_account_id,
+                &item.raw_auth_json,
+                job.created_at_ms,
+            ])
+            .with_context(|| format!("insert codex import job item {item_index}"))?;
+        }
+        drop(stmt);
+        tx.commit().context("commit codex import job transaction")?;
+        self.get_admin_codex_import_job(&job.job_id)?
+            .context("created codex import job disappeared")
+    }
+
+    /// List recent Codex batch import jobs ordered newest first.
+    pub fn list_admin_codex_import_jobs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AdminCodexImportJobSummary>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT
+                    job_id, provider_type, source_type, validate_before_import, status,
+                    total_count, completed_count, succeeded_count, skipped_count, failed_count,
+                    batch_error_message, created_at_ms, updated_at_ms, finished_at_ms
+                 FROM llm_account_import_jobs
+                 ORDER BY created_at_ms DESC, job_id DESC
+                 LIMIT ?1",
+            )
+            .context("prepare list codex import jobs")?;
+        let rows = stmt
+            .query_map([limit as i64], decode_codex_import_job_summary)?
+            .collect::<Result<Vec<_>, _>>()
+            .context("list codex import jobs")?;
+        Ok(rows)
+    }
+
+    /// Load one Codex batch import job and all item states.
+    pub fn get_admin_codex_import_job(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<Option<AdminCodexImportJobDetail>> {
+        let Some(summary) = self.load_codex_import_job_summary(job_id)? else {
+            return Ok(None);
+        };
+        let items = self.load_codex_import_job_items(job_id)?;
+        Ok(Some(AdminCodexImportJobDetail {
+            summary,
+            items,
+        }))
+    }
+
+    /// Mark one Codex batch import job as running.
+    pub fn mark_admin_codex_import_job_running(
+        &self,
+        job_id: &str,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE llm_account_import_jobs
+                 SET status = 'running', updated_at_ms = ?2
+                 WHERE job_id = ?1",
+                params![job_id, updated_at_ms],
+            )
+            .context("mark codex import job running")?;
+        if rows == 0 {
+            anyhow::bail!("codex import job `{job_id}` not found");
+        }
+        Ok(())
+    }
+
+    /// Mark one Codex batch import item as running.
+    pub fn mark_admin_codex_import_job_item_running(
+        &self,
+        job_id: &str,
+        item_index: usize,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE llm_account_import_job_items
+                 SET status = 'running', updated_at_ms = ?3
+                 WHERE job_id = ?1 AND item_index = ?2",
+                params![job_id, item_index as i64, updated_at_ms],
+            )
+            .context("mark codex import job item running")?;
+        if rows == 0 {
+            anyhow::bail!("codex import job item `{job_id}`:{item_index} not found");
+        }
+        Ok(())
+    }
+
+    /// Complete one Codex batch import item and roll up parent counters.
+    pub fn complete_admin_codex_import_job_item(
+        &self,
+        job_id: &str,
+        result: &AdminCodexImportJobItemResult,
+    ) -> anyhow::Result<Option<AdminCodexImportJobSummary>> {
+        if self.load_codex_import_job_summary(job_id)?.is_none() {
+            return Ok(None);
+        }
+        let tx = self
+            .conn
+            .unchecked_transaction()
+            .context("begin codex import job item completion transaction")?;
+        let item_rows = tx
+            .execute(
+                "UPDATE llm_account_import_job_items
+                 SET
+                    raw_auth_json = NULL,
+                    status = ?3,
+                    error_message = ?4,
+                    imported_account_name = ?5,
+                    final_account_id = ?6,
+                    validated_at_ms = ?7,
+                    imported_at_ms = ?8,
+                    updated_at_ms = ?9
+                 WHERE job_id = ?1 AND item_index = ?2",
+                params![
+                    job_id,
+                    result.item_index as i64,
+                    &result.status,
+                    &result.error_message,
+                    &result.imported_account_name,
+                    &result.final_account_id,
+                    result.validated_at_ms,
+                    result.imported_at_ms,
+                    result.updated_at_ms,
+                ],
+            )
+            .context("update codex import job item terminal state")?;
+        if item_rows == 0 {
+            anyhow::bail!("codex import job item `{job_id}`:{} not found", result.item_index);
+        }
+        let job_rows = tx
+            .execute(
+                "UPDATE llm_account_import_jobs
+                 SET
+                    completed_count = completed_count + ?2,
+                    succeeded_count = succeeded_count + ?3,
+                    skipped_count = skipped_count + ?4,
+                    failed_count = failed_count + ?5,
+                    status = CASE
+                        WHEN completed_count + ?2 >= total_count THEN 'completed'
+                        ELSE status
+                    END,
+                    updated_at_ms = ?6,
+                    finished_at_ms = CASE
+                        WHEN completed_count + ?2 >= total_count THEN ?6
+                        ELSE finished_at_ms
+                    END
+                 WHERE job_id = ?1",
+                params![
+                    job_id,
+                    result.completed_delta as i64,
+                    result.succeeded_delta as i64,
+                    result.skipped_delta as i64,
+                    result.failed_delta as i64,
+                    result.updated_at_ms,
+                ],
+            )
+            .context("roll up codex import job counters")?;
+        if job_rows == 0 {
+            anyhow::bail!("codex import job `{job_id}` not found");
+        }
+        tx.commit()
+            .context("commit codex import job item completion transaction")?;
+        self.load_codex_import_job_summary(job_id)
+    }
+
+    /// Mark one Codex batch import job as failed before all items finish.
+    pub fn fail_admin_codex_import_job(
+        &self,
+        job_id: &str,
+        error_message: &str,
+        finished_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let rows = self
+            .conn
+            .execute(
+                "UPDATE llm_account_import_jobs
+                 SET
+                    status = 'failed',
+                    batch_error_message = ?2,
+                    updated_at_ms = ?3,
+                    finished_at_ms = ?3
+                 WHERE job_id = ?1",
+                params![job_id, error_message, finished_at_ms],
+            )
+            .context("mark codex import job failed")?;
+        if rows == 0 {
+            anyhow::bail!("codex import job `{job_id}` not found");
+        }
+        Ok(())
+    }
+
     fn get_codex_account(&self, name: &str) -> anyhow::Result<Option<CodexAccountRecord>> {
         self.conn
             .query_row(
@@ -1699,6 +1972,48 @@ impl SqliteControlStore {
             )
             .optional()
             .context("load codex account")
+    }
+
+    fn load_codex_import_job_summary(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<Option<AdminCodexImportJobSummary>> {
+        self.conn
+            .query_row(
+                "SELECT
+                    job_id, provider_type, source_type, validate_before_import, status,
+                    total_count, completed_count, succeeded_count, skipped_count, failed_count,
+                    batch_error_message, created_at_ms, updated_at_ms, finished_at_ms
+                 FROM llm_account_import_jobs
+                 WHERE job_id = ?1",
+                [job_id],
+                decode_codex_import_job_summary,
+            )
+            .optional()
+            .context("load codex import job summary")
+    }
+
+    fn load_codex_import_job_items(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<Vec<AdminCodexImportJobItem>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT
+                    item_index, requested_name, requested_account_id, status,
+                    error_message, imported_account_name, final_account_id,
+                    validated_at_ms, imported_at_ms
+                 FROM llm_account_import_job_items
+                 WHERE job_id = ?1
+                 ORDER BY item_index",
+            )
+            .context("prepare load codex import job items")?;
+        let rows = stmt
+            .query_map([job_id], decode_codex_import_job_item)?
+            .collect::<Result<Vec<_>, _>>()
+            .context("load codex import job items")?;
+        Ok(rows)
     }
 
     fn admin_codex_account_from_record(
@@ -4284,6 +4599,43 @@ fn decode_codex_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<CodexAccoun
     })
 }
 
+fn decode_codex_import_job_summary(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AdminCodexImportJobSummary> {
+    Ok(AdminCodexImportJobSummary {
+        job_id: row.get(0)?,
+        provider_type: row.get(1)?,
+        source_type: row.get(2)?,
+        validate_before_import: row.get::<_, i64>(3)? != 0,
+        status: row.get(4)?,
+        total_count: row.get::<_, i64>(5)? as usize,
+        completed_count: row.get::<_, i64>(6)? as usize,
+        succeeded_count: row.get::<_, i64>(7)? as usize,
+        skipped_count: row.get::<_, i64>(8)? as usize,
+        failed_count: row.get::<_, i64>(9)? as usize,
+        batch_error_message: row.get(10)?,
+        created_at_ms: row.get(11)?,
+        updated_at_ms: row.get(12)?,
+        finished_at_ms: row.get(13)?,
+    })
+}
+
+fn decode_codex_import_job_item(
+    row: &rusqlite::Row<'_>,
+) -> rusqlite::Result<AdminCodexImportJobItem> {
+    Ok(AdminCodexImportJobItem {
+        item_index: row.get::<_, i64>(0)? as usize,
+        requested_name: row.get(1)?,
+        requested_account_id: row.get(2)?,
+        status: row.get(3)?,
+        error_message: row.get(4)?,
+        imported_account_name: row.get(5)?,
+        final_account_id: row.get(6)?,
+        validated_at_ms: row.get(7)?,
+        imported_at_ms: row.get(8)?,
+    })
+}
+
 fn decode_kiro_account(row: &rusqlite::Row<'_>) -> rusqlite::Result<KiroAccountRecord> {
     Ok(KiroAccountRecord {
         account_name: row.get(0)?,
@@ -5274,6 +5626,86 @@ mod tests {
         let proxy = route.proxy.expect("codex proxy");
         assert_eq!(proxy.proxy_url, "http://127.0.0.1:9010");
         assert_eq!(proxy.proxy_username.as_deref(), Some("codex-user"));
+    }
+
+    #[test]
+    fn sqlite_store_finds_codex_account_name_by_account_id() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlStore::new(conn);
+        repo.create_admin_codex_account(&llm_access_core::store::NewAdminCodexAccount {
+            name: "codex_primary".to_string(),
+            account_id: Some("acct-1".to_string()),
+            auth_json: r#"{"refresh_token":"rt-1"}"#.to_string(),
+            map_gpt53_codex_to_spark: false,
+            created_at_ms: 100,
+        })
+        .expect("create codex account");
+
+        let existing = repo
+            .find_admin_codex_account_name_by_account_id("acct-1")
+            .expect("lookup by account id");
+        assert_eq!(existing.as_deref(), Some("codex_primary"));
+        assert_eq!(
+            repo.find_admin_codex_account_name_by_account_id("acct-missing")
+                .expect("lookup missing account id"),
+            None
+        );
+    }
+
+    #[test]
+    fn sqlite_store_clears_raw_auth_json_after_terminal_import_job_item() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlStore::new(conn);
+
+        repo.create_admin_codex_import_job(&llm_access_core::store::NewAdminCodexImportJob {
+            job_id: "llm-import-1".to_string(),
+            provider_type: "codex".to_string(),
+            source_type: "local_json".to_string(),
+            validate_before_import: false,
+            items: vec![llm_access_core::store::NewAdminCodexImportJobItem {
+                requested_name: "codex-a".to_string(),
+                requested_account_id: Some("acct-a".to_string()),
+                raw_auth_json: r#"{"refresh_token":"rt-a"}"#.to_string(),
+            }],
+            created_at_ms: 100,
+        })
+        .expect("create import job");
+        repo.mark_admin_codex_import_job_running("llm-import-1", 110)
+            .expect("mark job running");
+        repo.mark_admin_codex_import_job_item_running("llm-import-1", 0, 111)
+            .expect("mark item running");
+        repo.complete_admin_codex_import_job_item(
+            "llm-import-1",
+            &llm_access_core::store::AdminCodexImportJobItemResult {
+                item_index: 0,
+                status: "imported".to_string(),
+                error_message: None,
+                imported_account_name: Some("codex-a".to_string()),
+                final_account_id: Some("acct-a".to_string()),
+                validated_at_ms: Some(112),
+                imported_at_ms: Some(113),
+                completed_delta: 1,
+                succeeded_delta: 1,
+                skipped_delta: 0,
+                failed_delta: 0,
+                updated_at_ms: 113,
+            },
+        )
+        .expect("complete item");
+
+        let raw_auth_json: Option<String> = repo
+            .conn
+            .query_row(
+                "SELECT raw_auth_json
+                 FROM llm_account_import_job_items
+                 WHERE job_id = 'llm-import-1' AND item_index = 0",
+                [],
+                |row| row.get(0),
+            )
+            .expect("load raw auth json");
+        assert_eq!(raw_auth_json, None);
     }
 
     #[test]

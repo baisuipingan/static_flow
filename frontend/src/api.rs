@@ -8540,6 +8540,53 @@ pub struct AccountListResponse {
     pub generated_at: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct CodexAccountImportJobSummaryView {
+    pub job_id: String,
+    pub provider_type: String,
+    pub source_type: String,
+    pub validate_before_import: bool,
+    pub status: String,
+    pub total_count: usize,
+    pub completed_count: usize,
+    pub succeeded_count: usize,
+    pub skipped_count: usize,
+    pub failed_count: usize,
+    pub batch_error_message: Option<String>,
+    pub created_at_ms: i64,
+    pub updated_at_ms: i64,
+    pub finished_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct CodexAccountImportJobItemView {
+    pub item_index: usize,
+    pub requested_name: String,
+    pub requested_account_id: Option<String>,
+    pub status: String,
+    pub error_message: Option<String>,
+    pub imported_account_name: Option<String>,
+    pub final_account_id: Option<String>,
+    pub validated_at_ms: Option<i64>,
+    pub imported_at_ms: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct CodexAccountImportJobDetailView {
+    pub summary: CodexAccountImportJobSummaryView,
+    pub items: Vec<CodexAccountImportJobItemView>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(default)]
+struct CodexAccountImportJobsResponse {
+    pub jobs: Vec<CodexAccountImportJobSummaryView>,
+    pub generated_at: i64,
+}
+
 pub async fn fetch_admin_llm_gateway_accounts() -> Result<AccountListResponse, String> {
     #[cfg(feature = "mock")]
     {
@@ -8552,6 +8599,155 @@ pub async fn fetch_admin_llm_gateway_accounts() -> Result<AccountListResponse, S
     #[cfg(not(feature = "mock"))]
     {
         let url = format!("{}/admin/llm-gateway/accounts", admin_base());
+        let response = api_get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {:?}", e))?;
+        if !response.ok() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed: {text}"));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Parse error: {:?}", e))
+    }
+}
+
+pub async fn create_admin_llm_gateway_account_import_job(
+    validate_before_import: bool,
+    items: &[serde_json::Value],
+) -> Result<CodexAccountImportJobDetailView, String> {
+    #[cfg(feature = "mock")]
+    {
+        let now_ms = Date::now() as i64;
+        let item_views = items
+            .iter()
+            .enumerate()
+            .map(|(item_index, item)| CodexAccountImportJobItemView {
+                item_index,
+                requested_name: item
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or_default()
+                    .to_string(),
+                requested_account_id: item
+                    .get("auth_json")
+                    .and_then(|value| value.get("account_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                status: "imported".to_string(),
+                error_message: None,
+                imported_account_name: item
+                    .get("name")
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                final_account_id: item
+                    .get("auth_json")
+                    .and_then(|value| value.get("account_id"))
+                    .and_then(serde_json::Value::as_str)
+                    .map(ToString::to_string),
+                validated_at_ms: validate_before_import.then_some(now_ms),
+                imported_at_ms: Some(now_ms),
+            })
+            .collect::<Vec<_>>();
+        Ok(CodexAccountImportJobDetailView {
+            summary: CodexAccountImportJobSummaryView {
+                job_id: "llm-import-mock".to_string(),
+                provider_type: "codex".to_string(),
+                source_type: "local_json".to_string(),
+                validate_before_import,
+                status: "completed".to_string(),
+                total_count: item_views.len(),
+                completed_count: item_views.len(),
+                succeeded_count: item_views.len(),
+                skipped_count: 0,
+                failed_count: 0,
+                batch_error_message: None,
+                created_at_ms: now_ms,
+                updated_at_ms: now_ms,
+                finished_at_ms: Some(now_ms),
+            },
+            items: item_views,
+        })
+    }
+
+    #[cfg(not(feature = "mock"))]
+    {
+        if items.is_empty() {
+            return Err("批量导入内容不能为空".to_string());
+        }
+        let url = format!("{}/admin/llm-gateway/accounts/import-jobs", admin_base());
+        let payload = serde_json::json!({
+            "provider_type": "codex",
+            "source_type": "local_json",
+            "validate_before_import": validate_before_import,
+            "items": items,
+        });
+        let response = api_post(&url)
+            .json(&payload)
+            .map_err(|e| format!("Serialize error: {:?}", e))?
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {:?}", e))?;
+        if !response.ok() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed: {text}"));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Parse error: {:?}", e))
+    }
+}
+
+pub async fn fetch_admin_llm_gateway_account_import_jobs(
+    limit: Option<usize>,
+) -> Result<Vec<CodexAccountImportJobSummaryView>, String> {
+    #[cfg(feature = "mock")]
+    {
+        let _ = limit;
+        Ok(vec![])
+    }
+
+    #[cfg(not(feature = "mock"))]
+    {
+        let mut url = format!("{}/admin/llm-gateway/accounts/import-jobs", admin_base());
+        if let Some(limit) = limit {
+            url.push_str(&format!("?limit={limit}"));
+        }
+        let response = api_get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {:?}", e))?;
+        if !response.ok() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed: {text}"));
+        }
+        let body: CodexAccountImportJobsResponse = response
+            .json()
+            .await
+            .map_err(|e| format!("Parse error: {:?}", e))?;
+        Ok(body.jobs)
+    }
+}
+
+pub async fn fetch_admin_llm_gateway_account_import_job(
+    job_id: &str,
+) -> Result<CodexAccountImportJobDetailView, String> {
+    #[cfg(feature = "mock")]
+    {
+        let _ = job_id;
+        Ok(CodexAccountImportJobDetailView::default())
+    }
+
+    #[cfg(not(feature = "mock"))]
+    {
+        let url = format!(
+            "{}/admin/llm-gateway/accounts/import-jobs/{}",
+            admin_base(),
+            urlencoding::encode(job_id)
+        );
         let response = api_get(&url)
             .send()
             .await
