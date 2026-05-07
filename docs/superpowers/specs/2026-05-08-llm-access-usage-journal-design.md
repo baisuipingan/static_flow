@@ -29,6 +29,12 @@ visible in logs and metrics.
   files when necessary, even if they have not been consumed.
 - Let the analytics worker claim sealed files, import them into DuckDB, and
   delete each file after a successful import.
+- Keep the DuckDB side compatible with the current tiered storage contract:
+  write active DuckDB segments on local VM disk first, then seal/compact/archive
+  them into JuiceFS-backed segment and catalog directories.
+- Keep existing local StaticFlow and operator usage-detail workflows compatible
+  by exposing settled usage queries on a new independent local port while
+  preserving the old admin usage HTTP paths as proxy-compatible entrypoints.
 - Provide a CLI for human or agent inspection of journal files.
 - Surface journal backlog and loss counters in admin/runtime status without
   embedding a full journal browser in the existing usage page.
@@ -60,8 +66,9 @@ runtime composition:
 - SQLite rollups continue in the API process.
 - The API process appends normalized event batches to the journal.
 - DuckDB analytics writes move to an independent worker process.
-- Admin usage queries continue to read settled DuckDB analytics and may report
-  ingestion lag separately.
+- Admin usage query paths keep their existing HTTP contract, but they no longer
+  read DuckDB in the API process. They call the independent usage query service
+  over its configured local URL and may report ingestion lag separately.
 
 ## Architecture
 
@@ -75,17 +82,22 @@ The crate owns the journal wire format, writer, reader, consumer claim logic,
 retention logic, and CLI-friendly inspection primitives. Both the API producer
 and analytics consumer depend on this library.
 
-Use one independent analytics process:
+Use one independent analytics process that has two responsibilities: consume
+sealed journal files into DuckDB and serve read-only settled usage queries over
+an independent loopback HTTP port.
 
 ```text
 llm-access API process
   -> SQLite rollup sink
   -> local usage journal writer
+  -> proxy legacy admin usage query paths to usage query port
 
 llm-access usage worker process
   -> claim sealed journal file
   -> read compressed blocks in batches
-  -> append rows to DuckDB
+  -> append rows to local active DuckDB segment
+  -> seal/compact/archive DuckDB segments into JuiceFS
+  -> serve read-only usage query API on a separate port
   -> delete journal file after successful DuckDB commit
 ```
 
@@ -93,6 +105,83 @@ Implement the worker as a separate `llm-access-usage-worker` binary target and
 run it as a separate systemd unit from the API service. The important boundary
 is process isolation: DuckDB memory growth or stalls must not consume the API
 process memory budget.
+
+Default ports:
+
+- API service: `127.0.0.1:19080`
+- Usage worker/query service: `127.0.0.1:19081`
+
+The exact ports remain configurable, but production deployment must not expose
+the usage worker directly to public traffic. Caddy and pb-mapper may route local
+or private operator traffic to it.
+
+## Remote Usage Query Compatibility
+
+Existing clients use these settled usage query paths:
+
+```text
+/admin/llm-gateway/usage
+/admin/llm-gateway/usage/:event_id
+/admin/kiro-gateway/usage
+/admin/kiro-gateway/usage/:event_id
+```
+
+Those paths remain valid on the main API service. After cutover, the main API
+service handles them by forwarding the request to the configured usage query
+base URL, then returning the same JSON response shape and HTTP status behavior
+expected by the frontend and local StaticFlow tooling.
+
+The independent usage query service also exposes the same paths on its own
+port. This gives operators and local agents a direct detail-query path when they
+are connected to the remote `llm-access` service through a separate private
+relay. The intended deployment shape is:
+
+```text
+cloud llm-access API          127.0.0.1:19080
+cloud llm-access usage query  127.0.0.1:19081
+
+local mirror of API           127.0.0.1:19182
+local mirror of usage query   127.0.0.1:19183
+```
+
+The local mirror ports are examples, not hard-coded values. The compatibility
+contract is that existing admin pages can continue to call the old API paths,
+while direct operational usage detail lookup can be configured to call the
+usage query mirror port. If the usage query service is unavailable, the main API
+service returns an explicit `503` for usage list/detail routes; model serving
+and SQLite-backed accounting continue unaffected.
+
+## DuckDB Storage Compatibility
+
+The usage worker must reuse the current tiered DuckDB storage shape instead of
+writing one mutable DuckDB file on JuiceFS.
+
+The settled analytics path stays:
+
+```text
+local active directory:
+  /var/lib/staticflow/llm-access/analytics-active
+
+local compact work directory:
+  /var/lib/staticflow/llm-access/analytics-active/compacting
+
+JuiceFS archive directory:
+  /mnt/llm-access/analytics/segments
+
+JuiceFS catalog directory:
+  /mnt/llm-access/analytics/catalog
+```
+
+The worker imports journal batches into the local active DuckDB segment through
+the same `TieredDuckDbUsageConfig` contract used today. Rollover still closes
+the local active segment, compacts it locally, publishes the immutable segment
+to JuiceFS, and updates the JuiceFS-backed catalog. Journal consumption is only
+the new upstream ingestion source; it does not replace the local-first DuckDB
+active segment and archive pipeline.
+
+Usage queries served by the worker read through the same tiered
+`UsageAnalyticsStore`: current rows from the local active segment and historical
+rows from archived JuiceFS segments selected by the catalog.
 
 ## Storage Layout
 
@@ -289,7 +378,7 @@ The analytics worker consumes whole files. A file is the commit unit.
 3. Read blocks one by one.
 4. Decode each `JournalUsageBatchV1`.
 5. Convert journal events into DuckDB `UsageEventRow` values.
-6. Insert rows into DuckDB in batches.
+6. Insert rows into the local active DuckDB segment in batches.
 7. Commit DuckDB writes.
 8. Delete the claimed journal file.
 
@@ -300,6 +389,12 @@ is to quarantine bad files so an operator can inspect them with the CLI.
 If DuckDB import fails before commit, the worker keeps the claimed file for
 retry. If the process crashes after DuckDB commit but before file delete, startup
 may retry the file. Therefore imports must be idempotent by `event_id`.
+
+The journal file is deleted after the local active DuckDB commit succeeds. It
+does not wait for the tiered DuckDB archive step to copy a sealed DuckDB segment
+to JuiceFS. At that point the event is durably represented by the local DuckDB
+active segment, and the existing tiered DuckDB sealer owns the later archive
+publication.
 
 The first implementation uses a local consumer state SQLite database under the
 journal root:
@@ -355,8 +450,10 @@ events table. It reports:
 - write failure counters
 - last producer seal timestamp
 - worker running status when available
+- usage query base URL and last successful proxy check
 - worker last successful import timestamp
 - worker last error
+- DuckDB active segment bytes and archive backlog from the tiered store
 
 The frontend only visualizes this status and backlog. It does not browse raw
 journal events.
@@ -377,6 +474,8 @@ usage_journal_fsync_interval_ms
 usage_journal_zstd_level
 usage_journal_consumer_lease_ms
 usage_journal_delete_bad_files
+usage_query_bind_addr
+usage_query_base_url
 ```
 
 The API process requires `usage_journal_enabled = true` before DuckDB is removed
@@ -384,6 +483,22 @@ from the hot process. Migration should support a short shadow period where the
 existing DuckDB analytics writer and the journal writer both receive events, but
 only for verification. The final production state must not keep DuckDB writes in
 the API process.
+
+The usage worker requires the same tiered DuckDB settings currently used by the
+API service:
+
+```text
+duckdb_active_dir
+duckdb_archive_dir
+duckdb_catalog_dir
+duckdb_rollover_bytes
+duckdb_usage_memory_limit_mib
+duckdb_usage_checkpoint_threshold_mib
+```
+
+After cutover, those DuckDB settings belong to `llm-access-usage-worker`, not
+the main API service. The API service only needs `usage_query_base_url` so it
+can preserve the existing admin usage routes.
 
 ## Migration Plan
 
@@ -393,12 +508,16 @@ the API process.
    journals.
 3. Add a journal-backed `UsageEventSink` and wire it into `UsageAccounting`
    while keeping SQLite rollups in process.
-4. Add the independent analytics worker and consumer state database.
-5. Add idempotent DuckDB import tests that retry after a simulated post-commit
+4. Add the independent analytics worker, consumer state database, and tiered
+   DuckDB repository wiring using the existing local-active-plus-JuiceFS storage
+   contract.
+5. Add the worker read-only usage query HTTP API on the independent port.
+6. Add API-process proxy compatibility for existing admin usage routes.
+7. Add idempotent DuckDB import tests that retry after a simulated post-commit
    crash.
-6. Add admin status APIs and a small frontend panel for backlog/status only.
-7. Run a shadow deployment with both DuckDB and journal writes enabled.
-8. Cut over production so the API process no longer opens DuckDB analytics for
+8. Add admin status APIs and a small frontend panel for backlog/status only.
+9. Run a shadow deployment with both DuckDB and journal writes enabled.
+10. Cut over production so the API process no longer opens DuckDB analytics for
    writes.
 
 ## Testing
@@ -417,6 +536,12 @@ Required test coverage:
 - Consumer retries a file after failed DuckDB import.
 - Consumer does not duplicate rows after retrying a post-commit, pre-delete
   crash.
+- Worker writes imported rows into the tiered DuckDB local active segment and
+  preserves local rollover plus JuiceFS archive publication behavior.
+- Usage query service returns the same JSON shape as the existing admin usage
+  list/detail endpoints.
+- API-process usage route proxy returns the same response as the usage query
+  service and returns `503` when the usage query service is down.
 - CLI `inspect` validates metadata without dumping full payloads.
 - Admin status reports backlog and dropped-file counters.
 
@@ -424,6 +549,10 @@ Required operational verification:
 
 - API process can serve traffic with the worker stopped.
 - Worker memory growth does not affect API process RSS.
+- Stopping the usage worker makes only usage list/detail routes unavailable; API
+  model serving and SQLite accounting remain healthy.
+- Local StaticFlow can query remote usage detail through the direct usage-query
+  mirror port and through the legacy API mirror path.
 - A large diagnostic payload workload compresses into bounded journal files.
 - Retention pressure produces visible counters and logs.
 - Restarting the API process recovers the active sequence without consuming
@@ -435,6 +564,11 @@ Required operational verification:
 - Use `postcard + zstd + crc32c`, not `rkyv`.
 - Use block-level CRC only.
 - Consume whole sealed files and delete them after successful import.
+- Treat successful local active DuckDB commit as the journal delete point; DuckDB
+  segment archival to JuiceFS remains the existing asynchronous tiered-store
+  responsibility.
 - Allow deletion of old unconsumed sealed files under retention pressure.
 - Keep raw journal inspection in CLI, not in the usage events frontend.
 - Show only journal backlog/status in the admin frontend.
+- Serve settled usage queries from the independent usage worker/query port and
+  keep the old admin usage paths as compatibility proxies.
