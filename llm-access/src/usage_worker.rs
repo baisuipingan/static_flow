@@ -13,9 +13,12 @@ use llm_access_store::duckdb::DuckDbUsageRepository;
 use llm_usage_journal::{JournalConsumerState, JournalReader, WorkerProgressSnapshot};
 use sha2::{Digest, Sha256};
 
-use crate::usage_query::{
-    get_kiro_usage_event, get_llm_usage_event, list_kiro_usage_events, list_llm_usage_events,
-    usage_chart_points, UsageQueryState,
+use crate::{
+    process_memory::{read_current_process_memory_stats, ProcessMemoryStats},
+    usage_query::{
+        get_kiro_usage_event, get_llm_usage_event, list_kiro_usage_events, list_llm_usage_events,
+        usage_chart_points, UsageQueryState,
+    },
 };
 
 /// Usage journal consumer.
@@ -59,13 +62,24 @@ async fn worker_status(State(state): State<WorkerHttpState>) -> impl IntoRespons
     match JournalConsumerState::open(&state.journal_root)
         .and_then(|state| state.progress_snapshot())
     {
-        Ok(progress) => Json(progress).into_response(),
+        Ok(progress) => Json(WorkerStatusResponse {
+            progress,
+            process_memory: read_current_process_memory_stats(),
+        })
+        .into_response(),
         Err(err) => (
             axum::http::StatusCode::INTERNAL_SERVER_ERROR,
             format!("failed to load worker status: {err:#}"),
         )
             .into_response(),
     }
+}
+
+#[derive(serde::Serialize)]
+struct WorkerStatusResponse {
+    #[serde(flatten)]
+    progress: WorkerProgressSnapshot,
+    process_memory: ProcessMemoryStats,
 }
 
 impl UsageWorker {
@@ -444,6 +458,29 @@ mod tests {
             .expect("chart body");
         let value: serde_json::Value = serde_json::from_slice(&body).expect("chart json");
         assert_eq!(value["chart_points"][0]["tokens"], 40);
+    }
+
+    #[tokio::test]
+    async fn usage_worker_status_includes_process_memory() {
+        let fixture = UsageWorkerFixture::new();
+        let app = super::router(fixture.worker.as_ref());
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/llm-access/usage-worker/status")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("status response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("status body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("status json");
+        assert!(value["process_memory"].is_object());
     }
 
     struct UsageWorkerFixture {

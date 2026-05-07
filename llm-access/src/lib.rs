@@ -11,6 +11,7 @@ mod geoip;
 pub mod kiro;
 mod kiro_refresh;
 mod kiro_status;
+mod process_memory;
 /// Provider request entrypoints.
 pub mod provider;
 mod public;
@@ -57,6 +58,7 @@ pub(crate) static KIRO_UPSTREAM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mute
 struct HttpState {
     provider_state: provider::ProviderState,
     geoip: geoip::GeoIpResolver,
+    request_activity: Arc<activity::RequestActivityTracker>,
     admin_config_store: Arc<dyn AdminConfigStore>,
     admin_key_store: Arc<dyn AdminKeyStore>,
     admin_account_group_store: Arc<dyn AdminAccountGroupStore>,
@@ -130,6 +132,7 @@ pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
     let state = HttpState {
         provider_state,
         geoip,
+        request_activity,
         admin_config_store: runtime.admin_config_store(),
         admin_key_store: runtime.admin_key_store(),
         admin_account_group_store: runtime.admin_account_group_store(),

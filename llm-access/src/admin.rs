@@ -42,7 +42,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
 
-use crate::{codex_refresh, codex_status, kiro_refresh, kiro_status, HttpState};
+use crate::{
+    activity::RequestActivitySnapshot,
+    codex_refresh, codex_status, kiro_refresh, kiro_status,
+    process_memory::{read_current_process_memory_stats, ProcessMemoryStats},
+    HttpState,
+};
 
 const MAX_CODEX_CLIENT_VERSION_LEN: usize = 64;
 const MAX_RUNTIME_CACHE_TTL_SECONDS: u64 = 86_400;
@@ -153,14 +158,8 @@ struct AdminKiroAccountStatusesResponse {
 struct AdminKiroCacheStatsResponse {
     #[serde(flatten)]
     stats: KiroCacheRuntimeStats,
-    process_memory: AdminProcessMemoryStats,
+    process_memory: ProcessMemoryStats,
     generated_at: i64,
-}
-
-#[derive(Debug, Default, Serialize)]
-struct AdminProcessMemoryStats {
-    rss_bytes: Option<u64>,
-    virtual_bytes: Option<u64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -228,6 +227,7 @@ struct AdminUsageWorkerProgressView {
     last_successful_import_at_ms: Option<i64>,
     last_error: Option<String>,
     last_error_at_ms: Option<i64>,
+    process_memory: ProcessMemoryStats,
 }
 
 #[derive(Debug, Serialize)]
@@ -1049,7 +1049,7 @@ pub(crate) async fn list_llm_gateway_usage_events(
         Ok(permit) => permit,
         Err(response) => return response.into_response(),
     };
-    proxy_usage_query(&state, &uri).await
+    proxy_usage_list_query(&state, &uri).await
 }
 
 pub(crate) async fn get_llm_gateway_usage_event(
@@ -1598,7 +1598,7 @@ pub(crate) async fn list_admin_kiro_usage_events(
         Ok(permit) => permit,
         Err(response) => return response.into_response(),
     };
-    proxy_usage_query(&state, &uri).await
+    proxy_usage_list_query(&state, &uri).await
 }
 
 pub(crate) async fn get_admin_kiro_usage_event(
@@ -1695,31 +1695,10 @@ pub(crate) async fn get_admin_kiro_cache_stats(
         stats: state
             .provider_state
             .kiro_cache_stats(kiro_cache_simulation_config_from_admin_config(&config)),
-        process_memory: read_process_memory_stats(),
+        process_memory: read_current_process_memory_stats(),
         generated_at: now_ms(),
     })
     .into_response()
-}
-
-fn read_process_memory_stats() -> AdminProcessMemoryStats {
-    let Ok(status) = fs::read_to_string("/proc/self/status") else {
-        return AdminProcessMemoryStats::default();
-    };
-    let mut stats = AdminProcessMemoryStats::default();
-    for line in status.lines() {
-        if let Some(bytes) = parse_proc_status_kib_line(line, "VmRSS:") {
-            stats.rss_bytes = Some(bytes);
-        } else if let Some(bytes) = parse_proc_status_kib_line(line, "VmSize:") {
-            stats.virtual_bytes = Some(bytes);
-        }
-    }
-    stats
-}
-
-fn parse_proc_status_kib_line(line: &str, prefix: &str) -> Option<u64> {
-    let rest = line.strip_prefix(prefix)?.trim();
-    let raw_kib = rest.split_whitespace().next()?.parse::<u64>().ok()?;
-    raw_kib.checked_mul(1024)
 }
 
 fn kiro_cache_simulation_config_from_admin_config(
@@ -3120,14 +3099,23 @@ async fn usage_worker_status(base_url: &str, now: i64) -> AdminUsageWorkerProgre
     if !response.status().is_success() {
         return unreachable_worker_view(now, format!("worker returned {}", response.status()));
     }
-    match response.json::<WorkerProgressSnapshot>().await {
-        Ok(progress) => worker_progress_view(progress, now),
+    match response.json::<WorkerStatusSnapshot>().await {
+        Ok(status) => worker_progress_view(status.progress, status.process_memory, now),
         Err(err) => unreachable_worker_view(now, err.to_string()),
     }
 }
 
+#[derive(Debug, Default, Deserialize)]
+struct WorkerStatusSnapshot {
+    #[serde(flatten)]
+    progress: WorkerProgressSnapshot,
+    #[serde(default)]
+    process_memory: ProcessMemoryStats,
+}
+
 fn worker_progress_view(
     progress: WorkerProgressSnapshot,
+    process_memory: ProcessMemoryStats,
     now: i64,
 ) -> AdminUsageWorkerProgressView {
     AdminUsageWorkerProgressView {
@@ -3149,6 +3137,7 @@ fn worker_progress_view(
         last_successful_import_at_ms: progress.last_successful_import_at_ms,
         last_error: progress.last_error,
         last_error_at_ms: progress.last_error_at_ms,
+        process_memory,
     }
 }
 
@@ -3160,11 +3149,26 @@ fn unreachable_worker_view(now: i64, error: String) -> AdminUsageWorkerProgressV
             last_error_at_ms: Some(now),
             ..WorkerProgressSnapshot::default()
         },
+        ProcessMemoryStats::default(),
         now,
     )
 }
 
+async fn proxy_usage_list_query(state: &HttpState, uri: &Uri) -> Response {
+    let activity_key_id = usage_activity_key_id_from_uri(uri);
+    let activity = state.request_activity.snapshot(activity_key_id.as_deref());
+    proxy_usage_query_with_activity(state, uri, Some(activity)).await
+}
+
 async fn proxy_usage_query(state: &HttpState, uri: &Uri) -> Response {
+    proxy_usage_query_with_activity(state, uri, None).await
+}
+
+async fn proxy_usage_query_with_activity(
+    state: &HttpState,
+    uri: &Uri,
+    activity: Option<RequestActivitySnapshot>,
+) -> Response {
     let config = match state.admin_config_store.get_admin_runtime_config().await {
         Ok(config) => config,
         Err(_) => return internal_error("Failed to load llm gateway config").into_response(),
@@ -3203,13 +3207,41 @@ async fn proxy_usage_query(state: &HttpState, uri: &Uri) -> Response {
             return internal_error("Failed to read usage worker response").into_response();
         },
     };
+    let body = match activity.filter(|_| status.is_success()) {
+        Some(activity) => overlay_usage_activity_response_body(bytes.as_ref(), activity)
+            .map(Body::from)
+            .unwrap_or_else(|| Body::from(bytes)),
+        None => Body::from(bytes),
+    };
     let mut builder = Response::builder().status(status);
     if let Some(content_type) = content_type {
         builder = builder.header(header::CONTENT_TYPE, content_type);
     }
     builder
-        .body(Body::from(bytes))
+        .body(body)
         .unwrap_or_else(|_| internal_error("Failed to build usage worker response").into_response())
+}
+
+fn usage_activity_key_id_from_uri(uri: &Uri) -> Option<String> {
+    url::form_urlencoded::parse(uri.query()?.as_bytes()).find_map(|(name, value)| {
+        (name == "key_id")
+            .then(|| normalize_optional_string(&value))
+            .flatten()
+    })
+}
+
+fn overlay_usage_activity_response_body(
+    body: &[u8],
+    activity: RequestActivitySnapshot,
+) -> Option<Vec<u8>> {
+    let mut value = serde_json::from_slice::<serde_json::Value>(body).ok()?;
+    let object = value.as_object_mut()?;
+    if !object.contains_key("events") || !object.contains_key("total") {
+        return None;
+    }
+    object.insert("current_rpm".to_string(), serde_json::Value::from(activity.rpm));
+    object.insert("current_in_flight".to_string(), serde_json::Value::from(activity.in_flight));
+    serde_json::to_vec(&value).ok()
 }
 
 fn review_queue_action(request: ReviewQueueActionRequest) -> AdminReviewQueueAction {
@@ -4725,12 +4757,6 @@ mod tests {
     }
 
     #[test]
-    fn parse_proc_status_kib_line_converts_to_bytes() {
-        assert_eq!(parse_proc_status_kib_line("VmRSS:\t  1234 kB", "VmRSS:"), Some(1_263_616));
-        assert_eq!(parse_proc_status_kib_line("VmSize: none", "VmRSS:"), None);
-    }
-
-    #[test]
     fn normalize_key_patch_accepts_partial_kiro_cache_policy_override() {
         let mut request = empty_key_patch_request();
         request.kiro_cache_policy_override_json = Some(Some(
@@ -4810,6 +4836,41 @@ mod tests {
         assert!(updated.usage_journal_delete_bad_files);
         assert_eq!(updated.usage_query_bind_addr, "127.0.0.1:19091");
         assert_eq!(updated.usage_query_base_url, "http://127.0.0.1:19091");
+    }
+
+    #[test]
+    fn proxied_usage_list_body_preserves_api_process_activity_counters() {
+        let body = br#"{
+            "total": 0,
+            "offset": 0,
+            "limit": 20,
+            "has_more": false,
+            "current_rpm": 0,
+            "current_in_flight": 0,
+            "events": [],
+            "generated_at": 1700000000000
+        }"#;
+        let activity = crate::activity::RequestActivitySnapshot {
+            rpm: 7,
+            in_flight: 2,
+        };
+
+        let overlaid =
+            overlay_usage_activity_response_body(body, activity).expect("usage list overlay");
+        let value: serde_json::Value =
+            serde_json::from_slice(&overlaid).expect("overlaid response json");
+
+        assert_eq!(value["current_rpm"], 7);
+        assert_eq!(value["current_in_flight"], 2);
+    }
+
+    #[test]
+    fn usage_activity_key_id_comes_from_query_string() {
+        let uri: Uri = "/admin/llm-gateway/usage?limit=20&key_id=key-a"
+            .parse()
+            .expect("uri");
+
+        assert_eq!(usage_activity_key_id_from_uri(&uri).as_deref(), Some("key-a"));
     }
 
     #[test]

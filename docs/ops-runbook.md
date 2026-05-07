@@ -119,7 +119,7 @@ private env files, not in tracked docs.
   use:
   - state root: `/mnt/llm-access`
   - SQLite control DB: `/mnt/llm-access/control/llm-access.sqlite3`
-  - local usage journal dir: `/mnt/llm-access/usage-journal`
+  - hot local usage journal dir: `/var/lib/staticflow/llm-access/usage-journal`
   - local active DuckDB dir: `/var/lib/staticflow/llm-access/analytics-active`
   - archived immutable DuckDB segments:
     `/mnt/llm-access/analytics/segments`
@@ -188,7 +188,7 @@ extra swap as an emergency buffer, not as normal working memory.
   mutable all-history DuckDB file.
 - The API process no longer writes usage events directly into DuckDB. It first
   commits SQLite rollups, then appends compact diagnostic usage events to
-  `/mnt/llm-access/usage-journal`. The separate usage worker consumes sealed
+  `/var/lib/staticflow/llm-access/usage-journal`. The separate usage worker consumes sealed
   journal files in batches, imports them into tiered DuckDB, records worker
   progress in `consumer-state.sqlite3`, and deletes consumed journal files.
 - Journal file rollover is controlled by both size and age. Retention is

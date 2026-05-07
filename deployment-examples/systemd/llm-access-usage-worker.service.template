@@ -13,7 +13,7 @@ Environment=STATICFLOW_LOG_DIR=/var/log/staticflow-runtime
 Environment=STATICFLOW_LOG_SERVICE=llm-access-usage-worker
 Environment=STATICFLOW_LOG_STDOUT=0
 Environment=LLM_ACCESS_USAGE_QUERY_BIND_ADDR=127.0.0.1:19081
-Environment=LLM_ACCESS_USAGE_JOURNAL_DIR=/mnt/llm-access/usage-journal
+Environment=LLM_ACCESS_USAGE_JOURNAL_DIR=/var/lib/staticflow/llm-access/usage-journal
 Environment=LLM_ACCESS_DUCKDB_ACTIVE_DIR=/var/lib/staticflow/llm-access/analytics-active
 # Compact work files are derived under ${LLM_ACCESS_DUCKDB_ACTIVE_DIR}/compacting
 # so DuckDB rewrite work stays on local block storage instead of JuiceFS.

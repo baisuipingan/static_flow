@@ -43,7 +43,8 @@ use crate::{
         CodexAccountImportJobSummaryView, CreateAdminAccountGroupInput,
         CreateAdminUpstreamProxyConfigInput, LlmGatewayRuntimeConfig, PatchAdminAccountGroupInput,
         PatchAdminLlmGatewayAccountInput, PatchAdminLlmGatewayKeyRequest,
-        PatchAdminUpstreamProxyConfigInput, DEFAULT_LLM_GATEWAY_CODEX_CLIENT_VERSION,
+        PatchAdminUpstreamProxyConfigInput, ProcessMemoryRuntimeStats,
+        DEFAULT_LLM_GATEWAY_CODEX_CLIENT_VERSION,
     },
     components::{pagination::Pagination, search_box::SearchBox, tab_bar::render_tab_bar},
     pages::llm_access_shared::{
@@ -291,6 +292,27 @@ fn format_optional_bytes(bytes: Option<u64>) -> String {
         format!("{:.1} KiB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn format_cgroup_memory_usage(memory: &ProcessMemoryRuntimeStats) -> String {
+    match (memory.cgroup_current_bytes, memory.cgroup_max_bytes) {
+        (Some(current), Some(max)) if max > 0 => {
+            let percent = (current as f64 / max as f64 * 100.0).clamp(0.0, 999.0);
+            format!(
+                "{} / {} ({percent:.1}%)",
+                format_optional_bytes(Some(current)),
+                format_optional_bytes(Some(max))
+            )
+        },
+        (Some(current), Some(max)) => format!(
+            "{} / {}",
+            format_optional_bytes(Some(current)),
+            format_optional_bytes(Some(max))
+        ),
+        (Some(current), None) => format!("{} / limit -", format_optional_bytes(Some(current))),
+        (None, Some(max)) => format!("- / {}", format_optional_bytes(Some(max))),
+        (None, None) => "-".to_string(),
     }
 }
 
@@ -4737,7 +4759,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         </div>
 
                         if let Some(status) = (*usage_journal_status).clone() {
-                            <div class={classes!("mt-4", "grid", "gap-3", "md:grid-cols-2", "xl:grid-cols-4")}>
+                            <div class={classes!("mt-4", "grid", "gap-3", "md:grid-cols-2", "xl:grid-cols-5")}>
                                 <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--bg)]", "p-3")}>
                                     <div class={classes!("font-mono", "text-[11px]", "uppercase", "tracking-widest", "text-[var(--muted)]")}>{ "worker" }</div>
                                     <div class={classes!("mt-2", "flex", "items-center", "gap-2", "flex-wrap")}>
@@ -4747,6 +4769,23 @@ pub fn admin_llm_gateway_page() -> Html {
                                         <span class={classes!("text-xs", "text-[var(--muted)]")}>
                                             { format!("heartbeat {}", format_optional_duration_ms(status.worker.heartbeat_age_ms)) }
                                         </span>
+                                    </div>
+                                </div>
+                                <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--bg)]", "p-3")}>
+                                    <div class={classes!("font-mono", "text-[11px]", "uppercase", "tracking-widest", "text-[var(--muted)]")}>{ "worker memory" }</div>
+                                    <div class={classes!("mt-1", "font-mono", "text-lg", "font-bold")}>
+                                        { format_optional_bytes(status.worker.process_memory.rss_bytes) }
+                                    </div>
+                                    <div class={classes!("text-xs", "text-[var(--muted)]")}>
+                                        { format!("cgroup {}", format_cgroup_memory_usage(&status.worker.process_memory)) }
+                                    </div>
+                                    <div class={classes!("mt-1", "text-[10px]", "text-[var(--muted)]")}>
+                                        { format!(
+                                            "peak {} · swap {} / {}",
+                                            format_optional_bytes(status.worker.process_memory.cgroup_peak_bytes),
+                                            format_optional_bytes(status.worker.process_memory.cgroup_swap_current_bytes),
+                                            format_optional_bytes(status.worker.process_memory.cgroup_swap_max_bytes),
+                                        ) }
                                     </div>
                                 </div>
                                 <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--bg)]", "p-3")}>

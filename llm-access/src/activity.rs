@@ -7,7 +7,6 @@ use std::{
 };
 
 /// Current live request activity.
-#[cfg(test)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) struct RequestActivitySnapshot {
     pub(crate) rpm: u32,
@@ -44,7 +43,6 @@ impl SlidingSecondWindow {
         bucket.count = bucket.count.saturating_add(1);
     }
 
-    #[cfg(test)]
     fn rpm_at(&self, now_sec: u64) -> u32 {
         self.buckets
             .iter()
@@ -70,7 +68,6 @@ impl ActivityState {
         self.in_flight = self.in_flight.saturating_sub(1);
     }
 
-    #[cfg(test)]
     fn snapshot(&self, now_sec: u64) -> RequestActivitySnapshot {
         RequestActivitySnapshot {
             rpm: self.rpm_window.rpm_at(now_sec),
@@ -100,7 +97,6 @@ impl RequestActivityTracker {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn snapshot(&self, key_id: Option<&str>) -> RequestActivitySnapshot {
         self.snapshot_at(key_id, self.current_tick_sec())
     }
@@ -109,7 +105,6 @@ impl RequestActivityTracker {
         self.started_at.elapsed().as_secs()
     }
 
-    #[cfg(test)]
     fn snapshot_at(&self, key_id: Option<&str>, tick_sec: u64) -> RequestActivitySnapshot {
         let Ok(inner) = self.inner.lock() else {
             return RequestActivitySnapshot::default();

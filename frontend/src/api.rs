@@ -6126,6 +6126,19 @@ pub struct AdminLlmGatewayUsageEventsResponse {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(default)]
+pub struct ProcessMemoryRuntimeStats {
+    pub rss_bytes: Option<u64>,
+    pub virtual_bytes: Option<u64>,
+    pub cgroup_current_bytes: Option<u64>,
+    pub cgroup_peak_bytes: Option<u64>,
+    pub cgroup_high_bytes: Option<u64>,
+    pub cgroup_max_bytes: Option<u64>,
+    pub cgroup_swap_current_bytes: Option<u64>,
+    pub cgroup_swap_max_bytes: Option<u64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(default)]
 pub struct AdminUsageWorkerProgressView {
     pub state: String,
     pub current_file_path: Option<String>,
@@ -6143,6 +6156,7 @@ pub struct AdminUsageWorkerProgressView {
     pub last_successful_import_at_ms: Option<i64>,
     pub last_error: Option<String>,
     pub last_error_at_ms: Option<i64>,
+    pub process_memory: ProcessMemoryRuntimeStats,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -9225,19 +9239,12 @@ pub struct KiroConversationAnchorRuntimeStats {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(default)]
-pub struct KiroProcessMemoryRuntimeStats {
-    pub rss_bytes: Option<u64>,
-    pub virtual_bytes: Option<u64>,
-}
-
-#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
-#[serde(default)]
 pub struct AdminKiroCacheStatsResponse {
     pub mode: String,
     pub page_size_tokens: usize,
     pub prefix_tree: KiroPrefixTreeRuntimeStats,
     pub conversation_anchors: KiroConversationAnchorRuntimeStats,
-    pub process_memory: KiroProcessMemoryRuntimeStats,
+    pub process_memory: ProcessMemoryRuntimeStats,
     pub generated_at: i64,
 }
 
@@ -10431,5 +10438,6 @@ mod tests {
         let _fetch = fetch_admin_usage_journal_status;
 
         assert_eq!(status.worker.processed_events, 0);
+        assert_eq!(status.worker.process_memory.rss_bytes, None);
     }
 }
