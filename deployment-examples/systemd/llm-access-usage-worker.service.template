@@ -1,0 +1,41 @@
+[Unit]
+Description=StaticFlow LLM Access Usage Worker
+After=network-online.target mnt-llm\x2daccess.mount
+Wants=network-online.target
+RequiresMountsFor=/mnt/llm-access
+
+[Service]
+Type=simple
+User=llm-access
+Group=llm-access
+EnvironmentFile=/etc/llm-access/llm-access.env
+Environment=STATICFLOW_LOG_DIR=/var/log/staticflow-runtime
+Environment=STATICFLOW_LOG_SERVICE=llm-access-usage-worker
+Environment=STATICFLOW_LOG_STDOUT=0
+Environment=LLM_ACCESS_USAGE_QUERY_BIND_ADDR=127.0.0.1:19081
+Environment=LLM_ACCESS_USAGE_JOURNAL_DIR=/mnt/llm-access/usage-journal
+Environment=LLM_ACCESS_DUCKDB_ACTIVE_DIR=/var/lib/staticflow/llm-access/analytics-active
+# Compact work files are derived under ${LLM_ACCESS_DUCKDB_ACTIVE_DIR}/compacting
+# so DuckDB rewrite work stays on local block storage instead of JuiceFS.
+Environment=LLM_ACCESS_DUCKDB_ARCHIVE_DIR=/mnt/llm-access/analytics/segments
+Environment=LLM_ACCESS_DUCKDB_CATALOG_DIR=/mnt/llm-access/analytics/catalog
+Environment=LLM_ACCESS_DUCKDB_ROLLOVER_BYTES=268435456
+WorkingDirectory=/mnt/llm-access
+ExecStartPre=/usr/local/bin/staticflow-wait-llm-access-state analytics
+ExecStart=/usr/local/bin/llm-access-usage-worker serve --bind ${LLM_ACCESS_USAGE_QUERY_BIND_ADDR} --state-root ${LLM_ACCESS_STATE_ROOT} --sqlite-control ${LLM_ACCESS_SQLITE_CONTROL} --duckdb ${LLM_ACCESS_DUCKDB} --usage-journal-dir ${LLM_ACCESS_USAGE_JOURNAL_DIR} --duckdb-active-dir ${LLM_ACCESS_DUCKDB_ACTIVE_DIR} --duckdb-archive-dir ${LLM_ACCESS_DUCKDB_ARCHIVE_DIR} --duckdb-catalog-dir ${LLM_ACCESS_DUCKDB_CATALOG_DIR} --duckdb-rollover-bytes ${LLM_ACCESS_DUCKDB_ROLLOVER_BYTES}
+Restart=always
+RestartSec=3
+NoNewPrivileges=true
+StateDirectory=staticflow/llm-access
+MemoryAccounting=yes
+MemoryHigh=2200M
+MemoryMax=3072M
+MemorySwapMax=1024M
+TasksMax=128
+OOMPolicy=kill
+# Do not add ProtectSystem/ReadWritePaths/PrivateTmp for this unit when
+# /mnt/llm-access is a JuiceFS FUSE mount with default_permissions. Those
+# systemd mount namespace features can fail before ExecStart with 226/NAMESPACE.
+
+[Install]
+WantedBy=multi-user.target

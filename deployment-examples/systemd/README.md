@@ -16,6 +16,7 @@ Files:
 - `staticflow-gateway.env.example`
 - `staticflow-backend-slot.env.example`
 - `llm-access.service.template`
+- `llm-access-usage-worker.service.template`
 - `llm-access-juicefs.mount.template`
 - `juicefs-llm-access.resource-guard.conf`
 - `staticflow-wait-llm-access-state`
@@ -65,12 +66,15 @@ Storage model:
 - GeoIP MMDB cache: `/var/lib/staticflow/llm-access/geoip/GeoLite2-City.mmdb`
 - archived DuckDB segments: `/mnt/llm-access/analytics/segments`
 - DuckDB segment catalog: `/mnt/llm-access/analytics/catalog`
+- usage journal: `/mnt/llm-access/usage-journal`
+- usage query worker bind: `127.0.0.1:19081`
 - JuiceFS cache dir: `/var/cache/juicefs/llm-access`
 
 The production JuiceFS volume is backed by Cloudflare R2 object storage and
 external Valkey metadata. Credentials belong in ignored private env files, not
-in these templates. `llm-access.service` must be a single writer for the
-SQLite/DuckDB/auth tree.
+in these templates. `llm-access.service` is the single writer for SQLite
+rollups/auth state and local usage journal files; `llm-access-usage-worker`
+is the single writer for tiered DuckDB analytics.
 The GeoIP MMDB is a rebuildable local cache and should stay on the VM block
 disk, not under `/mnt/llm-access`.
 

@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 
 use crate::usage_query::{
     get_kiro_usage_event, get_llm_usage_event, list_kiro_usage_events, list_llm_usage_events,
-    UsageQueryState,
+    usage_chart_points, UsageQueryState,
 };
 
 /// Usage journal consumer.
@@ -35,6 +35,7 @@ pub fn router(worker: &UsageWorker) -> Router {
         .route("/admin/llm-gateway/usage/:event_id", get(get_llm_usage_event))
         .route("/admin/kiro-gateway/usage", get(list_kiro_usage_events))
         .route("/admin/kiro-gateway/usage/:event_id", get(get_kiro_usage_event))
+        .route("/admin/llm-access/usage/chart", get(usage_chart_points))
         .route("/admin/llm-access/usage-worker/status", get(worker_status))
         .with_state(WorkerHttpState {
             journal_root: worker.journal_root.clone(),
@@ -415,6 +416,34 @@ mod tests {
             .expect("detail response");
 
         assert_eq!(response.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn usage_worker_serves_public_usage_chart_path() {
+        let fixture = UsageWorkerFixture::new();
+        fixture.write_sealed_event("evt-worker-chart");
+        fixture.run_one_import().await.expect("import");
+
+        let app = super::router(fixture.worker.as_ref());
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri(
+                        "/admin/llm-access/usage/chart?key_id=key-1&start_ms=1700000000000&\
+                         bucket_ms=3600000&bucket_count=1",
+                    )
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("chart response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("chart body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("chart json");
+        assert_eq!(value["chart_points"][0]["tokens"], 40);
     }
 
     struct UsageWorkerFixture {

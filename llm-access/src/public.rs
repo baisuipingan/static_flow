@@ -1,5 +1,7 @@
 //! Public unauthenticated endpoints.
 
+use std::time::Duration;
+
 use axum::{
     body::Body,
     extract::{OriginalUri, Path, State},
@@ -7,16 +9,16 @@ use axum::{
     response::{IntoResponse, Response},
     Json,
 };
-use llm_access_core::{
-    store::{
-        ProviderCodexRoute, PublicAccessKey, PublicAccountContribution, PublicSponsor,
-        PublicUsageLookupKey, UsageEventQuery,
-    },
-    usage::UsageEvent,
+use llm_access_core::store::{
+    ProviderCodexRoute, PublicAccessKey, PublicAccountContribution, PublicSponsor,
+    PublicUsageLookupKey,
 };
-use serde::{Deserialize, Serialize};
+use serde::{de::DeserializeOwned, Deserialize, Serialize};
 
-use crate::HttpState;
+use crate::{
+    usage_query::{AdminUsageEventView, AdminUsageEventsResponse, UsageChartResponse},
+    HttpState,
+};
 
 const MAX_PUBLIC_ACCOUNT_CONTRIBUTIONS: usize = 24;
 const MAX_PUBLIC_SPONSORS: usize = 36;
@@ -438,40 +440,51 @@ pub(crate) async fn post_llm_gateway_public_usage_query(
         .clamp(1, PUBLIC_USAGE_LOOKUP_MAX_LIMIT);
     let key_id = key.key_id.clone();
     let chart_start = public_usage_chart_window_start(now);
-    let chart_points = match state
-        .usage_analytics_store
-        .usage_chart_points(
-            &key_id,
-            chart_start,
-            PUBLIC_USAGE_LOOKUP_BUCKET_MS,
-            PUBLIC_USAGE_LOOKUP_CHART_BUCKETS,
-        )
-        .await
+    let chart_params = vec![
+        ("key_id", key_id.clone()),
+        ("start_ms", chart_start.to_string()),
+        ("bucket_ms", PUBLIC_USAGE_LOOKUP_BUCKET_MS.to_string()),
+        ("bucket_count", PUBLIC_USAGE_LOOKUP_CHART_BUCKETS.to_string()),
+    ];
+    let chart = match fetch_usage_worker_json::<UsageChartResponse>(
+        &state,
+        "/admin/llm-access/usage/chart",
+        &chart_params,
+    )
+    .await
     {
-        Ok(points) => points
-            .into_iter()
-            .map(|point| PublicLlmGatewayUsageChartPointView {
-                bucket_start_ms: point.bucket_start_ms,
-                tokens: point.tokens,
-            })
-            .collect(),
-        Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "public usage store error"),
+        Ok(chart) => chart,
+        Err(response) => return response,
     };
-    let page = match state
-        .usage_analytics_store
-        .list_usage_events(UsageEventQuery {
-            key_id: Some(key_id),
-            provider_type: None,
-            source: llm_access_core::store::UsageEventSource::All,
-            start_ms,
-            end_ms,
-            limit,
-            offset,
+    let chart_points = chart
+        .chart_points
+        .into_iter()
+        .map(|point| PublicLlmGatewayUsageChartPointView {
+            bucket_start_ms: point.bucket_start_ms,
+            tokens: point.tokens,
         })
-        .await
+        .collect();
+    let mut usage_params = vec![
+        ("key_id", key_id),
+        ("source", "all".to_string()),
+        ("limit", limit.to_string()),
+        ("offset", offset.to_string()),
+    ];
+    if let Some(start_ms) = start_ms {
+        usage_params.push(("start_ms", start_ms.to_string()));
+    }
+    if let Some(end_ms) = end_ms {
+        usage_params.push(("end_ms", end_ms.to_string()));
+    }
+    let page = match fetch_usage_worker_json::<AdminUsageEventsResponse>(
+        &state,
+        "/admin/llm-gateway/usage",
+        &usage_params,
+    )
+    .await
     {
         Ok(page) => page,
-        Err(_) => return json_error(StatusCode::INTERNAL_SERVER_ERROR, "public usage store error"),
+        Err(response) => return response,
     };
     let mut response = Json(PublicLlmGatewayUsageLookupResponse {
         key: PublicLlmGatewayUsageKeyView::from(key),
@@ -492,6 +505,39 @@ pub(crate) async fn post_llm_gateway_public_usage_query(
         .headers_mut()
         .insert(header::CACHE_CONTROL, HeaderValue::from_static("no-store"));
     response
+}
+
+async fn fetch_usage_worker_json<T>(
+    state: &HttpState,
+    path: &str,
+    query: &[(&str, String)],
+) -> Result<T, Response>
+where
+    T: DeserializeOwned,
+{
+    let config = state
+        .admin_config_store
+        .get_admin_runtime_config()
+        .await
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "public usage store error"))?;
+    let url = format!("{}{}", config.usage_query_base_url.trim_end_matches('/'), path);
+    let client = reqwest::Client::builder()
+        .timeout(Duration::from_secs(5))
+        .build()
+        .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "public usage store error"))?;
+    let response = client.get(&url).query(query).send().await.map_err(|err| {
+        tracing::warn!(url = %url, "public usage worker query failed: {err:#}");
+        json_error(StatusCode::SERVICE_UNAVAILABLE, "usage worker is unavailable")
+    })?;
+    let status = response.status();
+    if !status.is_success() {
+        tracing::warn!(url = %url, status = %status, "public usage worker query returned non-success");
+        return Err(json_error(StatusCode::SERVICE_UNAVAILABLE, "usage worker is unavailable"));
+    }
+    response.json::<T>().await.map_err(|err| {
+        tracing::warn!(url = %url, "public usage worker query returned invalid JSON: {err:#}");
+        json_error(StatusCode::SERVICE_UNAVAILABLE, "usage worker is unavailable")
+    })
 }
 
 pub(crate) async fn get_llm_gateway_account_contributions(
@@ -626,89 +672,41 @@ fn json_error(status: StatusCode, message: &str) -> Response {
         .into_response()
 }
 
-impl From<&UsageEvent> for PublicLlmGatewayUsageEventView {
-    fn from(value: &UsageEvent) -> Self {
-        let latency_ms = usage_latency_ms(value);
+impl From<&AdminUsageEventView> for PublicLlmGatewayUsageEventView {
+    fn from(value: &AdminUsageEventView) -> Self {
         Self {
-            id: value.event_id.clone(),
+            id: value.id.clone(),
             key_name: value.key_name.clone(),
             account_name: value.account_name.clone(),
             request_method: value.request_method.clone(),
             request_url: value.request_url.clone(),
-            latency_ms,
-            routing_wait_ms: optional_i64_to_i32(value.timing.routing_wait_ms),
-            upstream_headers_ms: optional_i64_to_i32(value.timing.upstream_headers_ms),
-            post_headers_body_ms: optional_i64_to_i32(value.timing.post_headers_body_ms),
-            request_body_bytes: value.request_body_bytes.and_then(non_negative_i64_to_u64),
-            request_body_read_ms: optional_i64_to_i32(value.timing.request_body_read_ms),
-            request_json_parse_ms: optional_i64_to_i32(value.timing.request_json_parse_ms),
-            pre_handler_ms: optional_i64_to_i32(value.timing.pre_handler_ms),
-            first_sse_write_ms: optional_i64_to_i32(value.timing.first_sse_write_ms),
-            stream_finish_ms: optional_i64_to_i32(value.timing.stream_finish_ms),
-            other_latency_ms: compute_other_latency_ms(
-                latency_ms,
-                optional_i64_to_i32(value.timing.routing_wait_ms),
-                optional_i64_to_i32(value.timing.upstream_headers_ms),
-                optional_i64_to_i32(value.timing.post_headers_body_ms),
-            ),
+            latency_ms: value.latency_ms,
+            routing_wait_ms: value.routing_wait_ms,
+            upstream_headers_ms: value.upstream_headers_ms,
+            post_headers_body_ms: value.post_headers_body_ms,
+            request_body_bytes: value.request_body_bytes,
+            request_body_read_ms: value.request_body_read_ms,
+            request_json_parse_ms: value.request_json_parse_ms,
+            pre_handler_ms: value.pre_handler_ms,
+            first_sse_write_ms: value.first_sse_write_ms,
+            stream_finish_ms: value.stream_finish_ms,
+            other_latency_ms: value.other_latency_ms,
             quota_failover_count: value.quota_failover_count,
             endpoint: value.endpoint.clone(),
             model: value.model.clone(),
-            status_code: value.status_code.clamp(0, i64::from(i32::MAX)) as i32,
-            input_uncached_tokens: non_negative_i64_to_u64(value.input_uncached_tokens)
-                .unwrap_or(0),
-            input_cached_tokens: non_negative_i64_to_u64(value.input_cached_tokens).unwrap_or(0),
-            output_tokens: non_negative_i64_to_u64(value.output_tokens).unwrap_or(0),
-            billable_tokens: non_negative_i64_to_u64(value.billable_tokens).unwrap_or(0),
+            status_code: value.status_code,
+            input_uncached_tokens: value.input_uncached_tokens,
+            input_cached_tokens: value.input_cached_tokens,
+            output_tokens: value.output_tokens,
+            billable_tokens: value.billable_tokens,
             usage_missing: value.usage_missing,
-            credit_usage: value
-                .credit_usage
-                .as_deref()
-                .and_then(|raw| raw.parse::<f64>().ok()),
+            credit_usage: value.credit_usage,
             credit_usage_missing: value.credit_usage_missing,
             client_ip: value.client_ip.clone(),
             ip_region: value.ip_region.clone(),
-            created_at: value.created_at_ms,
+            created_at: value.created_at,
         }
     }
-}
-
-fn usage_latency_ms(value: &UsageEvent) -> i32 {
-    let latency = value.timing.latency_ms.or_else(|| {
-        value.timing.stream_finish_ms.or_else(|| {
-            match (value.timing.upstream_headers_ms, value.timing.post_headers_body_ms) {
-                (Some(headers), Some(body)) => Some(headers.saturating_add(body)),
-                _ => None,
-            }
-        })
-    });
-    optional_i64_to_i32(latency).unwrap_or(0)
-}
-
-fn optional_i64_to_i32(value: Option<i64>) -> Option<i32> {
-    value.map(|value| value.clamp(0, i64::from(i32::MAX)) as i32)
-}
-
-fn non_negative_i64_to_u64(value: i64) -> Option<u64> {
-    u64::try_from(value.max(0)).ok()
-}
-
-fn compute_other_latency_ms(
-    latency_ms: i32,
-    routing_wait_ms: Option<i32>,
-    upstream_headers_ms: Option<i32>,
-    post_headers_body_ms: Option<i32>,
-) -> Option<i32> {
-    if routing_wait_ms.is_none() && upstream_headers_ms.is_none() && post_headers_body_ms.is_none()
-    {
-        return None;
-    }
-    let measured_ms: i64 = [routing_wait_ms, upstream_headers_ms, post_headers_body_ms]
-        .into_iter()
-        .flatten()
-        .map(|value| i64::from(value.max(0)))
-        .sum();
-    Some((i64::from(latency_ms.max(0)) - measured_ms).clamp(0, i64::from(i32::MAX)) as i32)
 }
 
 fn public_usage_chart_window_start(now_ms: i64) -> i64 {

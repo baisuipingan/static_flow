@@ -4,12 +4,16 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 RELEASE_DIR="${LLM_ACCESS_RELEASE_DIR:-$SCRIPT_DIR}"
 SERVICE="${LLM_ACCESS_SERVICE:-llm-access.service}"
+WORKER_SERVICE="${LLM_ACCESS_USAGE_WORKER_SERVICE:-llm-access-usage-worker.service}"
 INSTALL_PATH="${LLM_ACCESS_INSTALL_PATH:-/usr/local/bin/llm-access}"
+WORKER_INSTALL_PATH="${LLM_ACCESS_USAGE_WORKER_INSTALL_PATH:-/usr/local/bin/llm-access-usage-worker}"
 BACKUP_DIR="${LLM_ACCESS_BACKUP_DIR:-/usr/local/bin/staticflow-backups}"
 HEALTH_URL="${LLM_ACCESS_HEALTH_URL:-http://127.0.0.1:19080/healthz}"
+WORKER_HEALTH_URL="${LLM_ACCESS_USAGE_WORKER_HEALTH_URL:-http://127.0.0.1:19081/admin/llm-access/usage-worker/status}"
 VERSION_URL="${LLM_ACCESS_VERSION_URL:-http://127.0.0.1:19080/version}"
 JOURNAL_LINES="${JOURNAL_LINES:-80}"
 STAGED_BIN="${1:-$RELEASE_DIR/llm-access.latest}"
+STAGED_WORKER_BIN="${2:-$RELEASE_DIR/llm-access-usage-worker.latest}"
 MANIFEST="${LLM_ACCESS_RELEASE_MANIFEST:-$RELEASE_DIR/release.latest.env}"
 
 log() {
@@ -32,14 +36,45 @@ manifest_value() {
 }
 
 wait_for_health() {
+  local url="$1"
   local attempt
   for attempt in $(seq 1 30); do
-    if curl -fsS "$HEALTH_URL" >/dev/null; then
+    if curl -fsS "$url" >/dev/null; then
       return 0
     fi
     sleep 1
   done
   return 1
+}
+
+install_binary() {
+  local staged="$1"
+  local install_path="$2"
+  local backup_path="$3"
+  local expected_sha="$4"
+
+  local tmp_install
+  tmp_install="$install_path.next-$timestamp"
+
+  log "backing up current binary to $backup_path"
+  if sudo test -e "$install_path"; then
+    sudo cp -a "$install_path" "$backup_path"
+  else
+    log "current binary does not exist at $install_path; no backup created"
+  fi
+
+  log "installing staged binary to $install_path"
+  sudo install -o root -g root -m 0755 "$staged" "$tmp_install"
+  sudo mv -f "$tmp_install" "$install_path"
+
+  local installed_sha
+  installed_sha="$(sudo sha256sum "$install_path" | awk '{print $1}')"
+  if [[ "$installed_sha" != "$expected_sha" ]]; then
+    if sudo test -e "$backup_path"; then
+      sudo cp -a "$backup_path" "$install_path"
+    fi
+    fail "installed binary sha256 mismatch for $install_path: expected $expected_sha, got $installed_sha"
+  fi
 }
 
 for cmd in awk curl findmnt install sed seq sha256sum sudo systemctl; do
@@ -48,11 +83,19 @@ done
 
 [[ -f "$STAGED_BIN" ]] || fail "staged binary not found: $STAGED_BIN"
 [[ -r "$STAGED_BIN" ]] || fail "staged binary is not readable: $STAGED_BIN"
+[[ -f "$STAGED_WORKER_BIN" ]] || fail "staged usage worker binary not found: $STAGED_WORKER_BIN"
+[[ -r "$STAGED_WORKER_BIN" ]] || fail "staged usage worker binary is not readable: $STAGED_WORKER_BIN"
 
-expected_sha="$(manifest_value sha256 || true)"
+expected_sha="$(manifest_value api_sha256 || true)"
+expected_sha="${expected_sha:-$(manifest_value sha256 || true)}"
 actual_sha="$(sha256sum "$STAGED_BIN" | awk '{print $1}')"
 if [[ -n "$expected_sha" && "$actual_sha" != "$expected_sha" ]]; then
   fail "staged binary sha256 mismatch: expected $expected_sha, got $actual_sha"
+fi
+expected_worker_sha="$(manifest_value usage_worker_sha256 || true)"
+actual_worker_sha="$(sha256sum "$STAGED_WORKER_BIN" | awk '{print $1}')"
+if [[ -n "$expected_worker_sha" && "$actual_worker_sha" != "$expected_worker_sha" ]]; then
+  fail "staged usage worker binary sha256 mismatch: expected $expected_worker_sha, got $actual_worker_sha"
 fi
 
 release_id="$(manifest_value release_id || true)"
@@ -62,45 +105,49 @@ log "release_id=${release_id:-unknown}"
 log "git_commit=${git_commit:-unknown}"
 log "staged_binary=$STAGED_BIN"
 log "staged_sha256=$actual_sha"
+log "staged_usage_worker_binary=$STAGED_WORKER_BIN"
+log "staged_usage_worker_sha256=$actual_worker_sha"
 
 systemctl is-active juicefs-llm-access.service >/dev/null || fail "juicefs-llm-access.service is not active"
 findmnt -T /mnt/llm-access >/dev/null || fail "/mnt/llm-access is not mounted"
 
 if systemctl is-active "$SERVICE" >/dev/null; then
   log "$SERVICE is active before activation"
-  curl -fsS "$HEALTH_URL" >/dev/null || log "pre-activation health check failed; continuing with restart"
+  curl -fsS "$HEALTH_URL" >/dev/null || log "pre-activation API health check failed; continuing with restart"
 else
   log "$SERVICE is not active before activation; continuing with install"
 fi
 
-timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
-backup_path="$BACKUP_DIR/llm-access.$timestamp"
-tmp_install="$INSTALL_PATH.next-$timestamp"
-
-log "backing up current binary to $backup_path"
-sudo install -d -m 0755 "$BACKUP_DIR"
-if sudo test -e "$INSTALL_PATH"; then
-  sudo cp -a "$INSTALL_PATH" "$backup_path"
+if systemctl is-active "$WORKER_SERVICE" >/dev/null; then
+  log "$WORKER_SERVICE is active before activation"
+  curl -fsS "$WORKER_HEALTH_URL" >/dev/null || log "pre-activation usage worker health check failed; continuing with restart"
 else
-  log "current binary does not exist; no backup created"
+  log "$WORKER_SERVICE is not active before activation; continuing with install"
 fi
 
-log "installing staged binary to $INSTALL_PATH"
-sudo install -o root -g root -m 0755 "$STAGED_BIN" "$tmp_install"
-sudo mv -f "$tmp_install" "$INSTALL_PATH"
+timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
+backup_path="$BACKUP_DIR/llm-access.$timestamp"
+worker_backup_path="$BACKUP_DIR/llm-access-usage-worker.$timestamp"
 
+sudo install -d -m 0755 "$BACKUP_DIR"
+install_binary "$STAGED_BIN" "$INSTALL_PATH" "$backup_path" "$actual_sha"
+install_binary "$STAGED_WORKER_BIN" "$WORKER_INSTALL_PATH" "$worker_backup_path" "$actual_worker_sha"
 installed_sha="$(sudo sha256sum "$INSTALL_PATH" | awk '{print $1}')"
-if [[ "$installed_sha" != "$actual_sha" ]]; then
-  if sudo test -e "$backup_path"; then
-    sudo cp -a "$backup_path" "$INSTALL_PATH"
-  fi
-  fail "installed binary sha256 mismatch: expected $actual_sha, got $installed_sha"
+installed_worker_sha="$(sudo sha256sum "$WORKER_INSTALL_PATH" | awk '{print $1}')"
+
+log "restarting $WORKER_SERVICE"
+sudo systemctl restart "$WORKER_SERVICE"
+
+if ! wait_for_health "$WORKER_HEALTH_URL"; then
+  sudo systemctl status "$WORKER_SERVICE" --no-pager -l || true
+  sudo journalctl -u "$WORKER_SERVICE" -n "$JOURNAL_LINES" --no-pager -l || true
+  fail "usage worker health check failed after restart; rollback backup: $worker_backup_path"
 fi
 
 log "restarting $SERVICE"
 sudo systemctl restart "$SERVICE"
 
-if ! wait_for_health; then
+if ! wait_for_health "$HEALTH_URL"; then
   sudo systemctl status "$SERVICE" --no-pager -l || true
   sudo journalctl -u "$SERVICE" -n "$JOURNAL_LINES" --no-pager -l || true
   fail "health check failed after restart; rollback backup: $backup_path"
@@ -109,18 +156,23 @@ fi
 log "activation succeeded"
 curl -fsS "$HEALTH_URL"
 printf '\n'
+curl -fsS "$WORKER_HEALTH_URL"
+printf '\n'
 curl -fsS "$VERSION_URL"
 printf '\n'
 systemctl show "$SERVICE" -p ActiveState -p SubState -p MainPID -p ExecMainStartTimestamp -p NRestarts --no-pager
+systemctl show "$WORKER_SERVICE" -p ActiveState -p SubState -p MainPID -p ExecMainStartTimestamp -p NRestarts --no-pager
 
 cat <<EOF
 
 Installed llm-access release:
   release_id: ${release_id:-unknown}
   git_commit: ${git_commit:-unknown}
-  sha256: $installed_sha
-  backup: $backup_path
+  api_sha256: $installed_sha
+  api_backup: $backup_path
+  usage_worker_sha256: $installed_worker_sha
+  usage_worker_backup: $worker_backup_path
 
 Rollback command if needed:
-  sudo cp -a "$backup_path" "$INSTALL_PATH" && sudo systemctl restart "$SERVICE"
+  sudo cp -a "$backup_path" "$INSTALL_PATH" && sudo cp -a "$worker_backup_path" "$WORKER_INSTALL_PATH" && sudo systemctl restart "$WORKER_SERVICE" "$SERVICE"
 EOF

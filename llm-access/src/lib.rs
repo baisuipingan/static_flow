@@ -45,7 +45,6 @@ use llm_access_core::store::{
     AdminAccountGroupStore, AdminCodexAccountStore, AdminConfigStore, AdminKeyStore,
     AdminKiroAccountStore, AdminProxyStore, AdminReviewQueueStore, PublicAccessStore,
     PublicCommunityStore, PublicStatusStore, PublicSubmissionStore, PublicUsageStore,
-    UsageAnalyticsStore,
 };
 use serde::Serialize;
 use tokio::sync::Semaphore;
@@ -68,7 +67,6 @@ struct HttpState {
     public_access_store: Arc<dyn PublicAccessStore>,
     public_community_store: Arc<dyn PublicCommunityStore>,
     public_usage_store: Arc<dyn PublicUsageStore>,
-    usage_analytics_store: Arc<dyn UsageAnalyticsStore>,
     usage_journal_dir: Option<PathBuf>,
     #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
     usage_journal_sink: Option<Arc<usage_journal::JournalUsageEventSink>>,
@@ -83,7 +81,7 @@ pub fn run_from_env() -> anyhow::Result<()> {
     match CliCommand::parse(std::env::args_os())? {
         CliCommand::Init(storage) => bootstrap_storage(&storage),
         CliCommand::Serve(config) => {
-            bootstrap_storage(&config.storage)?;
+            bootstrap_api_storage(&config.storage)?;
             let runtime =
                 tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
             runtime.block_on(serve(config))
@@ -92,9 +90,15 @@ pub fn run_from_env() -> anyhow::Result<()> {
 }
 
 /// Initialize llm-access storage paths.
-pub fn bootstrap_storage(config: &StorageConfig) -> anyhow::Result<()> {
+pub fn bootstrap_api_storage(config: &StorageConfig) -> anyhow::Result<()> {
     runtime::validate_state_root(config)?;
     llm_access_store::initialize_sqlite_target_path(&config.sqlite_control)?;
+    Ok(())
+}
+
+/// Initialize llm-access storage paths, including analytics storage.
+pub fn bootstrap_storage(config: &StorageConfig) -> anyhow::Result<()> {
+    bootstrap_api_storage(config)?;
     #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
     if let Some(tiered) = &config.duckdb_tiered {
         llm_access_store::duckdb::DuckDbUsageRepository::open_tiered(
@@ -136,7 +140,6 @@ pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
         public_access_store: runtime.public_access_store(),
         public_community_store: runtime.public_community_store(),
         public_usage_store: runtime.public_usage_store(),
-        usage_analytics_store: runtime.usage_analytics_store(),
         usage_journal_dir: runtime.usage_journal_dir(),
         #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
         usage_journal_sink: runtime.usage_journal_sink(),
@@ -528,7 +531,7 @@ mod tests {
             codex_auths_dir: root.join("auths/codex"),
             logs_dir: root.join("logs"),
         };
-        crate::bootstrap_storage(&config).expect("bootstrap storage");
+        crate::bootstrap_api_storage(&config).expect("bootstrap storage");
         let runtime = crate::runtime::LlmAccessRuntime::from_storage_config(&config)
             .await
             .expect("open runtime");
@@ -670,12 +673,22 @@ mod tests {
         }))
     }
 
+    async fn fake_usage_chart() -> Json<serde_json::Value> {
+        Json(json!({
+            "chart_points": [{
+                "bucket_start_ms": 1_700_000_000_000_i64,
+                "tokens": 42_u64
+            }]
+        }))
+    }
+
     async fn spawn_fake_usage_worker() -> String {
         let app = Router::new()
             .route("/admin/llm-gateway/usage", get(fake_usage_list))
             .route("/admin/llm-gateway/usage/:event_id", get(fake_usage_detail))
             .route("/admin/kiro-gateway/usage", get(fake_usage_list))
             .route("/admin/kiro-gateway/usage/:event_id", get(fake_usage_detail))
+            .route("/admin/llm-access/usage/chart", get(fake_usage_chart))
             .route("/admin/llm-access/usage-worker/status", get(fake_usage_worker_status));
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -1016,6 +1029,61 @@ mod tests {
             .expect("body");
         let body = String::from_utf8(body.to_vec()).expect("utf8 body");
         assert!(body.contains("queryable key not found"));
+    }
+
+    #[tokio::test]
+    async fn public_usage_query_reads_settled_events_from_usage_worker() {
+        let usage_worker_base = spawn_fake_usage_worker().await;
+        let (router, root) = persistent_test_router("public-usage-worker").await;
+        set_usage_query_base_url(&router, &usage_worker_base).await;
+
+        let create_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-gateway/keys")
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        r#"{
+                            "name": "public usage test",
+                            "quota_billable_limit": 1000,
+                            "public_visible": true
+                        }"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("create key response");
+        assert_eq!(create_response.status(), StatusCode::OK);
+        let body = to_bytes(create_response.into_body(), usize::MAX)
+            .await
+            .expect("create key body");
+        let created: serde_json::Value = serde_json::from_slice(&body).expect("create key json");
+        let secret = created["secret"].as_str().expect("secret");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/llm-gateway/public-usage/query")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "api_key": secret }).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["events"][0]["id"], "evt-proxied");
+        assert_eq!(value["chart_points"][0]["tokens"], 42);
     }
 
     #[tokio::test]

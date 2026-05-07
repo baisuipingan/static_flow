@@ -1,7 +1,25 @@
 //! Standalone usage journal consumer.
 
+use better_mimalloc_rs::MiMalloc;
+
+const DEFAULT_LOG_FILTER: &str =
+    "warn,llm_access=info,llm_access_store=info,llm_usage_journal=info";
+
+#[global_allocator]
+static GLOBAL_MIMALLOC: MiMalloc = MiMalloc;
+
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 fn main() -> anyhow::Result<()> {
+    MiMalloc::init();
+    let _log_guards = static_flow_runtime::runtime_logging::init_runtime_logging(
+        "llm-access-usage-worker",
+        DEFAULT_LOG_FILTER,
+    )?;
+    run()
+}
+
+#[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
+fn run() -> anyhow::Result<()> {
     use std::{
         ffi::OsString,
         sync::{Arc, RwLock},

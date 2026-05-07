@@ -9,7 +9,9 @@ use axum::{
     Json,
 };
 use llm_access_core::{
-    store::{UsageAnalyticsStore, UsageEventPage, UsageEventQuery, UsageEventSource},
+    store::{
+        UsageAnalyticsStore, UsageChartPoint, UsageEventPage, UsageEventQuery, UsageEventSource,
+    },
     usage::UsageEvent,
 };
 use serde::{Deserialize, Serialize};
@@ -17,6 +19,9 @@ use serde::{Deserialize, Serialize};
 const DEFAULT_ADMIN_USAGE_LIMIT: usize = 20;
 const MAX_ADMIN_USAGE_LIMIT: usize = 20;
 const MAX_ADMIN_USAGE_OFFSET: usize = 200;
+const DEFAULT_USAGE_CHART_BUCKET_MS: i64 = 60 * 60 * 1000;
+const DEFAULT_USAGE_CHART_BUCKETS: usize = 24;
+const MAX_USAGE_CHART_BUCKETS: usize = 168;
 
 /// Query options for usage list endpoints.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -37,60 +42,60 @@ pub(crate) struct ListUsageEventsRequest {
 
 /// Paginated usage response.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct AdminUsageEventsResponse {
-    total: usize,
-    offset: usize,
-    limit: usize,
-    has_more: bool,
-    current_rpm: u32,
-    current_in_flight: u32,
-    events: Vec<AdminUsageEventView>,
-    generated_at: i64,
+pub(crate) struct AdminUsageEventsResponse {
+    pub(crate) total: usize,
+    pub(crate) offset: usize,
+    pub(crate) limit: usize,
+    pub(crate) has_more: bool,
+    pub(crate) current_rpm: u32,
+    pub(crate) current_in_flight: u32,
+    pub(crate) events: Vec<AdminUsageEventView>,
+    pub(crate) generated_at: i64,
 }
 
 /// Summary usage event.
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct AdminUsageEventView {
-    id: String,
-    key_id: String,
-    key_name: String,
-    account_name: Option<String>,
-    request_method: String,
-    request_url: String,
-    latency_ms: i32,
-    routing_wait_ms: Option<i32>,
-    upstream_headers_ms: Option<i32>,
-    post_headers_body_ms: Option<i32>,
-    request_body_bytes: Option<u64>,
-    request_body_read_ms: Option<i32>,
-    request_json_parse_ms: Option<i32>,
-    pre_handler_ms: Option<i32>,
-    first_sse_write_ms: Option<i32>,
-    stream_finish_ms: Option<i32>,
-    stream_completed_cleanly: Option<bool>,
-    downstream_disconnect: Option<bool>,
+pub(crate) struct AdminUsageEventView {
+    pub(crate) id: String,
+    pub(crate) key_id: String,
+    pub(crate) key_name: String,
+    pub(crate) account_name: Option<String>,
+    pub(crate) request_method: String,
+    pub(crate) request_url: String,
+    pub(crate) latency_ms: i32,
+    pub(crate) routing_wait_ms: Option<i32>,
+    pub(crate) upstream_headers_ms: Option<i32>,
+    pub(crate) post_headers_body_ms: Option<i32>,
+    pub(crate) request_body_bytes: Option<u64>,
+    pub(crate) request_body_read_ms: Option<i32>,
+    pub(crate) request_json_parse_ms: Option<i32>,
+    pub(crate) pre_handler_ms: Option<i32>,
+    pub(crate) first_sse_write_ms: Option<i32>,
+    pub(crate) stream_finish_ms: Option<i32>,
+    pub(crate) stream_completed_cleanly: Option<bool>,
+    pub(crate) downstream_disconnect: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    final_event_type: Option<String>,
-    bytes_streamed: Option<u64>,
-    other_latency_ms: Option<i32>,
-    quota_failover_count: u64,
+    pub(crate) final_event_type: Option<String>,
+    pub(crate) bytes_streamed: Option<u64>,
+    pub(crate) other_latency_ms: Option<i32>,
+    pub(crate) quota_failover_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
-    routing_diagnostics_json: Option<String>,
-    endpoint: String,
-    model: Option<String>,
-    status_code: i32,
-    input_uncached_tokens: u64,
-    input_cached_tokens: u64,
-    output_tokens: u64,
-    billable_tokens: u64,
-    usage_missing: bool,
-    credit_usage: Option<f64>,
-    credit_usage_missing: bool,
-    client_ip: String,
-    ip_region: String,
+    pub(crate) routing_diagnostics_json: Option<String>,
+    pub(crate) endpoint: String,
+    pub(crate) model: Option<String>,
+    pub(crate) status_code: i32,
+    pub(crate) input_uncached_tokens: u64,
+    pub(crate) input_cached_tokens: u64,
+    pub(crate) output_tokens: u64,
+    pub(crate) billable_tokens: u64,
+    pub(crate) usage_missing: bool,
+    pub(crate) credit_usage: Option<f64>,
+    pub(crate) credit_usage_missing: bool,
+    pub(crate) client_ip: String,
+    pub(crate) ip_region: String,
     #[serde(skip_serializing_if = "Option::is_none")]
-    last_message_content: Option<String>,
-    created_at: i64,
+    pub(crate) last_message_content: Option<String>,
+    pub(crate) created_at: i64,
 }
 
 /// Usage detail response.
@@ -102,6 +107,31 @@ struct AdminUsageEventDetailView {
     client_request_body_json: Option<String>,
     upstream_request_body_json: Option<String>,
     full_request_json: Option<String>,
+}
+
+/// Chart query options.
+#[derive(Debug, Clone, Deserialize)]
+pub(crate) struct UsageChartRequest {
+    pub(crate) key_id: String,
+    #[serde(default)]
+    pub(crate) start_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) bucket_ms: Option<i64>,
+    #[serde(default)]
+    pub(crate) bucket_count: Option<usize>,
+}
+
+/// Usage chart response.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct UsageChartResponse {
+    pub(crate) chart_points: Vec<UsageChartPointView>,
+}
+
+/// One chart bucket.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub(crate) struct UsageChartPointView {
+    pub(crate) bucket_start_ms: i64,
+    pub(crate) tokens: u64,
 }
 
 /// Worker query route state.
@@ -140,6 +170,41 @@ pub(crate) async fn get_kiro_usage_event(
     Path(event_id): Path<String>,
 ) -> Response {
     get_usage_event(state, event_id, Some("kiro")).await
+}
+
+/// Return chart buckets for a public usage key.
+pub(crate) async fn usage_chart_points(
+    State(state): State<UsageQueryState>,
+    Query(request): Query<UsageChartRequest>,
+) -> Response {
+    let key_id = request.key_id.trim();
+    if key_id.is_empty() {
+        return (StatusCode::BAD_REQUEST, "key_id is required").into_response();
+    }
+    let start_ms = request.start_ms.unwrap_or(0).max(0);
+    let bucket_ms = request
+        .bucket_ms
+        .unwrap_or(DEFAULT_USAGE_CHART_BUCKET_MS)
+        .max(1);
+    let bucket_count = request
+        .bucket_count
+        .unwrap_or(DEFAULT_USAGE_CHART_BUCKETS)
+        .clamp(1, MAX_USAGE_CHART_BUCKETS);
+    match state
+        .usage_analytics_store
+        .usage_chart_points(key_id, start_ms, bucket_ms, bucket_count)
+        .await
+    {
+        Ok(points) => Json(UsageChartResponse {
+            chart_points: points.into_iter().map(UsageChartPointView::from).collect(),
+        })
+        .into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("Failed to load usage chart: {err:#}"),
+        )
+            .into_response(),
+    }
 }
 
 async fn list_usage_events(
@@ -289,6 +354,15 @@ impl From<&UsageEvent> for AdminUsageEventView {
             ip_region: value.ip_region.clone(),
             last_message_content: value.last_message_content.clone(),
             created_at: value.created_at_ms,
+        }
+    }
+}
+
+impl From<UsageChartPoint> for UsageChartPointView {
+    fn from(value: UsageChartPoint) -> Self {
+        Self {
+            bucket_start_ms: value.bucket_start_ms,
+            tokens: value.tokens,
         }
     }
 }

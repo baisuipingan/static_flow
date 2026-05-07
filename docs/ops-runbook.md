@@ -19,8 +19,11 @@ Current source-of-truth production facts verified on 2026-05-02:
   - `SERVICE_KEY=sf-backend`
   - `LOCAL_ADDR=127.0.0.1:39080`
 - Server-side pb-mapper server systemd unit: `pb-mapper-server.service`.
-- Cloud `llm-access` systemd unit: `llm-access.service`, serving
-  `127.0.0.1:19080`.
+- Cloud `llm-access` API systemd unit: `llm-access.service`, serving
+  provider/admin compatibility traffic on `127.0.0.1:19080`.
+- Target cloud `llm-access` usage worker systemd unit:
+  `llm-access-usage-worker.service`, serving DuckDB-backed usage queries on
+  `127.0.0.1:19081`.
 - Cloud JuiceFS mount service: `juicefs-llm-access.service`, mounting
   `/mnt/llm-access`.
 - Cloud-to-local back-link unit:
@@ -116,11 +119,19 @@ private env files, not in tracked docs.
   use:
   - state root: `/mnt/llm-access`
   - SQLite control DB: `/mnt/llm-access/control/llm-access.sqlite3`
+  - local usage journal dir: `/mnt/llm-access/usage-journal`
   - local active DuckDB dir: `/var/lib/staticflow/llm-access/analytics-active`
   - archived immutable DuckDB segments:
     `/mnt/llm-access/analytics/segments`
   - DuckDB segment catalog: `/mnt/llm-access/analytics/catalog`
-  - current cloud bind address: `127.0.0.1:19080`
+  - API bind address: `127.0.0.1:19080`
+  - usage worker bind address: `127.0.0.1:19081`
+- Service ownership after the usage split:
+  - `llm-access.service`: provider traffic, SQLite control/rollups, account
+    status refreshers, and compact local usage journal production.
+  - `llm-access-usage-worker.service`: journal consumption, tiered DuckDB
+    writes, worker progress state, and legacy admin usage list/detail query
+    routes on the worker port.
 - Live GCP `llm-access.service` currently runs as the non-root `ts_user`
   service user. The checked-in template still uses a dedicated `llm-access`
   user for fresh deployments; either is acceptable if file ownership, FUSE
@@ -130,8 +141,12 @@ private env files, not in tracked docs.
   - `llm-access.service`: serves `127.0.0.1:19080`
   - `pb-mapper-server-cli@llm-access.service`: registers cloud
     `127.0.0.1:19080` as pb-mapper key `llm-access`
+- The usage-journal split adds `llm-access-usage-worker.service`, serving
+  `127.0.0.1:19081`.
 - Current GCP llm-access logs:
   - systemd journal: `sudo journalctl -u llm-access.service -f`
+  - usage worker journal:
+    `sudo journalctl -u llm-access-usage-worker.service -f`
   - runtime app logs:
     `/var/log/staticflow-runtime/llm-access/app/current.*.log`
   - runtime access logs:
@@ -153,6 +168,10 @@ private env files, not in tracked docs.
 - `/etc/sysctl.d/99-staticflow-memory-guard.conf` sets `vm.swappiness=10`.
 - `llm-access.service` has `MemoryHigh=2200M`, `MemoryMax=3072M`,
   `MemorySwapMax=1024M`, `TasksMax=256`, and `OOMPolicy=kill`.
+- `llm-access-usage-worker.service` should carry the DuckDB memory budget after
+  the split. Start with `MemoryHigh=2200M`, `MemoryMax=3072M`,
+  `MemorySwapMax=1024M`, `TasksMax=128`, and `OOMPolicy=kill`; keep API and
+  worker limits independent so a DuckDB scan cannot kill provider traffic.
 - `juicefs-llm-access.service` has `MemoryHigh=1800M`,
   `MemoryMax=2560M`, `MemorySwapMax=0`, `TasksMax=256`, and
   `OOMPolicy=kill`.
@@ -167,10 +186,24 @@ extra swap as an emergency buffer, not as normal working memory.
   immutable archived segment files plus the low-frequency segment catalog. Do
   not point a live writer at `/mnt/llm-access/analytics/usage.duckdb` as a
   mutable all-history DuckDB file.
+- The API process no longer writes usage events directly into DuckDB. It first
+  commits SQLite rollups, then appends compact diagnostic usage events to
+  `/mnt/llm-access/usage-journal`. The separate usage worker consumes sealed
+  journal files in batches, imports them into tiered DuckDB, records worker
+  progress in `consumer-state.sqlite3`, and deletes consumed journal files.
+- Journal file rollover is controlled by both size and age. Retention is
+  intentionally lossy for old unconsumed diagnostics: SQLite rollups remain the
+  source of truth for quota/account accounting, while journal events are for
+  detailed troubleshooting.
+- Legacy usage query paths remain compatible. The public/API service keeps the
+  old `/admin/llm-gateway/usage*` and `/admin/kiro-gateway/usage*` routes for
+  auth and compatibility, but proxies those queries to
+  `usage_query_base_url` (`http://127.0.0.1:19081` by default).
 - The completed migration model is:
   1. Production `llm-access` state lives under `/mnt/llm-access` and the local
      VM active DuckDB directory described above.
-  2. Only cloud `llm-access.service` writes that state.
+  2. Only cloud `llm-access.service` writes SQLite rollups and local journal
+     files; only `llm-access-usage-worker.service` writes tiered DuckDB.
   3. Cloud Caddy owns the public LLM route split and sends LLM paths directly
      to `127.0.0.1:19080`.
   4. Local StaticFlow reaches cloud `llm-access` through the local
@@ -196,17 +229,16 @@ extra swap as an emergency buffer, not as normal working memory.
 
 ## llm-access Admin API Constraints
 
-- Do not use the in-process admin usage APIs for broad diagnostics such as
-  large `limit` pages or ad-hoc scans over the full DuckDB usage table. Those
-  queries execute inside the production `llm-access` process, so DuckDB scan
-  buffers are charged to the service RSS. For production analysis, prefer an
-  external read-only DuckDB connection or a deliberately narrow SQL/API query.
-  Online usage list endpoints must stay server-bounded and lightweight: max
-  `limit` is 20, max `offset` is 200, and list responses must not read/return
-  heavy diagnostic fields such as message content or routing diagnostics. The
-  response `total` should still be the exact count for the active filter
-  condition, including key/provider/time filters. Use the per-event detail
-  endpoint by `event_id` when heavy fields are needed.
+- Admin usage APIs are compatibility proxies to the usage worker. Broad
+  diagnostics should still avoid large pages or full-table scans: DuckDB scan
+  buffers now affect `llm-access-usage-worker.service` rather than provider
+  traffic, but the worker is still a production process. Online usage list
+  endpoints must stay server-bounded and lightweight: max `limit` is 20, max
+  `offset` is 200, and list responses must not read/return heavy diagnostic
+  fields such as message content or routing diagnostics. The response `total`
+  should still be the exact count for the active filter condition, including
+  key/provider/time filters. Use the per-event detail endpoint by `event_id`
+  when heavy fields are needed.
 
 ## Emergency Recovery for Sudden Public Outage
 

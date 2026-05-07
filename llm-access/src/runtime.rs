@@ -17,9 +17,8 @@ use llm_access_core::store::{
     EmptyAdminKeyStore, EmptyAdminKiroAccountStore, EmptyAdminProxyStore,
     EmptyAdminReviewQueueStore, EmptyProviderRouteStore, EmptyPublicAccessStore,
     EmptyPublicCommunityStore, EmptyPublicStatusStore, EmptyPublicSubmissionStore,
-    EmptyPublicUsageStore, EmptyUsageAnalyticsStore, ProviderRouteStore, PublicAccessStore,
-    PublicCommunityStore, PublicStatusStore, PublicSubmissionStore, PublicUsageStore,
-    UsageAnalyticsStore,
+    EmptyPublicUsageStore, ProviderRouteStore, PublicAccessStore, PublicCommunityStore,
+    PublicStatusStore, PublicSubmissionStore, PublicUsageStore,
 };
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use llm_access_core::store::{
@@ -28,10 +27,6 @@ use llm_access_core::store::{
 };
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use llm_access_core::usage::UsageEvent;
-#[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
-use llm_access_store::duckdb::{
-    DuckDbUsageConnectionConfig, DuckDbUsageRepository, TieredDuckDbUsageConfig,
-};
 use llm_access_store::repository::SqliteControlRepository;
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use tokio::{
@@ -63,7 +58,6 @@ pub struct LlmAccessRuntime {
     public_access_store: Arc<dyn PublicAccessStore>,
     public_community_store: Arc<dyn PublicCommunityStore>,
     public_usage_store: Arc<dyn PublicUsageStore>,
-    usage_analytics_store: Arc<dyn UsageAnalyticsStore>,
     public_submission_store: Arc<dyn PublicSubmissionStore>,
     public_status_store: Arc<dyn PublicStatusStore>,
     #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
@@ -89,7 +83,6 @@ struct LlmAccessStores {
     public_access_store: Arc<dyn PublicAccessStore>,
     public_community_store: Arc<dyn PublicCommunityStore>,
     public_usage_store: Arc<dyn PublicUsageStore>,
-    usage_analytics_store: Arc<dyn UsageAnalyticsStore>,
     public_submission_store: Arc<dyn PublicSubmissionStore>,
     public_status_store: Arc<dyn PublicStatusStore>,
     #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
@@ -116,7 +109,6 @@ impl LlmAccessRuntime {
             public_access_store: Arc::new(EmptyPublicAccessStore),
             public_community_store: Arc::new(EmptyPublicCommunityStore),
             public_usage_store: Arc::new(EmptyPublicUsageStore),
-            usage_analytics_store: Arc::new(EmptyUsageAnalyticsStore),
             public_submission_store: Arc::new(EmptyPublicSubmissionStore),
             public_status_store: Arc::new(EmptyPublicStatusStore),
             #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
@@ -143,7 +135,6 @@ impl LlmAccessRuntime {
             public_access_store: stores.public_access_store,
             public_community_store: stores.public_community_store,
             public_usage_store: stores.public_usage_store,
-            usage_analytics_store: stores.usage_analytics_store,
             public_submission_store: stores.public_submission_store,
             public_status_store: stores.public_status_store,
             #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
@@ -163,14 +154,7 @@ impl LlmAccessRuntime {
         #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
         let initial_runtime_config = repository.get_admin_runtime_config().await?;
         #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
-        let duckdb_connection_config = Arc::new(RwLock::new(
-            DuckDbUsageConnectionConfig::from_admin_runtime_config(&initial_runtime_config),
-        ));
-        #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
         let runtime_config = Arc::new(RwLock::new(initial_runtime_config.clone()));
-        #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
-        let duckdb_usage =
-            Arc::new(open_duckdb_usage_repository(config, duckdb_connection_config.clone())?);
         #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
         let journal_usage = Arc::new(JournalUsageEventSink::open(
             config.usage_journal_dir.clone(),
@@ -193,7 +177,6 @@ impl LlmAccessRuntime {
         let admin_config_store: Arc<dyn AdminConfigStore> = Arc::new(RecordingAdminConfigStore {
             admin_config_store: repository.clone(),
             runtime_config: runtime_config.clone(),
-            duckdb_connection_config,
         });
         #[cfg(not(any(feature = "duckdb-runtime", feature = "duckdb-bundled")))]
         let admin_config_store: Arc<dyn AdminConfigStore> = repository.clone();
@@ -226,11 +209,6 @@ impl LlmAccessRuntime {
             });
         #[cfg(not(any(feature = "duckdb-runtime", feature = "duckdb-bundled")))]
         let public_usage_store: Arc<dyn PublicUsageStore> = repository.clone();
-        #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
-        let usage_analytics_store: Arc<dyn UsageAnalyticsStore> = duckdb_usage;
-        #[cfg(not(any(feature = "duckdb-runtime", feature = "duckdb-bundled")))]
-        let usage_analytics_store: Arc<dyn UsageAnalyticsStore> =
-            Arc::new(EmptyUsageAnalyticsStore);
         let public_submission_store: Arc<dyn PublicSubmissionStore> = repository.clone();
         let public_status_store: Arc<dyn PublicStatusStore> = repository;
         Ok(Self::with_stores(LlmAccessStores {
@@ -247,7 +225,6 @@ impl LlmAccessRuntime {
             public_access_store,
             public_community_store,
             public_usage_store,
-            usage_analytics_store,
             public_submission_store,
             public_status_store,
             #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
@@ -322,11 +299,6 @@ impl LlmAccessRuntime {
         Arc::clone(&self.public_usage_store)
     }
 
-    /// Usage analytics store used by admin and public usage views.
-    pub fn usage_analytics_store(&self) -> Arc<dyn UsageAnalyticsStore> {
-        Arc::clone(&self.usage_analytics_store)
-    }
-
     /// Journal root used by producer-side status views.
     pub(crate) fn usage_journal_dir(&self) -> Option<PathBuf> {
         self.usage_journal_dir.clone()
@@ -367,28 +339,6 @@ impl LlmAccessRuntime {
     /// No-op when DuckDB usage persistence is not compiled in.
     #[cfg(not(any(feature = "duckdb-runtime", feature = "duckdb-bundled")))]
     pub async fn shutdown_usage_events(&self) {}
-}
-
-#[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
-fn open_duckdb_usage_repository(
-    config: &StorageConfig,
-    duckdb_connection_config: Arc<RwLock<DuckDbUsageConnectionConfig>>,
-) -> anyhow::Result<DuckDbUsageRepository> {
-    if let Some(tiered) = &config.duckdb_tiered {
-        return DuckDbUsageRepository::open_tiered_with_connection_config(
-            TieredDuckDbUsageConfig {
-                active_dir: tiered.active_dir.clone(),
-                archive_dir: tiered.archive_dir.clone(),
-                catalog_dir: tiered.catalog_dir.clone(),
-                rollover_bytes: tiered.rollover_bytes,
-            },
-            duckdb_connection_config,
-        );
-    }
-    DuckDbUsageRepository::open_path_with_connection_config(
-        &config.duckdb,
-        duckdb_connection_config,
-    )
 }
 
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
@@ -1027,7 +977,6 @@ fn append_analytics_retry_events(state: &mut UsageEventFlushState<'_>, events: V
 struct RecordingAdminConfigStore {
     admin_config_store: Arc<dyn AdminConfigStore>,
     runtime_config: Arc<RwLock<AdminRuntimeConfig>>,
-    duckdb_connection_config: Arc<RwLock<DuckDbUsageConnectionConfig>>,
 }
 
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
@@ -1053,11 +1002,6 @@ impl AdminConfigStore for RecordingAdminConfigStore {
             .runtime_config
             .write()
             .expect("llm access runtime config lock poisoned") = updated.clone();
-        *self
-            .duckdb_connection_config
-            .write()
-            .expect("llm access duckdb config lock poisoned") =
-            DuckDbUsageConnectionConfig::from_admin_runtime_config(&updated);
         Ok(updated)
     }
 }
