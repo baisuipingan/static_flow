@@ -1375,7 +1375,7 @@ mod tests {
             PublicAccessStore, PublicCommunityStore, PublicStatusStore, PublicUsageStore,
             UsageEventSink,
         },
-        usage::{UsageEvent, UsageTiming},
+        usage::{UsageEvent, UsageStreamDetails, UsageTiming},
     };
 
     fn sample_event(key_id: &str) -> UsageEvent {
@@ -1413,6 +1413,7 @@ mod tests {
             upstream_request_body_json: None,
             full_request_json: None,
             timing: UsageTiming::default(),
+            stream: UsageStreamDetails::default(),
         }
     }
 

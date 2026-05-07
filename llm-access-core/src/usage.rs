@@ -28,6 +28,19 @@ pub struct UsageTiming {
     pub stream_finish_ms: Option<i64>,
 }
 
+/// Stream outcome fields captured by downstream streaming handlers.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageStreamDetails {
+    /// Whether the downstream SSE stream reached a clean end.
+    pub stream_completed_cleanly: Option<bool>,
+    /// Whether the downstream SSE stream was dropped before completion.
+    pub downstream_disconnect: Option<bool>,
+    /// Last downstream SSE event type emitted by the gateway when known.
+    pub final_event_type: Option<String>,
+    /// Total downstream SSE bytes emitted by the gateway.
+    pub bytes_streamed: Option<i64>,
+}
+
 /// One normalized usage event before persistence.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UsageEvent {
@@ -97,4 +110,7 @@ pub struct UsageEvent {
     pub full_request_json: Option<String>,
     /// Provider timing fields.
     pub timing: UsageTiming,
+    /// Downstream stream outcome fields.
+    #[serde(default)]
+    pub stream: UsageStreamDetails,
 }

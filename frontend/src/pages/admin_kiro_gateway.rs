@@ -118,6 +118,45 @@ fn format_compact_bytes(bytes: u64) -> String {
     }
 }
 
+fn usage_stream_state_label(
+    stream_completed_cleanly: Option<bool>,
+    downstream_disconnect: Option<bool>,
+) -> &'static str {
+    if downstream_disconnect == Some(true) {
+        "disconnect"
+    } else if stream_completed_cleanly == Some(true) {
+        "clean"
+    } else if stream_completed_cleanly == Some(false) {
+        "incomplete"
+    } else {
+        "n/a"
+    }
+}
+
+fn format_optional_stream_bytes(bytes_streamed: Option<u64>) -> String {
+    bytes_streamed
+        .map(format_compact_bytes)
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn format_usage_stream_summary(
+    stream_completed_cleanly: Option<bool>,
+    downstream_disconnect: Option<bool>,
+    final_event_type: Option<&str>,
+    bytes_streamed: Option<u64>,
+) -> String {
+    let final_event_type = final_event_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-");
+    format!(
+        "{} · final {} · {}",
+        usage_stream_state_label(stream_completed_cleanly, downstream_disconnect),
+        final_event_type,
+        format_optional_stream_bytes(bytes_streamed),
+    )
+}
+
 fn format_json_for_textarea(raw: &str) -> String {
     serde_json::from_str::<serde_json::Value>(raw)
         .ok()
@@ -4462,6 +4501,12 @@ pub fn admin_kiro_gateway_page() -> Html {
                             let credit_text = event.credit_usage
                                 .map(|c| format!("{c:.4}"))
                                 .unwrap_or_else(|| "-".to_string());
+                            let stream_summary = format_usage_stream_summary(
+                                event.stream_completed_cleanly,
+                                event.downstream_disconnect,
+                                event.final_event_type.as_deref(),
+                                event.bytes_streamed,
+                            );
                             let event_id = event.id.clone();
                             let on_detail = {
                                 let open_usage_detail = open_usage_detail.clone();
@@ -4476,6 +4521,7 @@ pub fn admin_kiro_gateway_page() -> Html {
                                     </span>
                                     <span class={classes!("font-semibold", "text-[var(--text)]")}>{ event.key_name.clone() }</span>
                                     <span class={classes!("text-[var(--muted)]")}>{ event.model.clone().unwrap_or_else(|| "-".to_string()) }</span>
+                                    <span class={classes!("text-[var(--muted)]")}>{ stream_summary }</span>
                                     <span class={classes!("ml-auto", "text-[var(--text)]")}>{ format!("credit {credit_text}") }</span>
                                     <button
                                         type="button"
@@ -4522,10 +4568,15 @@ pub fn admin_kiro_gateway_page() -> Html {
                                 </div>
                                 <div class={classes!("max-h-[72vh]", "overflow-auto", "px-4", "py-4", "space-y-3")}>
                                     <div class={classes!("grid", "gap-3", "sm:grid-cols-2", "lg:grid-cols-4")}>
+                                        { usage_detail_kv("created", format_ms(detail.created_at)) }
                                         { usage_detail_kv("key", detail.key_name.clone()) }
                                         { usage_detail_kv("account", detail.account_name.clone().unwrap_or_else(|| "-".to_string())) }
                                         { usage_detail_kv("model", detail.model.clone().unwrap_or_else(|| "-".to_string())) }
                                         { usage_detail_kv("status", detail.status_code.to_string()) }
+                                        { usage_detail_kv("latency", format!("{} ms", detail.latency_ms.max(0))) }
+                                        { usage_detail_kv("stream", usage_stream_state_label(detail.stream_completed_cleanly, detail.downstream_disconnect).to_string()) }
+                                        { usage_detail_kv("final event", detail.final_event_type.clone().unwrap_or_else(|| "-".to_string())) }
+                                        { usage_detail_kv("stream bytes", format_optional_stream_bytes(detail.bytes_streamed)) }
                                         { usage_detail_kv("input", format_number_u64(detail.input_uncached_tokens)) }
                                         { usage_detail_kv("cached", format_number_u64(detail.input_cached_tokens)) }
                                         { usage_detail_kv("output", format_number_u64(detail.output_tokens)) }

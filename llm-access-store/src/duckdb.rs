@@ -22,7 +22,7 @@ use llm_access_core::{
         UsageEventSink, UsageEventSource, DEFAULT_DUCKDB_USAGE_CHECKPOINT_THRESHOLD_MIB,
         DEFAULT_DUCKDB_USAGE_MEMORY_LIMIT_MIB,
     },
-    usage::{UsageEvent, UsageTiming},
+    usage::{UsageEvent, UsageStreamDetails, UsageTiming},
 };
 #[cfg(feature = "duckdb-runtime")]
 use rusqlite::OptionalExtension;
@@ -92,6 +92,14 @@ pub struct UsageEventRow {
     pub first_sse_write_ms: Option<i64>,
     /// Time until stream finish.
     pub stream_finish_ms: Option<i64>,
+    /// Whether the downstream stream finished cleanly.
+    pub stream_completed_cleanly: Option<bool>,
+    /// Whether the downstream stream disconnected before completion.
+    pub downstream_disconnect: Option<bool>,
+    /// Last downstream SSE event type when known.
+    pub final_event_type: Option<String>,
+    /// Total downstream SSE bytes emitted by the gateway.
+    pub bytes_streamed: Option<i64>,
     /// Request body size in bytes.
     pub request_body_bytes: Option<i64>,
     /// Number of route failovers.
@@ -169,6 +177,10 @@ impl UsageEventRow {
             pre_handler_ms: event.timing.pre_handler_ms,
             first_sse_write_ms: event.timing.first_sse_write_ms,
             stream_finish_ms: event.timing.stream_finish_ms,
+            stream_completed_cleanly: event.stream.stream_completed_cleanly,
+            downstream_disconnect: event.stream.downstream_disconnect,
+            final_event_type: event.stream.final_event_type.clone(),
+            bytes_streamed: event.stream.bytes_streamed,
             request_body_bytes: event.request_body_bytes,
             quota_failover_count: event.quota_failover_count.min(i64::MAX as u64) as i64,
             routing_diagnostics_json: event.routing_diagnostics_json.clone(),
@@ -200,8 +212,9 @@ pub fn insert_usage_event_sql() -> &'static str {
         mapped_model, status_code, latency_ms, routing_wait_ms,
         upstream_headers_ms, post_headers_body_ms, request_body_read_ms,
         request_json_parse_ms, pre_handler_ms, first_sse_write_ms,
-        stream_finish_ms, request_body_bytes, quota_failover_count,
-        routing_diagnostics_json,
+        stream_finish_ms, stream_completed_cleanly, downstream_disconnect,
+        final_event_type, bytes_streamed, request_body_bytes,
+        quota_failover_count, routing_diagnostics_json,
         input_uncached_tokens, input_cached_tokens, output_tokens, billable_tokens,
         credit_usage, usage_missing, credit_usage_missing, client_ip, ip_region,
         request_headers_json, last_message_content, client_request_body_json,
@@ -212,7 +225,8 @@ pub fn insert_usage_event_sql() -> &'static str {
         date_trunc('hour', to_timestamp(?4 / 1000.0)),
         ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
         ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-        ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44
+        ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44,
+        ?45, ?46, ?47, ?48
      )"
 }
 
@@ -239,8 +253,9 @@ const LIST_USAGE_EVENT_SUMMARIES_SQL: &str = "SELECT event_id, created_at_ms,
         billable_tokens, CAST(credit_usage AS VARCHAR), usage_missing,
         credit_usage_missing, latency_ms, routing_wait_ms, upstream_headers_ms,
         post_headers_body_ms, request_body_read_ms, request_json_parse_ms,
-        pre_handler_ms, first_sse_write_ms, stream_finish_ms, client_ip,
-        ip_region, NULL AS last_message_content
+        pre_handler_ms, first_sse_write_ms, stream_finish_ms,
+        stream_completed_cleanly, downstream_disconnect, final_event_type,
+        bytes_streamed, client_ip, ip_region, NULL AS last_message_content
     FROM usage_events
     WHERE (?1 IS NULL OR key_id = ?1)
       AND (?2 IS NULL OR provider_type = ?2)
@@ -258,8 +273,9 @@ const GET_USAGE_EVENT_DETAIL_SQL: &str = "SELECT event_id, created_at_ms,
         billable_tokens, CAST(credit_usage AS VARCHAR), usage_missing,
         credit_usage_missing, latency_ms, routing_wait_ms, upstream_headers_ms,
         post_headers_body_ms, request_body_read_ms, request_json_parse_ms,
-        pre_handler_ms, first_sse_write_ms, stream_finish_ms, client_ip,
-        ip_region, last_message_content, request_headers_json,
+        pre_handler_ms, first_sse_write_ms, stream_finish_ms,
+        stream_completed_cleanly, downstream_disconnect, final_event_type,
+        bytes_streamed, client_ip, ip_region, last_message_content, request_headers_json,
         client_request_body_json, upstream_request_body_json, full_request_json
     FROM usage_events
     WHERE event_id = ?1";
@@ -335,6 +351,10 @@ fn execute_usage_event_insert(
         row.pre_handler_ms,
         row.first_sse_write_ms,
         row.stream_finish_ms,
+        row.stream_completed_cleanly,
+        row.downstream_disconnect,
+        row.final_event_type.as_deref(),
+        row.bytes_streamed,
         row.request_body_bytes,
         row.quota_failover_count,
         row.routing_diagnostics_json.as_deref(),
@@ -2196,22 +2216,28 @@ fn decode_usage_event_row(
         credit_usage: row.get(22)?,
         usage_missing: row.get(23)?,
         credit_usage_missing: row.get(24)?,
+        stream: UsageStreamDetails {
+            stream_completed_cleanly: row.get(34)?,
+            downstream_disconnect: row.get(35)?,
+            final_event_type: row.get(36)?,
+            bytes_streamed: row.get(37)?,
+        },
         client_ip: row
-            .get::<_, Option<String>>(34)?
+            .get::<_, Option<String>>(38)?
             .unwrap_or_else(|| "unknown".to_string()),
         ip_region: row
-            .get::<_, Option<String>>(35)?
+            .get::<_, Option<String>>(39)?
             .unwrap_or_else(|| "unknown".to_string()),
         request_headers_json: if include_detail_payload {
-            row.get::<_, Option<String>>(37)?
+            row.get::<_, Option<String>>(41)?
                 .unwrap_or_else(|| "{}".to_string())
         } else {
             "{}".to_string()
         },
-        last_message_content: row.get(36)?,
-        client_request_body_json: if include_detail_payload { row.get(38)? } else { None },
-        upstream_request_body_json: if include_detail_payload { row.get(39)? } else { None },
-        full_request_json: if include_detail_payload { row.get(40)? } else { None },
+        last_message_content: row.get(40)?,
+        client_request_body_json: if include_detail_payload { row.get(42)? } else { None },
+        upstream_request_body_json: if include_detail_payload { row.get(43)? } else { None },
+        full_request_json: if include_detail_payload { row.get(44)? } else { None },
         timing: UsageTiming {
             latency_ms: row.get(25)?,
             routing_wait_ms: row.get(26)?,
@@ -2232,7 +2258,7 @@ mod tests {
     use llm_access_core::{
         provider::{ProtocolFamily, ProviderType, RouteStrategy},
         store::{UsageAnalyticsStore, UsageEventQuery, UsageEventSink, UsageEventSource},
-        usage::{UsageEvent, UsageTiming},
+        usage::{UsageEvent, UsageStreamDetails, UsageTiming},
     };
 
     #[cfg(feature = "duckdb-runtime")]
@@ -2280,6 +2306,12 @@ mod tests {
                 pre_handler_ms: Some(7),
                 first_sse_write_ms: Some(33),
                 stream_finish_ms: Some(44),
+            },
+            stream: UsageStreamDetails {
+                stream_completed_cleanly: Some(true),
+                downstream_disconnect: Some(false),
+                final_event_type: Some("message_stop".to_string()),
+                bytes_streamed: Some(2048),
             },
         }
     }
@@ -2338,6 +2370,10 @@ mod tests {
             "post_headers_body_ms",
             "first_sse_write_ms",
             "stream_finish_ms",
+            "stream_completed_cleanly",
+            "downstream_disconnect",
+            "final_event_type",
+            "bytes_streamed",
             "input_uncached_tokens",
             "input_cached_tokens",
             "output_tokens",

@@ -40,7 +40,7 @@ use llm_access_core::{
         EmptyAdminConfigStore, ProviderCodexRoute, ProviderKiroRoute, ProviderProxyConfig,
         ProviderRouteStore,
     },
-    usage::{UsageEvent, UsageTiming},
+    usage::{UsageEvent, UsageStreamDetails, UsageTiming},
 };
 use llm_access_kiro::{
     anthropic::{
@@ -112,6 +112,10 @@ struct ProviderUsageMetadata {
     post_headers_body_ms: Option<i64>,
     first_sse_write_ms: Option<i64>,
     stream_finish_ms: Option<i64>,
+    stream_completed_cleanly: Option<bool>,
+    downstream_disconnect: Option<bool>,
+    final_event_type: Option<String>,
+    bytes_streamed: Option<i64>,
     quota_failover_count: u64,
     routing_diagnostics_json: Option<String>,
     client_ip: String,
@@ -145,6 +149,10 @@ impl ProviderUsageMetadata {
             post_headers_body_ms: None,
             first_sse_write_ms: None,
             stream_finish_ms: None,
+            stream_completed_cleanly: None,
+            downstream_disconnect: None,
+            final_event_type: None,
+            bytes_streamed: None,
             quota_failover_count: 0,
             routing_diagnostics_json: None,
             client_ip,
@@ -201,8 +209,40 @@ impl ProviderUsageMetadata {
         }
     }
 
+    fn observe_stream_write(&mut self, bytes_len: usize, event_type: Option<&str>) {
+        self.mark_first_sse_write();
+        self.stream_completed_cleanly.get_or_insert(false);
+        self.downstream_disconnect.get_or_insert(false);
+        self.bytes_streamed = Some(
+            self.bytes_streamed
+                .unwrap_or_default()
+                .saturating_add(clamp_usize_to_i64(bytes_len)),
+        );
+        if let Some(event_type) = event_type.map(str::trim).filter(|value| !value.is_empty()) {
+            self.final_event_type = Some(event_type.to_string());
+        }
+    }
+
     fn mark_stream_finish(&mut self) {
         self.stream_finish_ms = Some(self.elapsed_ms());
+    }
+
+    fn mark_stream_completed_cleanly(&mut self) {
+        self.stream_completed_cleanly = Some(true);
+        self.downstream_disconnect = Some(false);
+        self.mark_stream_finish();
+    }
+
+    fn mark_stream_internal_incomplete(&mut self) {
+        self.stream_completed_cleanly = Some(false);
+        self.downstream_disconnect = Some(false);
+        self.mark_stream_finish();
+    }
+
+    fn mark_downstream_disconnect(&mut self) {
+        self.stream_completed_cleanly = Some(false);
+        self.downstream_disconnect = Some(true);
+        self.mark_stream_finish();
     }
 
     fn to_timing(&self) -> UsageTiming {
@@ -216,6 +256,15 @@ impl ProviderUsageMetadata {
             pre_handler_ms: self.pre_handler_ms,
             first_sse_write_ms: self.first_sse_write_ms,
             stream_finish_ms: self.stream_finish_ms,
+        }
+    }
+
+    fn to_stream_details(&self) -> UsageStreamDetails {
+        UsageStreamDetails {
+            stream_completed_cleanly: self.stream_completed_cleanly,
+            downstream_disconnect: self.downstream_disconnect,
+            final_event_type: self.final_event_type.clone(),
+            bytes_streamed: self.bytes_streamed,
         }
     }
 }
@@ -1144,7 +1193,7 @@ fn stream_codex_upstream_response(
             route,
             control_store,
             permits,
-            mut usage_meta,
+            usage_meta,
         } = ctx;
         let _permits = permits;
         let mut events = response
@@ -1152,35 +1201,48 @@ fn stream_codex_upstream_response(
             .map_err(std::io::Error::other)
             .eventsource();
         let mut chat_metadata = ChatStreamMetadata::default();
-        let mut usage_collector = SseUsageCollector::default();
+        let mut guard = CodexStreamRecordGuard {
+            prepared,
+            key,
+            route,
+            control_store,
+            status,
+            usage_meta,
+            usage_collector: SseUsageCollector::default(),
+            state: StreamRecordState::Pending,
+            record_committed: false,
+        };
         while let Some(event) = events.next().await {
             match event {
                 Ok(event) => {
-                    usage_collector.observe_event(&event);
+                    guard.usage_collector.observe_event(&event);
                     match response_adapter {
                         GatewayResponseAdapter::Responses => {
-                            usage_meta.mark_first_sse_write();
-                            yield Ok::<Bytes, std::io::Error>(encode_sse_event_with_model_alias(
+                            let bytes = encode_sse_event_with_model_alias(
                                 &event,
-                                prepared.model.as_deref(),
-                                prepared.client_visible_model.as_deref(),
-                            ));
+                                guard.prepared.model.as_deref(),
+                                guard.prepared.client_visible_model.as_deref(),
+                            );
+                            guard.observe_chunk(&bytes, Some(event.event.as_str()));
+                            yield Ok::<Bytes, std::io::Error>(bytes);
                         },
                         GatewayResponseAdapter::ChatCompletions => {
                             if let Some(chunk) = convert_response_event_to_chat_chunk(
                                 &event,
-                                Some(&prepared.tool_name_restore_map),
+                                Some(&guard.prepared.tool_name_restore_map),
                                 &mut chat_metadata,
-                                prepared.model.as_deref(),
-                                prepared.client_visible_model.as_deref(),
+                                guard.prepared.model.as_deref(),
+                                guard.prepared.client_visible_model.as_deref(),
                             ) {
-                                usage_meta.mark_first_sse_write();
-                                yield Ok::<Bytes, std::io::Error>(encode_json_sse_chunk(&chunk));
+                                let bytes = encode_json_sse_chunk(&chunk);
+                                guard.observe_chunk(&bytes, Some(event.event.as_str()));
+                                yield Ok::<Bytes, std::io::Error>(bytes);
                             }
                         },
                     }
                 },
                 Err(err) => {
+                    guard.mark_internal_failure();
                     yield Err(std::io::Error::other(format!(
                         "failed to parse codex upstream SSE event: {err}"
                     )));
@@ -1189,22 +1251,11 @@ fn stream_codex_upstream_response(
             }
         }
         if response_adapter == GatewayResponseAdapter::ChatCompletions {
-            usage_meta.mark_first_sse_write();
-            yield Ok::<Bytes, std::io::Error>(Bytes::from_static(b"data: [DONE]\n\n"));
+            let bytes = Bytes::from_static(b"data: [DONE]\n\n");
+            guard.observe_chunk(&bytes, Some("done"));
+            yield Ok::<Bytes, std::io::Error>(bytes);
         }
-        usage_meta.mark_post_headers_body();
-        usage_meta.mark_stream_finish();
-        if let Err(err) = record_codex_usage(
-            control_store.as_ref(),
-            &key,
-            &prepared,
-            status,
-            &route,
-            usage_collector.usage.unwrap_or_else(missing_codex_usage),
-            &usage_meta,
-        ).await {
-            yield Err(std::io::Error::other(format!("failed to record codex usage: {err}")));
-        }
+        guard.finish_success().await;
     };
     let response_content_type = if response_adapter == GatewayResponseAdapter::ChatCompletions {
         "text/event-stream"
@@ -3191,23 +3242,265 @@ struct KiroCacheContext {
     billable_model_multipliers: BTreeMap<String, f64>,
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum StreamRecordState {
+    Pending,
+    InternalFailure,
+}
+
+struct CodexStreamRecordGuard {
+    prepared: PreparedGatewayRequest,
+    key: AuthenticatedKey,
+    route: ProviderCodexRoute,
+    control_store: Arc<dyn ControlStore>,
+    status: StatusCode,
+    usage_meta: ProviderUsageMetadata,
+    usage_collector: SseUsageCollector,
+    state: StreamRecordState,
+    record_committed: bool,
+}
+
+impl CodexStreamRecordGuard {
+    fn observe_chunk(&mut self, bytes: &Bytes, event_type: Option<&str>) {
+        self.usage_meta
+            .observe_stream_write(bytes.len(), event_type);
+    }
+
+    fn mark_internal_failure(&mut self) {
+        self.state = StreamRecordState::InternalFailure;
+    }
+
+    async fn finish_success(mut self) {
+        self.usage_meta.mark_post_headers_body();
+        self.usage_meta.mark_stream_completed_cleanly();
+        let usage = self
+            .usage_collector
+            .usage
+            .clone()
+            .unwrap_or_else(missing_codex_usage);
+        if let Err(err) = record_codex_usage(
+            self.control_store.as_ref(),
+            &self.key,
+            &self.prepared,
+            self.status,
+            &self.route,
+            usage,
+            &self.usage_meta,
+        )
+        .await
+        {
+            tracing::warn!(
+                key_id = %self.key.key_id,
+                account = %self.route.account_name,
+                error = %err,
+                "failed to record codex stream usage"
+            );
+        }
+        self.record_committed = true;
+    }
+}
+
+impl Drop for CodexStreamRecordGuard {
+    fn drop(&mut self) {
+        if self.record_committed {
+            return;
+        }
+        match self.state {
+            StreamRecordState::Pending => self.usage_meta.mark_downstream_disconnect(),
+            StreamRecordState::InternalFailure => self.usage_meta.mark_stream_internal_incomplete(),
+        }
+        let control_store = self.control_store.clone();
+        let key = self.key.clone();
+        let prepared = self.prepared.clone();
+        let route = self.route.clone();
+        let status = self.status;
+        let usage = self
+            .usage_collector
+            .usage
+            .clone()
+            .unwrap_or_else(missing_codex_usage);
+        let meta = self.usage_meta.clone();
+        tokio::spawn(async move {
+            if let Err(err) = record_codex_usage(
+                control_store.as_ref(),
+                &key,
+                &prepared,
+                status,
+                &route,
+                usage,
+                &meta,
+            )
+            .await
+            {
+                tracing::warn!(
+                    key_id = %key.key_id,
+                    account = %route.account_name,
+                    error = %err,
+                    "failed to record incomplete codex stream usage"
+                );
+            }
+        });
+        self.record_committed = true;
+    }
+}
+
+struct KiroStreamRecordGuard {
+    control_store: Arc<dyn ControlStore>,
+    key: AuthenticatedKey,
+    route: ProviderKiroRoute,
+    endpoint: String,
+    model: String,
+    status: StatusCode,
+    cache_ctx: KiroCacheContext,
+    usage_meta: ProviderUsageMetadata,
+    stream_ctx: StreamContext,
+    state: StreamRecordState,
+    record_committed: bool,
+}
+
+impl KiroStreamRecordGuard {
+    fn observe_chunk(&mut self, bytes: &Bytes, event_type: Option<&str>) {
+        self.usage_meta
+            .observe_stream_write(bytes.len(), event_type);
+    }
+
+    fn mark_internal_failure(&mut self) {
+        self.state = StreamRecordState::InternalFailure;
+    }
+
+    fn current_usage_summary(&self) -> KiroUsageSummary {
+        let (_resolved_input_tokens, output_tokens) = self.stream_ctx.final_usage();
+        let (credit_usage, credit_usage_missing) = self.stream_ctx.final_credit_usage();
+        build_kiro_usage_summary(
+            &self.model,
+            KiroUsageInputs {
+                request_input_tokens: self.stream_ctx.request_input_tokens(),
+                context_input_tokens: self.stream_ctx.context_input_tokens(),
+                output_tokens,
+                credit_usage,
+                credit_usage_missing,
+                cache_estimation_enabled: self.route.cache_estimation_enabled,
+            },
+            &self.cache_ctx,
+        )
+    }
+
+    async fn finish_success(mut self, usage: KiroUsageSummary) {
+        self.usage_meta.mark_stream_completed_cleanly();
+        if let Err(err) = record_kiro_usage(KiroUsageRecord {
+            control_store: self.control_store.as_ref(),
+            key: &self.key,
+            route: &self.route,
+            endpoint: &self.endpoint,
+            model: &self.model,
+            status: self.status,
+            usage,
+            cache_ctx: &self.cache_ctx,
+            meta: &self.usage_meta,
+        })
+        .await
+        {
+            tracing::warn!(
+                key_id = %self.key.key_id,
+                account = %self.route.account_name,
+                error = %err,
+                "failed to record kiro stream usage"
+            );
+        }
+        self.record_committed = true;
+    }
+}
+
+impl Drop for KiroStreamRecordGuard {
+    fn drop(&mut self) {
+        if self.record_committed {
+            return;
+        }
+        match self.state {
+            StreamRecordState::Pending => self.usage_meta.mark_downstream_disconnect(),
+            StreamRecordState::InternalFailure => self.usage_meta.mark_stream_internal_incomplete(),
+        }
+        let control_store = self.control_store.clone();
+        let key = self.key.clone();
+        let route = self.route.clone();
+        let endpoint = self.endpoint.clone();
+        let model = self.model.clone();
+        let status = self.status;
+        let cache_ctx = self.cache_ctx.clone();
+        let usage = self.current_usage_summary();
+        let meta = self.usage_meta.clone();
+        tokio::spawn(async move {
+            if let Err(err) = record_kiro_usage(KiroUsageRecord {
+                control_store: control_store.as_ref(),
+                key: &key,
+                route: &route,
+                endpoint: &endpoint,
+                model: &model,
+                status,
+                usage,
+                cache_ctx: &cache_ctx,
+                meta: &meta,
+            })
+            .await
+            {
+                tracing::warn!(
+                    key_id = %key.key_id,
+                    account = %route.account_name,
+                    error = %err,
+                    "failed to record incomplete kiro stream usage"
+                );
+            }
+        });
+        self.record_committed = true;
+    }
+}
+
 fn stream_kiro_upstream_response(
     response: reqwest::Response,
     ctx: KiroResponseContext,
 ) -> Response {
     let status = response.status();
     let body_stream = stream! {
-        let mut usage_meta = ctx.usage_meta.clone();
-        let mut stream_ctx = StreamContext::new_with_thinking(
-            &ctx.model,
-            ctx.request_input_tokens,
-            ctx.thinking_enabled,
-            ctx.tool_name_map,
-            ctx.structured_output_tool_name.clone(),
-        );
-        for event in stream_ctx.generate_initial_events() {
-            usage_meta.mark_first_sse_write();
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(event.to_sse_string()));
+        let KiroResponseContext {
+            key,
+            route,
+            public_path,
+            model,
+            request_input_tokens,
+            thinking_enabled,
+            tool_name_map,
+            structured_output_tool_name,
+            cache_ctx,
+            control_store,
+            kiro_cache_simulator,
+            usage_meta,
+            _key_permit,
+            _account_permit,
+        } = ctx;
+        let stream_model = model.clone();
+        let mut guard = KiroStreamRecordGuard {
+            control_store,
+            key,
+            route,
+            endpoint: public_path,
+            model,
+            status,
+            cache_ctx,
+            usage_meta,
+            stream_ctx: StreamContext::new_with_thinking(
+                &stream_model,
+                request_input_tokens,
+                thinking_enabled,
+                tool_name_map,
+                structured_output_tool_name,
+            ),
+            state: StreamRecordState::Pending,
+            record_committed: false,
+        };
+        for event in guard.stream_ctx.generate_initial_events() {
+            let bytes = Bytes::from(event.to_sse_string());
+            guard.observe_chunk(&bytes, Some(event.event.as_str()));
+            yield Ok::<Bytes, std::io::Error>(bytes);
         }
         let mut body_stream = response.bytes_stream();
         let mut decoder = EventStreamDecoder::new();
@@ -3215,6 +3508,7 @@ fn stream_kiro_upstream_response(
             let chunk = match chunk_result {
                 Ok(chunk) => chunk,
                 Err(err) => {
+                    guard.mark_internal_failure();
                     yield Err(std::io::Error::other(format!("failed to read kiro upstream stream: {err}")));
                     return;
                 },
@@ -3224,6 +3518,7 @@ fn stream_kiro_upstream_response(
                 let frame = match frame {
                     Ok(frame) => frame,
                     Err(err) => {
+                        guard.mark_internal_failure();
                         yield Err(std::io::Error::other(format!("failed to decode kiro event frame: {err}")));
                         return;
                     },
@@ -3231,33 +3526,35 @@ fn stream_kiro_upstream_response(
                 let event = match Event::from_frame(frame) {
                     Ok(event) => event,
                     Err(err) => {
+                        guard.mark_internal_failure();
                         yield Err(std::io::Error::other(format!("failed to parse kiro event: {err}")));
                         return;
                     },
                 };
-                for sse_event in stream_ctx.process_kiro_event(&event) {
-                    usage_meta.mark_first_sse_write();
-                    yield Ok::<Bytes, std::io::Error>(Bytes::from(sse_event.to_sse_string()));
+                for sse_event in guard.stream_ctx.process_kiro_event(&event) {
+                    let bytes = Bytes::from(sse_event.to_sse_string());
+                    guard.observe_chunk(&bytes, Some(sse_event.event.as_str()));
+                    yield Ok::<Bytes, std::io::Error>(bytes);
                 }
             }
         }
-        usage_meta.mark_post_headers_body();
-        let (_resolved_input_tokens, output_tokens) = stream_ctx.final_usage();
-        let (credit_usage, credit_usage_missing) = stream_ctx.final_credit_usage();
+        guard.usage_meta.mark_post_headers_body();
+        let (_resolved_input_tokens, output_tokens) = guard.stream_ctx.final_usage();
+        let (credit_usage, credit_usage_missing) = guard.stream_ctx.final_credit_usage();
         let usage = build_kiro_usage_summary(
-            &ctx.model,
+            &guard.model,
             KiroUsageInputs {
-                request_input_tokens: ctx.request_input_tokens,
-                context_input_tokens: stream_ctx.context_input_tokens(),
+                request_input_tokens,
+                context_input_tokens: guard.stream_ctx.context_input_tokens(),
                 output_tokens,
                 credit_usage,
                 credit_usage_missing,
-                cache_estimation_enabled: ctx.route.cache_estimation_enabled,
+                cache_estimation_enabled: guard.route.cache_estimation_enabled,
             },
-            &ctx.cache_ctx,
+            &guard.cache_ctx,
         );
-        let mut final_events = stream_ctx.generate_final_events();
-        let anthropic_usage = anthropic_usage_json_from_summary_with_policy(usage, &ctx.cache_ctx);
+        let mut final_events = guard.stream_ctx.generate_final_events();
+        let anthropic_usage = anthropic_usage_json_from_summary_with_policy(usage, &guard.cache_ctx);
         for event in &mut final_events {
             if event.event == "message_delta" {
                 if let Some(value) = event.data.get_mut("usage") {
@@ -3265,34 +3562,21 @@ fn stream_kiro_upstream_response(
                 }
             }
         }
-        let assistant_message = stream_ctx.final_assistant_message();
-        ctx.kiro_cache_simulator.record_success(
-            &ctx.cache_ctx.projection,
+        let assistant_message = guard.stream_ctx.final_assistant_message();
+        kiro_cache_simulator.record_success(
+            &guard.cache_ctx.projection,
             &assistant_message,
-            &ctx.cache_ctx.conversation_id,
-            ctx.route.cache_estimation_enabled,
-            ctx.cache_ctx.simulation_config,
+            &guard.cache_ctx.conversation_id,
+            guard.route.cache_estimation_enabled,
+            guard.cache_ctx.simulation_config,
             Instant::now(),
         );
-        usage_meta.mark_stream_finish();
-        if let Err(err) = record_kiro_usage(KiroUsageRecord {
-            control_store: ctx.control_store.as_ref(),
-            key: &ctx.key,
-            route: &ctx.route,
-            endpoint: &ctx.public_path,
-            model: &ctx.model,
-            status,
-            usage,
-            cache_ctx: &ctx.cache_ctx,
-            meta: &usage_meta,
-        }).await {
-            yield Err(std::io::Error::other(format!("failed to record kiro usage: {err}")));
-            return;
-        }
         for event in final_events {
-            usage_meta.mark_first_sse_write();
-            yield Ok::<Bytes, std::io::Error>(Bytes::from(event.to_sse_string()));
+            let bytes = Bytes::from(event.to_sse_string());
+            guard.observe_chunk(&bytes, Some(event.event.as_str()));
+            yield Ok::<Bytes, std::io::Error>(bytes);
         }
+        guard.finish_success(usage).await;
     };
     Response::builder()
         .status(status)
@@ -3360,8 +3644,11 @@ async fn buffered_kiro_stream_response(
         }
     }
     let assistant_message = stream_ctx.final_assistant_message();
-    usage_meta.mark_first_sse_write();
-    usage_meta.mark_stream_finish();
+    for event in &sse_events {
+        let encoded = event.to_sse_string();
+        usage_meta.observe_stream_write(encoded.len(), Some(event.event.as_str()));
+    }
+    usage_meta.mark_stream_completed_cleanly();
     ctx.kiro_cache_simulator.record_success(
         &ctx.cache_ctx.projection,
         &assistant_message,
@@ -4184,6 +4471,7 @@ async fn record_kiro_usage(record: KiroUsageRecord<'_>) -> anyhow::Result<()> {
         upstream_request_body_json,
         full_request_json,
         timing: record.meta.to_timing(),
+        stream: record.meta.to_stream_details(),
     };
     record.control_store.apply_usage_rollup(&event).await
 }
@@ -4255,6 +4543,7 @@ async fn record_kiro_websearch_usage(record: KiroWebsearchUsageRecord<'_>) -> an
             })
             .flatten(),
         timing: record.meta.to_timing(),
+        stream: record.meta.to_stream_details(),
     };
     record.control_store.apply_usage_rollup(&event).await
 }
@@ -4780,6 +5069,7 @@ async fn record_codex_usage(
         upstream_request_body_json: meta.upstream_request_body_json.clone(),
         full_request_json: meta.full_request_json.clone(),
         timing: meta.to_timing(),
+        stream: meta.to_stream_details(),
     };
     control_store.apply_usage_rollup(&event).await
 }
@@ -5264,6 +5554,7 @@ mod tests {
             ControlStore, EmptyProviderRouteStore, ProviderCodexRoute, ProviderKiroAuthUpdate,
             ProviderKiroRoute, ProviderProxyConfig, ProviderRouteStore,
         },
+        usage::UsageStreamDetails,
     };
     use serde_json::json;
     use tokio::sync::Notify;
@@ -7603,6 +7894,10 @@ mod tests {
             post_headers_body_ms: None,
             first_sse_write_ms: None,
             stream_finish_ms: None,
+            stream_completed_cleanly: None,
+            downstream_disconnect: None,
+            final_event_type: None,
+            bytes_streamed: None,
             quota_failover_count: 0,
             routing_diagnostics_json: None,
             client_ip: "127.0.0.1".to_string(),
@@ -7676,6 +7971,10 @@ mod tests {
             post_headers_body_ms: None,
             first_sse_write_ms: None,
             stream_finish_ms: None,
+            stream_completed_cleanly: None,
+            downstream_disconnect: None,
+            final_event_type: None,
+            bytes_streamed: None,
             quota_failover_count: 0,
             routing_diagnostics_json: None,
             client_ip: "127.0.0.1".to_string(),
@@ -7712,6 +8011,49 @@ mod tests {
         assert_eq!(events[0].client_request_body_json.as_deref(), Some(r#"{"client":true}"#));
         assert_eq!(events[0].upstream_request_body_json.as_deref(), Some(r#"{"upstream":true}"#));
         assert_eq!(events[0].full_request_json.as_deref(), Some(r#"{"full":true}"#));
+    }
+
+    #[test]
+    fn provider_usage_metadata_tracks_stream_outcome_fields() {
+        let mut meta = super::ProviderUsageMetadata {
+            started_at: Instant::now(),
+            request_method: "POST".to_string(),
+            request_url: "/v1/messages".to_string(),
+            request_body_bytes: Some(64),
+            request_body_read_ms: Some(1),
+            request_json_parse_ms: Some(1),
+            pre_handler_ms: Some(2),
+            routing_wait_ms: Some(3),
+            upstream_headers_ms: Some(4),
+            post_headers_body_ms: Some(5),
+            first_sse_write_ms: None,
+            stream_finish_ms: None,
+            stream_completed_cleanly: None,
+            downstream_disconnect: None,
+            final_event_type: None,
+            bytes_streamed: None,
+            quota_failover_count: 0,
+            routing_diagnostics_json: None,
+            client_ip: "127.0.0.1".to_string(),
+            ip_region: "local".to_string(),
+            request_headers_json: "{}".to_string(),
+            last_message_content: None,
+            client_request_body_json: None,
+            upstream_request_body_json: None,
+            full_request_json: None,
+        };
+
+        meta.observe_stream_write(12, Some("message_start"));
+        meta.observe_stream_write(8, Some("message_stop"));
+        meta.mark_stream_completed_cleanly();
+
+        assert_eq!(meta.to_stream_details(), UsageStreamDetails {
+            stream_completed_cleanly: Some(true),
+            downstream_disconnect: Some(false),
+            final_event_type: Some("message_stop".to_string()),
+            bytes_streamed: Some(20),
+        });
+        assert!(meta.to_timing().stream_finish_ms.is_some());
     }
 
     #[tokio::test]

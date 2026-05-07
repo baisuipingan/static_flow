@@ -29,6 +29,10 @@ CREATE TABLE IF NOT EXISTS usage_events (
     pre_handler_ms INTEGER,
     first_sse_write_ms INTEGER,
     stream_finish_ms INTEGER,
+    stream_completed_cleanly BOOLEAN,
+    downstream_disconnect BOOLEAN,
+    final_event_type VARCHAR,
+    bytes_streamed BIGINT,
     request_body_bytes BIGINT,
     quota_failover_count BIGINT NOT NULL DEFAULT 0,
     routing_diagnostics_json VARCHAR,
@@ -52,6 +56,10 @@ ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS request_url VARCHAR DEFAULT ''
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS request_body_read_ms INTEGER;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS request_json_parse_ms INTEGER;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS pre_handler_ms INTEGER;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS stream_completed_cleanly BOOLEAN;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS downstream_disconnect BOOLEAN;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS final_event_type VARCHAR;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS bytes_streamed BIGINT;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS quota_failover_count BIGINT DEFAULT 0;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS routing_diagnostics_json VARCHAR;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS request_headers_json VARCHAR DEFAULT '{}';

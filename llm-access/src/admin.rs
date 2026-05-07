@@ -213,6 +213,11 @@ struct AdminUsageEventView {
     pre_handler_ms: Option<i32>,
     first_sse_write_ms: Option<i32>,
     stream_finish_ms: Option<i32>,
+    stream_completed_cleanly: Option<bool>,
+    downstream_disconnect: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    final_event_type: Option<String>,
+    bytes_streamed: Option<u64>,
     other_latency_ms: Option<i32>,
     quota_failover_count: u64,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -3356,6 +3361,13 @@ impl From<&UsageEvent> for AdminUsageEventView {
             pre_handler_ms: optional_i64_to_i32(value.timing.pre_handler_ms),
             first_sse_write_ms: optional_i64_to_i32(value.timing.first_sse_write_ms),
             stream_finish_ms: optional_i64_to_i32(value.timing.stream_finish_ms),
+            stream_completed_cleanly: value.stream.stream_completed_cleanly,
+            downstream_disconnect: value.stream.downstream_disconnect,
+            final_event_type: value.stream.final_event_type.clone(),
+            bytes_streamed: value
+                .stream
+                .bytes_streamed
+                .and_then(non_negative_i64_to_u64),
             other_latency_ms: compute_other_latency_ms(
                 latency_ms,
                 optional_i64_to_i32(value.timing.routing_wait_ms),

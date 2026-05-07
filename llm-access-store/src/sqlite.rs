@@ -5159,6 +5159,7 @@ mod tests {
             upstream_request_body_json: None,
             full_request_json: None,
             timing: llm_access_core::usage::UsageTiming::default(),
+            stream: llm_access_core::usage::UsageStreamDetails::default(),
         };
 
         repo.increment_key_usage_rollup(&event)

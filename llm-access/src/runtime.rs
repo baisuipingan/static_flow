@@ -1192,7 +1192,7 @@ mod tests {
     use llm_access_core::{
         provider::{ProtocolFamily, ProviderType},
         store::{AdminRuntimeConfig, AuthenticatedKey, ControlStore, UsageEventSink},
-        usage::{UsageEvent, UsageTiming},
+        usage::UsageEvent,
     };
     #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
     use tokio::sync::Mutex;
@@ -1348,10 +1348,11 @@ mod tests {
             client_request_body_json: None,
             upstream_request_body_json: None,
             full_request_json: None,
-            timing: UsageTiming {
+            timing: llm_access_core::usage::UsageTiming {
                 latency_ms: Some(20),
-                ..UsageTiming::default()
+                ..llm_access_core::usage::UsageTiming::default()
             },
+            stream: llm_access_core::usage::UsageStreamDetails::default(),
         }
     }
 

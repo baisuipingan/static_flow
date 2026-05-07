@@ -294,6 +294,83 @@ fn format_optional_bytes(bytes: Option<u64>) -> String {
     }
 }
 
+fn usage_stream_state_label(
+    stream_completed_cleanly: Option<bool>,
+    downstream_disconnect: Option<bool>,
+) -> &'static str {
+    if downstream_disconnect == Some(true) {
+        "disconnect"
+    } else if stream_completed_cleanly == Some(true) {
+        "clean"
+    } else if stream_completed_cleanly == Some(false) {
+        "incomplete"
+    } else {
+        "n/a"
+    }
+}
+
+fn usage_stream_state_badge_classes(
+    stream_completed_cleanly: Option<bool>,
+    downstream_disconnect: Option<bool>,
+) -> Classes {
+    let mut classes = classes!(
+        "inline-flex",
+        "rounded-full",
+        "border",
+        "px-2.5",
+        "py-1",
+        "text-[11px]",
+        "font-semibold",
+        "uppercase",
+        "tracking-[0.12em]"
+    );
+    match usage_stream_state_label(stream_completed_cleanly, downstream_disconnect) {
+        "clean" => {
+            classes.push("border-emerald-500/20");
+            classes.push("bg-emerald-500/10");
+            classes.push("text-emerald-700");
+            classes.push("dark:text-emerald-200");
+        },
+        "disconnect" => {
+            classes.push("border-red-500/20");
+            classes.push("bg-red-500/10");
+            classes.push("text-red-700");
+            classes.push("dark:text-red-200");
+        },
+        "incomplete" => {
+            classes.push("border-amber-500/20");
+            classes.push("bg-amber-500/10");
+            classes.push("text-amber-700");
+            classes.push("dark:text-amber-200");
+        },
+        _ => {
+            classes.push("border-slate-500/20");
+            classes.push("bg-slate-500/10");
+            classes.push("text-slate-700");
+            classes.push("dark:text-slate-200");
+        },
+    }
+    classes
+}
+
+fn format_stream_summary(
+    stream_completed_cleanly: Option<bool>,
+    downstream_disconnect: Option<bool>,
+    final_event_type: Option<&str>,
+    bytes_streamed: Option<u64>,
+) -> String {
+    let final_event_type = final_event_type
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("-");
+    format!(
+        "state {} · final {} · bytes {}",
+        usage_stream_state_label(stream_completed_cleanly, downstream_disconnect),
+        final_event_type,
+        format_optional_bytes(bytes_streamed),
+    )
+}
+
 fn compute_other_latency_ms(
     latency_ms: i32,
     routing_wait_ms: Option<i32>,
@@ -3927,8 +4004,14 @@ pub fn admin_llm_gateway_page() -> Html {
             event.routing_wait_ms,
             event.routing_diagnostics_json.as_deref(),
         );
+        let stream_summary = format_stream_summary(
+            event.stream_completed_cleanly,
+            event.downstream_disconnect,
+            event.final_event_type.as_deref(),
+            event.bytes_streamed,
+        );
         let request_detail_summary = format!(
-            "{} {} · {} / {} · key {} · account {} · status {} · model {} · route {} · latency {}",
+            "{} {} · {} / {} · key {} · account {} · status {} · model {} · route {} · latency {} · stream {}",
             event.request_method,
             event.request_url,
             event.client_ip,
@@ -3952,6 +4035,7 @@ pub fn admin_llm_gateway_page() -> Html {
                 other_latency_ms: event.other_latency_ms,
                 quota_failover_count: event.quota_failover_count,
             }),
+            stream_summary,
         );
         let last_message_for_copy = event
             .last_message_content
@@ -4102,6 +4186,21 @@ pub fn admin_llm_gateway_page() -> Html {
                                 <span>{ format!("stream finish {}", format_optional_latency_ms(event.stream_finish_ms)) }</span>
                                 <span>{ format!("other {}", format_optional_latency_ms(detail_other_latency_ms)) }</span>
                                 <span>{ format!("quota failover {}", event.quota_failover_count) }</span>
+                            </div>
+                        </div>
+                        <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "px-3", "py-3")}>
+                            <div class={classes!("text-xs", "uppercase", "tracking-widest", "text-[var(--muted)]")}>{ "Stream" }</div>
+                            <div class={classes!("mt-1", "flex", "items-center", "gap-2", "flex-wrap")}>
+                                <span class={usage_stream_state_badge_classes(event.stream_completed_cleanly, event.downstream_disconnect)}>
+                                    { usage_stream_state_label(event.stream_completed_cleanly, event.downstream_disconnect) }
+                                </span>
+                                <span class={classes!("font-mono", "text-xs", "text-[var(--muted)]")}>
+                                    { format!("final {}", event.final_event_type.clone().unwrap_or_else(|| "-".to_string())) }
+                                </span>
+                            </div>
+                            <div class={classes!("mt-2", "grid", "gap-1", "font-mono", "text-[11px]", "text-[var(--muted)]")}>
+                                <span>{ format!("bytes {}", format_optional_bytes(event.bytes_streamed)) }</span>
+                                <span>{ format!("disconnect {}", event.downstream_disconnect.map(|value| if value { "yes" } else { "no" }).unwrap_or("-")) }</span>
                             </div>
                         </div>
                         <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "px-3", "py-3")}>
@@ -6237,7 +6336,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         class={classes!("mt-4", "overflow-x-auto", "rounded-xl", "border", "border-[var(--border)]")}
                         onscroll={on_usage_scroll_bottom}
                     >
-                        <table class={classes!("min-w-[110rem]", "w-full", "text-sm")}>
+                        <table class={classes!("min-w-[118rem]", "w-full", "text-sm")}>
                             <thead>
                                 <tr class={classes!("text-left", "text-[var(--muted)]")}>
                                     <th class={classes!("py-2", "pr-3")}>{ "时间 / Event ID" }</th>
@@ -6247,6 +6346,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                     <th class={classes!("py-2", "pr-3")}>{ "Model" }</th>
                                     <th class={classes!("py-2", "pr-3")}>{ "Status" }</th>
                                     <th class={classes!("py-2", "pr-3")}>{ "Latency" }</th>
+                                <th class={classes!("py-2", "pr-3")}>{ "Stream" }</th>
                                 <th class={classes!("py-2", "pr-3")}>{ "IP / 属地" }</th>
                                 <th class={classes!("py-2", "pr-3")}>{ "Tokens" }</th>
                                 <th class={classes!("py-2", "pr-3")}>{ "Credit" }</th>
@@ -6257,7 +6357,7 @@ pub fn admin_llm_gateway_page() -> Html {
                             <tbody>
                                 if usage_events.is_empty() && !*loading && !*usage_loading && (*usage_error).is_none() {
                                     <tr class={classes!("border-t", "border-[var(--border)]")}>
-                                        <td colspan="12" class={classes!("py-8", "text-center", "text-[var(--muted)]")}>{ "当前筛选下还没有 usage 事件" }</td>
+                                        <td colspan="13" class={classes!("py-8", "text-center", "text-[var(--muted)]")}>{ "当前筛选下还没有 usage 事件" }</td>
                                     </tr>
                                 } else {
                                     { for usage_events.iter().map(|event| {
@@ -6283,6 +6383,10 @@ pub fn admin_llm_gateway_page() -> Html {
                                             )
                                         });
                                         let sse_applicable = event.first_sse_write_ms.is_some();
+                                        let stream_state_label = usage_stream_state_label(
+                                            event.stream_completed_cleanly,
+                                            event.downstream_disconnect,
+                                        );
                                         html! {
                                             <tr class={classes!("border-t", "border-[var(--border)]", "align-top")}>
                                                 <td class={classes!("py-3", "pr-3", "min-w-[13rem]", "whitespace-nowrap")}>
@@ -6344,6 +6448,19 @@ pub fn admin_llm_gateway_page() -> Html {
                                                         <span>{ format!("stream finish {}", format_optional_latency_ms(event.stream_finish_ms)) }</span>
                                                         <span>{ format!("other {}", format_optional_latency_ms(other_latency_ms)) }</span>
                                                         <span>{ format!("quota failover {}", event.quota_failover_count) }</span>
+                                                    </div>
+                                                </td>
+                                                <td class={classes!("py-3", "pr-3", "min-w-[14rem]")}>
+                                                    <div class={classes!("flex", "items-center", "gap-2", "flex-wrap")}>
+                                                        <span class={usage_stream_state_badge_classes(event.stream_completed_cleanly, event.downstream_disconnect)}>
+                                                            { stream_state_label }
+                                                        </span>
+                                                        <span class={classes!("font-mono", "text-[11px]", "text-[var(--muted)]")}>
+                                                            { format!("final {}", event.final_event_type.clone().unwrap_or_else(|| "-".to_string())) }
+                                                        </span>
+                                                    </div>
+                                                    <div class={classes!("mt-2", "grid", "gap-1", "font-mono", "text-[11px]", "text-[var(--muted)]")}>
+                                                        <span>{ format!("bytes {}", format_optional_bytes(event.bytes_streamed)) }</span>
                                                     </div>
                                                 </td>
                                                 <td class={classes!("py-3", "pr-3", "min-w-[14rem]")}>
@@ -7060,6 +7177,16 @@ mod tests {
 
         assert!(summary.contains("route 12 ms"));
         assert!(summary.contains("first SSE n/a"));
+    }
+
+    #[test]
+    fn stream_summary_marks_disconnect_and_formats_bytes() {
+        assert_eq!(
+            format_stream_summary(Some(false), Some(true), Some("message_stop"), Some(2048)),
+            "state disconnect · final message_stop · bytes 2.0 KiB"
+        );
+        assert_eq!(usage_stream_state_label(Some(true), Some(false)), "clean");
+        assert_eq!(usage_stream_state_label(None, None), "n/a");
     }
 
     #[test]
