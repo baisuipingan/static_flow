@@ -6126,7 +6126,6 @@ pub struct AdminLlmGatewayUsageEventsResponse {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(default)]
-#[allow(dead_code, reason = "used after the usage journal status panel is wired")]
 pub struct AdminUsageWorkerProgressView {
     pub state: String,
     pub current_file_path: Option<String>,
@@ -6148,7 +6147,6 @@ pub struct AdminUsageWorkerProgressView {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(default)]
-#[allow(dead_code, reason = "used after the usage journal status panel is wired")]
 pub struct AdminUsageJournalStatusView {
     pub journal_enabled: bool,
     pub journal_root: String,
@@ -7370,7 +7368,6 @@ pub async fn update_admin_llm_gateway_config(
     }
 }
 
-#[allow(dead_code, reason = "used after the usage journal status panel is wired")]
 pub async fn fetch_admin_usage_journal_status() -> Result<AdminUsageJournalStatusView, String> {
     #[cfg(feature = "mock")]
     {
@@ -7379,7 +7376,7 @@ pub async fn fetch_admin_usage_journal_status() -> Result<AdminUsageJournalStatu
 
     #[cfg(not(feature = "mock"))]
     {
-        let url = format!("{}/admin/llm-gateway/usage-journal/status", admin_base());
+        let url = format!("{}/admin/llm-access/usage-journal/status", admin_base());
         let response = api_get(&url)
             .send()
             .await

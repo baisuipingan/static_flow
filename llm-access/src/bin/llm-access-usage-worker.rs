@@ -2,27 +2,43 @@
 
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 fn main() -> anyhow::Result<()> {
-    use std::sync::{Arc, RwLock};
+    use std::{
+        ffi::OsString,
+        sync::{Arc, RwLock},
+    };
 
     use llm_access::{
         config::CliCommand,
-        usage_worker::{run_forever, UsageWorker},
+        usage_worker::{router, run_forever, UsageWorker},
     };
-    use llm_access_core::store::AdminRuntimeConfig;
-    use llm_access_store::duckdb::{
-        DuckDbUsageConnectionConfig, DuckDbUsageRepository, TieredDuckDbUsageConfig,
+    use llm_access_core::store::AdminConfigStore;
+    use llm_access_store::{
+        duckdb::{DuckDbUsageConnectionConfig, DuckDbUsageRepository, TieredDuckDbUsageConfig},
+        repository::SqliteControlRepository,
     };
 
-    let command = CliCommand::parse(std::env::args_os())?;
-    let storage = match command {
+    let args = std::env::args_os().collect::<Vec<OsString>>();
+    let explicit_bind = args.iter().any(|arg| arg == "--bind");
+    let command = CliCommand::parse(args)?;
+    let (bind_addr, storage) = match command {
         CliCommand::Init(storage) => {
             llm_access::bootstrap_storage(&storage)?;
             return Ok(());
         },
-        CliCommand::Serve(config) => config.storage,
+        CliCommand::Serve(config) => (config.bind_addr, config.storage),
     };
     llm_access::bootstrap_storage(&storage)?;
-    let runtime_config = AdminRuntimeConfig::default();
+    let control = SqliteControlRepository::open_path(&storage.sqlite_control)?;
+    let runtime = tokio::runtime::Runtime::new()?;
+    let runtime_config = runtime.block_on(control.get_admin_runtime_config())?;
+    let bind_addr = if explicit_bind {
+        bind_addr
+    } else {
+        runtime_config
+            .usage_query_bind_addr
+            .parse()
+            .unwrap_or(bind_addr)
+    };
     let connection_config = Arc::new(RwLock::new(
         DuckDbUsageConnectionConfig::from_admin_runtime_config(&runtime_config),
     ));
@@ -40,7 +56,27 @@ fn main() -> anyhow::Result<()> {
         DuckDbUsageRepository::open_path_with_connection_config(storage.duckdb, connection_config)?
     };
     let worker = UsageWorker::new(storage.usage_journal_dir, Arc::new(duckdb))?;
-    tokio::runtime::Runtime::new()?.block_on(run_forever(worker))
+    let app = router(&worker);
+    std::thread::spawn(move || {
+        let runtime = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(runtime) => runtime,
+            Err(err) => {
+                tracing::error!("failed to create usage worker import runtime: {err:#}");
+                return;
+            },
+        };
+        if let Err(err) = runtime.block_on(run_forever(worker)) {
+            tracing::error!("llm access usage worker import loop stopped: {err:#}");
+        }
+    });
+    runtime.block_on(async move {
+        let listener = tokio::net::TcpListener::bind(bind_addr).await?;
+        axum::serve(listener, app.into_make_service()).await?;
+        Ok(())
+    })
 }
 
 #[cfg(not(any(feature = "duckdb-runtime", feature = "duckdb-bundled")))]

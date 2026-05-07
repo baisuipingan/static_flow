@@ -2,6 +2,7 @@
 
 use std::{
     collections::HashMap,
+    path::PathBuf,
     sync::{Arc, RwLock},
     time::Duration,
 };
@@ -66,6 +67,9 @@ pub struct LlmAccessRuntime {
     public_submission_store: Arc<dyn PublicSubmissionStore>,
     public_status_store: Arc<dyn PublicStatusStore>,
     #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
+    usage_journal_sink: Option<Arc<JournalUsageEventSink>>,
+    usage_journal_dir: Option<PathBuf>,
+    #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
     usage_event_flusher: Option<Arc<UsageEventFlusherHandle>>,
 }
 
@@ -88,6 +92,9 @@ struct LlmAccessStores {
     usage_analytics_store: Arc<dyn UsageAnalyticsStore>,
     public_submission_store: Arc<dyn PublicSubmissionStore>,
     public_status_store: Arc<dyn PublicStatusStore>,
+    #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
+    usage_journal_sink: Option<Arc<JournalUsageEventSink>>,
+    usage_journal_dir: Option<PathBuf>,
     #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
     usage_event_flusher: Option<Arc<UsageEventFlusherHandle>>,
 }
@@ -113,32 +120,8 @@ impl LlmAccessRuntime {
             public_submission_store: Arc::new(EmptyPublicSubmissionStore),
             public_status_store: Arc::new(EmptyPublicStatusStore),
             #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
-            usage_event_flusher: None,
-        })
-    }
-
-    #[cfg(test)]
-    pub(crate) fn new_with_usage_analytics_store_for_tests(
-        control_store: Arc<dyn ControlStore>,
-        usage_analytics_store: Arc<dyn UsageAnalyticsStore>,
-    ) -> Self {
-        Self::with_stores(LlmAccessStores {
-            control_store,
-            geoip: GeoIpResolver::disabled(),
-            provider_route_store: Arc::new(EmptyProviderRouteStore),
-            admin_config_store: Arc::new(EmptyAdminConfigStore),
-            admin_key_store: Arc::new(EmptyAdminKeyStore),
-            admin_account_group_store: Arc::new(EmptyAdminAccountGroupStore),
-            admin_proxy_store: Arc::new(EmptyAdminProxyStore),
-            admin_codex_account_store: Arc::new(EmptyAdminCodexAccountStore),
-            admin_kiro_account_store: Arc::new(EmptyAdminKiroAccountStore),
-            admin_review_queue_store: Arc::new(EmptyAdminReviewQueueStore),
-            public_access_store: Arc::new(EmptyPublicAccessStore),
-            public_community_store: Arc::new(EmptyPublicCommunityStore),
-            public_usage_store: Arc::new(EmptyPublicUsageStore),
-            usage_analytics_store,
-            public_submission_store: Arc::new(EmptyPublicSubmissionStore),
-            public_status_store: Arc::new(EmptyPublicStatusStore),
+            usage_journal_sink: None,
+            usage_journal_dir: None,
             #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
             usage_event_flusher: None,
         })
@@ -163,6 +146,9 @@ impl LlmAccessRuntime {
             usage_analytics_store: stores.usage_analytics_store,
             public_submission_store: stores.public_submission_store,
             public_status_store: stores.public_status_store,
+            #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
+            usage_journal_sink: stores.usage_journal_sink,
+            usage_journal_dir: stores.usage_journal_dir,
             #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
             usage_event_flusher: stores.usage_event_flusher,
         }
@@ -190,6 +176,8 @@ impl LlmAccessRuntime {
             config.usage_journal_dir.clone(),
             &initial_runtime_config,
         )?);
+        #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
+        let journal_usage_for_status = journal_usage.clone();
         #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
         let (usage_accounting, usage_event_flusher) =
             UsageAccounting::new(repository.clone(), journal_usage, runtime_config.clone());
@@ -263,6 +251,9 @@ impl LlmAccessRuntime {
             public_submission_store,
             public_status_store,
             #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
+            usage_journal_sink: Some(journal_usage_for_status),
+            usage_journal_dir: Some(config.usage_journal_dir.clone()),
+            #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
             usage_event_flusher: Some(usage_event_flusher),
         }))
     }
@@ -334,6 +325,25 @@ impl LlmAccessRuntime {
     /// Usage analytics store used by admin and public usage views.
     pub fn usage_analytics_store(&self) -> Arc<dyn UsageAnalyticsStore> {
         Arc::clone(&self.usage_analytics_store)
+    }
+
+    /// Journal root used by producer-side status views.
+    pub(crate) fn usage_journal_dir(&self) -> Option<PathBuf> {
+        self.usage_journal_dir.clone()
+    }
+
+    /// Producer-side journal sink used for live status views.
+    #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
+    pub(crate) fn usage_journal_sink(&self) -> Option<Arc<JournalUsageEventSink>> {
+        self.usage_journal_sink.clone()
+    }
+
+    /// No producer journal sink is available without DuckDB runtime support.
+    #[cfg(not(any(feature = "duckdb-runtime", feature = "duckdb-bundled")))]
+    pub(crate) fn usage_journal_sink(
+        &self,
+    ) -> Option<Arc<crate::usage_journal::JournalUsageEventSink>> {
+        None
     }
 
     /// Public submission store used by unauthenticated public endpoints.

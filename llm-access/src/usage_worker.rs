@@ -8,15 +8,63 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
+use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
 use llm_access_store::duckdb::DuckDbUsageRepository;
 use llm_usage_journal::{JournalConsumerState, JournalReader, WorkerProgressSnapshot};
 use sha2::{Digest, Sha256};
+
+use crate::usage_query::{
+    get_kiro_usage_event, get_llm_usage_event, list_kiro_usage_events, list_llm_usage_events,
+    UsageQueryState,
+};
 
 /// Usage journal consumer.
 pub struct UsageWorker {
     journal_root: PathBuf,
     state: JournalConsumerState,
     duckdb_usage: Arc<DuckDbUsageRepository>,
+}
+
+/// Build the usage worker HTTP router.
+pub fn router(worker: &UsageWorker) -> Router {
+    let query_state = UsageQueryState {
+        usage_analytics_store: worker.duckdb_usage.clone(),
+    };
+    Router::new()
+        .route("/admin/llm-gateway/usage", get(list_llm_usage_events))
+        .route("/admin/llm-gateway/usage/:event_id", get(get_llm_usage_event))
+        .route("/admin/kiro-gateway/usage", get(list_kiro_usage_events))
+        .route("/admin/kiro-gateway/usage/:event_id", get(get_kiro_usage_event))
+        .route("/admin/llm-access/usage-worker/status", get(worker_status))
+        .with_state(WorkerHttpState {
+            journal_root: worker.journal_root.clone(),
+            query: query_state,
+        })
+}
+
+#[derive(Clone)]
+struct WorkerHttpState {
+    journal_root: PathBuf,
+    query: UsageQueryState,
+}
+
+impl axum::extract::FromRef<WorkerHttpState> for UsageQueryState {
+    fn from_ref(input: &WorkerHttpState) -> Self {
+        input.query.clone()
+    }
+}
+
+async fn worker_status(State(state): State<WorkerHttpState>) -> impl IntoResponse {
+    match JournalConsumerState::open(&state.journal_root)
+        .and_then(|state| state.progress_snapshot())
+    {
+        Ok(progress) => Json(progress).into_response(),
+        Err(err) => (
+            axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+            format!("failed to load worker status: {err:#}"),
+        )
+            .into_response(),
+    }
 }
 
 impl UsageWorker {
@@ -51,6 +99,17 @@ impl UsageWorker {
     /// Return current worker progress.
     pub fn progress_snapshot(&self) -> anyhow::Result<WorkerProgressSnapshot> {
         self.state.progress_snapshot()
+    }
+
+    fn record_error(&self, err: &anyhow::Error) {
+        let mut progress = self.progress_snapshot().unwrap_or_else(|_| idle_progress());
+        progress.state = "error".to_string();
+        progress.heartbeat_at_ms = Some(now_ms());
+        progress.last_error = Some(format!("{err:#}"));
+        progress.last_error_at_ms = Some(now_ms());
+        if let Err(update_err) = self.state.update_progress(&progress, now_ms()) {
+            tracing::error!("failed to persist usage worker error status: {update_err:#}");
+        }
     }
 
     async fn import_next(
@@ -251,7 +310,10 @@ fn now_ms() -> i64 {
 /// Run the import loop until the process is stopped.
 pub async fn run_forever(worker: UsageWorker) -> anyhow::Result<()> {
     loop {
-        worker.run_one_import().await?;
+        if let Err(err) = worker.run_one_import().await {
+            worker.record_error(&err);
+            return Err(err);
+        }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
 }
@@ -260,6 +322,10 @@ pub async fn run_forever(worker: UsageWorker) -> anyhow::Result<()> {
 mod tests {
     use std::{path::PathBuf, sync::Arc};
 
+    use axum::{
+        body::{to_bytes, Body},
+        http::{Request, StatusCode},
+    };
     use llm_access_core::{
         provider::{ProtocolFamily, ProviderType},
         store::UsageAnalyticsStore,
@@ -267,6 +333,7 @@ mod tests {
     };
     use llm_access_store::duckdb::{DuckDbUsageRepository, TieredDuckDbUsageConfig};
     use llm_usage_journal::{JournalConfig, JournalReader, JournalWriter};
+    use tower::ServiceExt;
 
     use super::UsageWorker;
 
@@ -312,10 +379,48 @@ mod tests {
         assert_eq!(fixture.count_duckdb_event("evt-idempotent").await, 1);
     }
 
+    #[tokio::test]
+    async fn usage_worker_serves_legacy_llm_usage_paths() {
+        let fixture = UsageWorkerFixture::new();
+        fixture.write_sealed_event("evt-worker-http");
+        fixture.run_one_import().await.expect("import");
+
+        let app = super::router(fixture.worker.as_ref());
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/llm-gateway/usage?limit=1")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("list response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("list body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("list json");
+        assert_eq!(value["events"][0]["id"], "evt-worker-http");
+
+        let response = app
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/llm-gateway/usage/evt-worker-http")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("detail response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+    }
+
     struct UsageWorkerFixture {
         _temp_dir: tempfile::TempDir,
         journal_root: PathBuf,
-        worker: UsageWorker,
+        worker: Arc<UsageWorker>,
         duckdb: Arc<DuckDbUsageRepository>,
     }
 
@@ -332,7 +437,8 @@ mod tests {
                 })
                 .expect("open duckdb"),
             );
-            let worker = UsageWorker::new(journal_root.clone(), duckdb.clone()).expect("worker");
+            let worker =
+                Arc::new(UsageWorker::new(journal_root.clone(), duckdb.clone()).expect("worker"));
             Self {
                 _temp_dir: temp_dir,
                 journal_root,

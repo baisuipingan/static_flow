@@ -4,14 +4,15 @@ use std::{
     collections::{BTreeMap, HashSet},
     fs,
     net::{IpAddr, SocketAddr},
-    path::PathBuf,
+    path::{Path as FsPath, PathBuf},
     time::{Duration, Instant},
 };
 
 use anyhow::Context;
 use axum::{
-    extract::{Path, Query, State},
-    http::{header, HeaderMap, StatusCode},
+    body::Body,
+    extract::{OriginalUri, Path, Query, State},
+    http::{header, HeaderMap, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
@@ -22,11 +23,10 @@ use llm_access_core::{
         AdminCodexImportJobItemResult, AdminKeyPatch, AdminProxyConfigPatch,
         AdminReviewQueueAction, AdminRuntimeConfig, NewAdminAccountGroup, NewAdminCodexAccount,
         NewAdminCodexImportJob, NewAdminCodexImportJobItem, NewAdminKey, NewAdminKiroAccount,
-        NewAdminProxyConfig, UpdateAdminRuntimeConfig, UsageEventQuery, UsageEventSource,
-        KEY_STATUS_ACTIVE, KEY_STATUS_DISABLED, KIRO_PREFIX_CACHE_MODE_FORMULA, PROTOCOL_ANTHROPIC,
-        PROTOCOL_OPENAI, PROVIDER_CODEX, PROVIDER_KIRO,
+        NewAdminProxyConfig, UpdateAdminRuntimeConfig, KEY_STATUS_ACTIVE, KEY_STATUS_DISABLED,
+        KIRO_PREFIX_CACHE_MODE_FORMULA, PROTOCOL_ANTHROPIC, PROTOCOL_OPENAI, PROVIDER_CODEX,
+        PROVIDER_KIRO,
     },
-    usage::UsageEvent,
 };
 use llm_access_kiro::{
     auth_file::KiroAuthRecord,
@@ -37,6 +37,7 @@ use llm_access_kiro::{
     cache_sim::{KiroCacheRuntimeStats, KiroCacheSimulationConfig, KiroCacheSimulationMode},
     local_import,
 };
+use llm_usage_journal::{JournalStatusSnapshot, WorkerProgressSnapshot};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tokio::sync::OwnedSemaphorePermit;
@@ -81,9 +82,6 @@ const DEFAULT_ADMIN_REVIEW_QUEUE_LIMIT: usize = 50;
 const MAX_ADMIN_REVIEW_QUEUE_LIMIT: usize = 200;
 const DEFAULT_ADMIN_IMPORT_JOB_LIMIT: usize = 20;
 const MAX_ADMIN_IMPORT_JOB_LIMIT: usize = 50;
-const DEFAULT_ADMIN_USAGE_LIMIT: usize = 20;
-const MAX_ADMIN_USAGE_LIMIT: usize = 20;
-const MAX_ADMIN_USAGE_OFFSET: usize = 200;
 const PROXY_CONNECTIVITY_CHECK_TIMEOUT_SECONDS: u64 = 10;
 const BAND_CONTIGUITY_TOLERANCE: f64 = 1e-12;
 
@@ -196,69 +194,40 @@ struct AdminSponsorRequestsResponse {
 }
 
 #[derive(Debug, Serialize)]
-struct AdminUsageEventsResponse {
-    total: usize,
-    offset: usize,
-    limit: usize,
-    has_more: bool,
-    current_rpm: u32,
-    current_in_flight: u32,
-    events: Vec<AdminUsageEventView>,
+struct AdminUsageJournalStatusResponse {
+    journal_enabled: bool,
+    journal_root: String,
+    active_file_sequence: Option<u64>,
+    active_file_bytes: u64,
+    sealed_file_count: u64,
+    sealed_bytes: u64,
+    oldest_sealed_age_ms: Option<i64>,
+    dropped_files_total: u64,
+    dropped_unconsumed_files_total: u64,
+    write_failures_total: u64,
+    usage_query_base_url: String,
+    worker: AdminUsageWorkerProgressView,
     generated_at: i64,
 }
 
 #[derive(Debug, Serialize)]
-struct AdminUsageEventView {
-    id: String,
-    key_id: String,
-    key_name: String,
-    account_name: Option<String>,
-    request_method: String,
-    request_url: String,
-    latency_ms: i32,
-    routing_wait_ms: Option<i32>,
-    upstream_headers_ms: Option<i32>,
-    post_headers_body_ms: Option<i32>,
-    request_body_bytes: Option<u64>,
-    request_body_read_ms: Option<i32>,
-    request_json_parse_ms: Option<i32>,
-    pre_handler_ms: Option<i32>,
-    first_sse_write_ms: Option<i32>,
-    stream_finish_ms: Option<i32>,
-    stream_completed_cleanly: Option<bool>,
-    downstream_disconnect: Option<bool>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    final_event_type: Option<String>,
-    bytes_streamed: Option<u64>,
-    other_latency_ms: Option<i32>,
-    quota_failover_count: u64,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    routing_diagnostics_json: Option<String>,
-    endpoint: String,
-    model: Option<String>,
-    status_code: i32,
-    input_uncached_tokens: u64,
-    input_cached_tokens: u64,
-    output_tokens: u64,
-    billable_tokens: u64,
-    usage_missing: bool,
-    credit_usage: Option<f64>,
-    credit_usage_missing: bool,
-    client_ip: String,
-    ip_region: String,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    last_message_content: Option<String>,
-    created_at: i64,
-}
-
-#[derive(Debug, Serialize)]
-struct AdminUsageEventDetailView {
-    #[serde(flatten)]
-    event: AdminUsageEventView,
-    request_headers_json: String,
-    client_request_body_json: Option<String>,
-    upstream_request_body_json: Option<String>,
-    full_request_json: Option<String>,
+struct AdminUsageWorkerProgressView {
+    state: String,
+    current_file_path: Option<String>,
+    current_file_sequence: Option<u64>,
+    processed_blocks: u64,
+    total_blocks: u64,
+    processed_events: u64,
+    total_events: u64,
+    processed_compressed_bytes: u64,
+    total_compressed_bytes: u64,
+    progress_percent: f64,
+    import_rate_events_per_second: f64,
+    heartbeat_age_ms: Option<i64>,
+    last_successful_file_sequence: Option<u64>,
+    last_successful_import_at_ms: Option<i64>,
+    last_error: Option<String>,
+    last_error_at_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -288,22 +257,6 @@ struct AdminLegacyKiroProxyMigrationResponse {
     reused_configs: Vec<core_store::AdminProxyConfig>,
     migrated_account_names: Vec<String>,
     generated_at: i64,
-}
-
-#[derive(Debug, Deserialize)]
-pub(crate) struct ListUsageEventsRequest {
-    #[serde(default)]
-    key_id: Option<String>,
-    #[serde(default)]
-    start_ms: Option<i64>,
-    #[serde(default)]
-    end_ms: Option<i64>,
-    #[serde(default)]
-    source: Option<String>,
-    #[serde(default)]
-    limit: Option<usize>,
-    #[serde(default)]
-    offset: Option<usize>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1087,41 +1040,25 @@ pub(crate) async fn import_legacy_kiro_proxy_configs(
 pub(crate) async fn list_llm_gateway_usage_events(
     State(state): State<HttpState>,
     headers: HeaderMap,
-    Query(request): Query<ListUsageEventsRequest>,
+    OriginalUri(uri): OriginalUri,
 ) -> Response {
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
     }
-    let query = match normalize_usage_query(request) {
-        Ok(query) => query,
-        Err(response) => return response.into_response(),
-    };
     let _permit = match acquire_admin_usage_query_permit(&state) {
         Ok(permit) => permit,
         Err(response) => return response.into_response(),
     };
-    let activity = state.request_activity.snapshot(query.key_id.as_deref());
-    match state.usage_analytics_store.list_usage_events(query).await {
-        Ok(page) => Json(AdminUsageEventsResponse {
-            total: page.total,
-            offset: page.offset,
-            limit: page.limit,
-            has_more: page.has_more,
-            current_rpm: activity.rpm,
-            current_in_flight: activity.in_flight,
-            events: page.events.iter().map(AdminUsageEventView::from).collect(),
-            generated_at: now_ms(),
-        })
-        .into_response(),
-        Err(_) => internal_error("Failed to list llm gateway usage events").into_response(),
-    }
+    proxy_usage_query(&state, &uri).await
 }
 
 pub(crate) async fn get_llm_gateway_usage_event(
     State(state): State<HttpState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Path(event_id): Path<String>,
 ) -> Response {
+    let _ = event_id;
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
     }
@@ -1129,18 +1066,53 @@ pub(crate) async fn get_llm_gateway_usage_event(
         Ok(permit) => permit,
         Err(response) => return response.into_response(),
     };
-    match state.usage_analytics_store.get_usage_event(&event_id).await {
-        Ok(Some(event)) => Json(AdminUsageEventDetailView {
-            event: AdminUsageEventView::from(&event),
-            request_headers_json: event.request_headers_json.clone(),
-            client_request_body_json: event.client_request_body_json.clone(),
-            upstream_request_body_json: event.upstream_request_body_json.clone(),
-            full_request_json: event.full_request_json.clone(),
-        })
-        .into_response(),
-        Ok(None) => not_found("LLM gateway usage event not found").into_response(),
-        Err(_) => internal_error("Failed to load llm gateway usage event").into_response(),
+    proxy_usage_query(&state, &uri).await
+}
+
+pub(crate) async fn get_usage_journal_status(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+) -> Response {
+    if let Err(response) = ensure_admin_access(&headers) {
+        return response.into_response();
     }
+    let config = match state.admin_config_store.get_admin_runtime_config().await {
+        Ok(config) => config,
+        Err(_) => return internal_error("Failed to load llm gateway config").into_response(),
+    };
+    let mut journal = match producer_journal_status(&state) {
+        Ok(status) => status,
+        Err(err) => {
+            tracing::warn!("failed to load usage journal producer status: {err:#}");
+            return internal_error("Failed to load usage journal status").into_response();
+        },
+    };
+    journal.journal_enabled = config.usage_journal_enabled;
+    if journal.journal_root.is_empty() {
+        journal.journal_root = state
+            .usage_journal_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+    }
+    let now = now_ms();
+    let worker = usage_worker_status(&config.usage_query_base_url, now).await;
+    Json(AdminUsageJournalStatusResponse {
+        journal_enabled: journal.journal_enabled,
+        journal_root: journal.journal_root,
+        active_file_sequence: journal.active_file_sequence,
+        active_file_bytes: journal.active_file_bytes,
+        sealed_file_count: journal.sealed_file_count,
+        sealed_bytes: journal.sealed_bytes,
+        oldest_sealed_age_ms: journal.oldest_sealed_age_ms,
+        dropped_files_total: journal.dropped_files_total,
+        dropped_unconsumed_files_total: journal.dropped_unconsumed_files_total,
+        write_failures_total: journal.write_failures_total,
+        usage_query_base_url: config.usage_query_base_url,
+        worker,
+        generated_at: now,
+    })
+    .into_response()
 }
 
 pub(crate) async fn list_llm_gateway_accounts(
@@ -1617,41 +1589,25 @@ pub(crate) async fn delete_admin_kiro_account_group(
 pub(crate) async fn list_admin_kiro_usage_events(
     State(state): State<HttpState>,
     headers: HeaderMap,
-    Query(request): Query<ListUsageEventsRequest>,
+    OriginalUri(uri): OriginalUri,
 ) -> Response {
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
     }
-    let query = match normalize_provider_usage_query(request, PROVIDER_KIRO) {
-        Ok(query) => query,
-        Err(response) => return response.into_response(),
-    };
     let _permit = match acquire_admin_usage_query_permit(&state) {
         Ok(permit) => permit,
         Err(response) => return response.into_response(),
     };
-    let activity = state.request_activity.snapshot(query.key_id.as_deref());
-    match state.usage_analytics_store.list_usage_events(query).await {
-        Ok(page) => Json(AdminUsageEventsResponse {
-            total: page.total,
-            offset: page.offset,
-            limit: page.limit,
-            has_more: page.has_more,
-            current_rpm: activity.rpm,
-            current_in_flight: activity.in_flight,
-            events: page.events.iter().map(AdminUsageEventView::from).collect(),
-            generated_at: now_ms(),
-        })
-        .into_response(),
-        Err(_) => internal_error("Failed to list Kiro gateway usage events").into_response(),
-    }
+    proxy_usage_query(&state, &uri).await
 }
 
 pub(crate) async fn get_admin_kiro_usage_event(
     State(state): State<HttpState>,
     headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
     Path(event_id): Path<String>,
 ) -> Response {
+    let _ = event_id;
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
     }
@@ -1659,20 +1615,7 @@ pub(crate) async fn get_admin_kiro_usage_event(
         Ok(permit) => permit,
         Err(response) => return response.into_response(),
     };
-    match state.usage_analytics_store.get_usage_event(&event_id).await {
-        Ok(Some(event)) if event.provider_type.as_storage_str() == PROVIDER_KIRO => {
-            Json(AdminUsageEventDetailView {
-                event: AdminUsageEventView::from(&event),
-                request_headers_json: event.request_headers_json.clone(),
-                client_request_body_json: event.client_request_body_json.clone(),
-                upstream_request_body_json: event.upstream_request_body_json.clone(),
-                full_request_json: event.full_request_json.clone(),
-            })
-            .into_response()
-        },
-        Ok(_) => not_found("Kiro gateway usage event not found").into_response(),
-        Err(_) => internal_error("Failed to load Kiro gateway usage event").into_response(),
-    }
+    proxy_usage_query(&state, &uri).await
 }
 
 pub(crate) async fn list_admin_kiro_accounts(
@@ -3039,46 +2982,6 @@ fn normalize_review_queue_query(
     }
 }
 
-fn normalize_usage_query(
-    request: ListUsageEventsRequest,
-) -> Result<UsageEventQuery, AdminHttpError> {
-    let (start_ms, end_ms) = normalize_usage_time_range(request.start_ms, request.end_ms);
-    let source = match request
-        .source
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    {
-        Some(value) => UsageEventSource::from_query_value(value)
-            .ok_or_else(|| bad_request("source must be one of hot, archive, or all"))?,
-        None => UsageEventSource::Hot,
-    };
-    Ok(UsageEventQuery {
-        key_id: request
-            .key_id
-            .and_then(|key_id| normalize_optional_string(&key_id)),
-        provider_type: None,
-        source,
-        start_ms,
-        end_ms,
-        limit: request
-            .limit
-            .unwrap_or(DEFAULT_ADMIN_USAGE_LIMIT)
-            .clamp(1, MAX_ADMIN_USAGE_LIMIT),
-        offset: request.offset.unwrap_or(0).min(MAX_ADMIN_USAGE_OFFSET),
-    })
-}
-
-fn normalize_provider_usage_query(
-    request: ListUsageEventsRequest,
-    provider_type: &str,
-) -> Result<UsageEventQuery, AdminHttpError> {
-    Ok(UsageEventQuery {
-        provider_type: Some(provider_type.to_string()),
-        ..normalize_usage_query(request)?
-    })
-}
-
 fn acquire_admin_usage_query_permit(
     state: &HttpState,
 ) -> Result<OwnedSemaphorePermit, AdminHttpError> {
@@ -3087,16 +2990,226 @@ fn acquire_admin_usage_query_permit(
         .map_err(|_| too_many_requests("Another admin usage query is already running"))
 }
 
-fn normalize_usage_time_range(
-    start_ms: Option<i64>,
-    end_ms: Option<i64>,
-) -> (Option<i64>, Option<i64>) {
-    let start_ms = start_ms.filter(|value| *value > 0);
-    let end_ms = end_ms.filter(|value| *value > 0);
-    match (start_ms, end_ms) {
-        (Some(start), Some(end)) if start >= end => (Some(start), Some(start.saturating_add(1))),
-        other => other,
+fn producer_journal_status(state: &HttpState) -> anyhow::Result<JournalStatusSnapshot> {
+    #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
+    if let Some(sink) = &state.usage_journal_sink {
+        return sink.status_snapshot();
     }
+    inspect_journal_dir(state.usage_journal_dir.as_deref())
+}
+
+fn inspect_journal_dir(root: Option<&FsPath>) -> anyhow::Result<JournalStatusSnapshot> {
+    let Some(root) = root else {
+        return Ok(JournalStatusSnapshot::default());
+    };
+    let active = active_journal_stats(&root.join("active"))?;
+    let sealed = sealed_journal_stats(&root.join("sealed"))?;
+    Ok(JournalStatusSnapshot {
+        journal_enabled: true,
+        journal_root: root.display().to_string(),
+        active_file_sequence: active.file_sequence,
+        active_file_bytes: active.bytes,
+        sealed_file_count: sealed.file_count,
+        sealed_bytes: sealed.bytes,
+        oldest_sealed_age_ms: sealed.oldest_age_ms,
+        dropped_files_total: 0,
+        dropped_unconsumed_files_total: 0,
+        write_failures_total: 0,
+    })
+}
+
+#[derive(Default)]
+struct ActiveJournalStats {
+    file_sequence: Option<u64>,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct JournalDirStats {
+    file_count: u64,
+    bytes: u64,
+    oldest_age_ms: Option<i64>,
+}
+
+fn active_journal_stats(dir: &FsPath) -> anyhow::Result<ActiveJournalStats> {
+    if !dir.exists() {
+        return Ok(ActiveJournalStats::default());
+    }
+    let mut stats = ActiveJournalStats::default();
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("failed to read active journal dir `{}`", dir.display()))?
+    {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some(sequence) = journal_file_sequence(&entry.path()) else {
+            continue;
+        };
+        if stats
+            .file_sequence
+            .is_none_or(|current| sequence >= current)
+        {
+            stats.file_sequence = Some(sequence);
+            stats.bytes = metadata.len();
+        }
+    }
+    Ok(stats)
+}
+
+fn sealed_journal_stats(dir: &FsPath) -> anyhow::Result<JournalDirStats> {
+    if !dir.exists() {
+        return Ok(JournalDirStats::default());
+    }
+    let mut stats = JournalDirStats::default();
+    for entry in fs::read_dir(dir)
+        .with_context(|| format!("failed to read sealed journal dir `{}`", dir.display()))?
+    {
+        let entry = entry?;
+        let metadata = entry.metadata()?;
+        if !metadata.is_file() {
+            continue;
+        }
+        stats.file_count = stats.file_count.saturating_add(1);
+        stats.bytes = stats.bytes.saturating_add(metadata.len());
+        if let Some(age_ms) = file_age_ms(&metadata) {
+            stats.oldest_age_ms = Some(
+                stats
+                    .oldest_age_ms
+                    .map_or(age_ms, |current| current.max(age_ms)),
+            );
+        }
+    }
+    Ok(stats)
+}
+
+fn journal_file_sequence(path: &FsPath) -> Option<u64> {
+    let file_name = path.file_name()?.to_string_lossy();
+    let suffix = file_name.strip_prefix("usage-")?;
+    let digits = suffix
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .collect::<String>();
+    digits.parse().ok()
+}
+
+fn file_age_ms(metadata: &fs::Metadata) -> Option<i64> {
+    let modified = metadata.modified().ok()?;
+    let modified_ms = modified
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis()
+        .min(i64::MAX as u128) as i64;
+    Some(now_ms().saturating_sub(modified_ms))
+}
+
+async fn usage_worker_status(base_url: &str, now: i64) -> AdminUsageWorkerProgressView {
+    let url = format!("{}/admin/llm-access/usage-worker/status", base_url.trim_end_matches('/'));
+    let client = match reqwest::Client::builder()
+        .timeout(Duration::from_secs(2))
+        .build()
+    {
+        Ok(client) => client,
+        Err(err) => return unreachable_worker_view(now, err.to_string()),
+    };
+    let response = match client.get(&url).send().await {
+        Ok(response) => response,
+        Err(err) => return unreachable_worker_view(now, err.to_string()),
+    };
+    if !response.status().is_success() {
+        return unreachable_worker_view(now, format!("worker returned {}", response.status()));
+    }
+    match response.json::<WorkerProgressSnapshot>().await {
+        Ok(progress) => worker_progress_view(progress, now),
+        Err(err) => unreachable_worker_view(now, err.to_string()),
+    }
+}
+
+fn worker_progress_view(
+    progress: WorkerProgressSnapshot,
+    now: i64,
+) -> AdminUsageWorkerProgressView {
+    AdminUsageWorkerProgressView {
+        state: progress.state,
+        current_file_path: progress.current_file_path,
+        current_file_sequence: progress.current_file_sequence,
+        processed_blocks: progress.processed_blocks,
+        total_blocks: progress.total_blocks,
+        processed_events: progress.processed_events,
+        total_events: progress.total_events,
+        processed_compressed_bytes: progress.processed_compressed_bytes,
+        total_compressed_bytes: progress.total_compressed_bytes,
+        progress_percent: progress.progress_percent,
+        import_rate_events_per_second: progress.import_rate_events_per_second,
+        heartbeat_age_ms: progress
+            .heartbeat_at_ms
+            .map(|heartbeat| now.saturating_sub(heartbeat)),
+        last_successful_file_sequence: progress.last_successful_file_sequence,
+        last_successful_import_at_ms: progress.last_successful_import_at_ms,
+        last_error: progress.last_error,
+        last_error_at_ms: progress.last_error_at_ms,
+    }
+}
+
+fn unreachable_worker_view(now: i64, error: String) -> AdminUsageWorkerProgressView {
+    worker_progress_view(
+        WorkerProgressSnapshot {
+            state: "unreachable".to_string(),
+            last_error: Some(error),
+            last_error_at_ms: Some(now),
+            ..WorkerProgressSnapshot::default()
+        },
+        now,
+    )
+}
+
+async fn proxy_usage_query(state: &HttpState, uri: &Uri) -> Response {
+    let config = match state.admin_config_store.get_admin_runtime_config().await {
+        Ok(config) => config,
+        Err(_) => return internal_error("Failed to load llm gateway config").into_response(),
+    };
+    let base = config.usage_query_base_url.trim_end_matches('/');
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or(uri.path());
+    let url = format!("{base}{path_and_query}");
+    let response = match reqwest::Client::new().get(&url).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(url = %url, "usage worker query proxy failed: {err:#}");
+            return (
+                StatusCode::SERVICE_UNAVAILABLE,
+                Json(ErrorResponse {
+                    error: "Usage worker is unavailable".to_string(),
+                    code: StatusCode::SERVICE_UNAVAILABLE.as_u16(),
+                }),
+            )
+                .into_response();
+        },
+    };
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let content_type = response
+        .headers()
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string);
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(url = %url, "failed to read usage worker response: {err:#}");
+            return internal_error("Failed to read usage worker response").into_response();
+        },
+    };
+    let mut builder = Response::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder
+        .body(Body::from(bytes))
+        .unwrap_or_else(|_| internal_error("Failed to build usage worker response").into_response())
 }
 
 fn review_queue_action(request: ReviewQueueActionRequest) -> AdminReviewQueueAction {
@@ -3449,101 +3562,6 @@ fn codex_import_job_success_result(
         failed_delta: 0,
         updated_at_ms: now_ms(),
     }
-}
-
-impl From<&UsageEvent> for AdminUsageEventView {
-    fn from(value: &UsageEvent) -> Self {
-        let latency_ms = usage_latency_ms(value);
-        Self {
-            id: value.event_id.clone(),
-            key_id: value.key_id.clone(),
-            key_name: value.key_name.clone(),
-            account_name: value.account_name.clone(),
-            request_method: value.request_method.clone(),
-            request_url: value.request_url.clone(),
-            latency_ms,
-            routing_wait_ms: optional_i64_to_i32(value.timing.routing_wait_ms),
-            upstream_headers_ms: optional_i64_to_i32(value.timing.upstream_headers_ms),
-            post_headers_body_ms: optional_i64_to_i32(value.timing.post_headers_body_ms),
-            request_body_bytes: value.request_body_bytes.and_then(non_negative_i64_to_u64),
-            request_body_read_ms: optional_i64_to_i32(value.timing.request_body_read_ms),
-            request_json_parse_ms: optional_i64_to_i32(value.timing.request_json_parse_ms),
-            pre_handler_ms: optional_i64_to_i32(value.timing.pre_handler_ms),
-            first_sse_write_ms: optional_i64_to_i32(value.timing.first_sse_write_ms),
-            stream_finish_ms: optional_i64_to_i32(value.timing.stream_finish_ms),
-            stream_completed_cleanly: value.stream.stream_completed_cleanly,
-            downstream_disconnect: value.stream.downstream_disconnect,
-            final_event_type: value.stream.final_event_type.clone(),
-            bytes_streamed: value
-                .stream
-                .bytes_streamed
-                .and_then(non_negative_i64_to_u64),
-            other_latency_ms: compute_other_latency_ms(
-                latency_ms,
-                optional_i64_to_i32(value.timing.routing_wait_ms),
-                optional_i64_to_i32(value.timing.upstream_headers_ms),
-                optional_i64_to_i32(value.timing.post_headers_body_ms),
-            ),
-            quota_failover_count: value.quota_failover_count,
-            routing_diagnostics_json: value.routing_diagnostics_json.clone(),
-            endpoint: value.endpoint.clone(),
-            model: value.model.clone(),
-            status_code: value.status_code.clamp(0, i64::from(i32::MAX)) as i32,
-            input_uncached_tokens: non_negative_i64_to_u64(value.input_uncached_tokens)
-                .unwrap_or(0),
-            input_cached_tokens: non_negative_i64_to_u64(value.input_cached_tokens).unwrap_or(0),
-            output_tokens: non_negative_i64_to_u64(value.output_tokens).unwrap_or(0),
-            billable_tokens: non_negative_i64_to_u64(value.billable_tokens).unwrap_or(0),
-            usage_missing: value.usage_missing,
-            credit_usage: value
-                .credit_usage
-                .as_deref()
-                .and_then(|raw| raw.parse::<f64>().ok()),
-            credit_usage_missing: value.credit_usage_missing,
-            client_ip: value.client_ip.clone(),
-            ip_region: value.ip_region.clone(),
-            last_message_content: value.last_message_content.clone(),
-            created_at: value.created_at_ms,
-        }
-    }
-}
-
-fn usage_latency_ms(value: &UsageEvent) -> i32 {
-    let latency = value.timing.latency_ms.or_else(|| {
-        value.timing.stream_finish_ms.or_else(|| {
-            match (value.timing.upstream_headers_ms, value.timing.post_headers_body_ms) {
-                (Some(headers), Some(body)) => Some(headers.saturating_add(body)),
-                _ => None,
-            }
-        })
-    });
-    optional_i64_to_i32(latency).unwrap_or(0)
-}
-
-fn optional_i64_to_i32(value: Option<i64>) -> Option<i32> {
-    value.map(|value| value.clamp(0, i64::from(i32::MAX)) as i32)
-}
-
-fn non_negative_i64_to_u64(value: i64) -> Option<u64> {
-    u64::try_from(value.max(0)).ok()
-}
-
-fn compute_other_latency_ms(
-    latency_ms: i32,
-    routing_wait_ms: Option<i32>,
-    upstream_headers_ms: Option<i32>,
-    post_headers_body_ms: Option<i32>,
-) -> Option<i32> {
-    if routing_wait_ms.is_none() && upstream_headers_ms.is_none() && post_headers_body_ms.is_none()
-    {
-        return None;
-    }
-    let measured_ms: i64 = [routing_wait_ms, upstream_headers_ms, post_headers_body_ms]
-        .into_iter()
-        .flatten()
-        .map(|value| i64::from(value.max(0)))
-        .sum();
-    Some((i64::from(latency_ms.max(0)) - measured_ms).clamp(0, i64::from(i32::MAX)) as i32)
 }
 
 async fn run_proxy_connectivity_check(
@@ -4807,37 +4825,6 @@ mod tests {
         assert!(err
             .message
             .contains("duckdb_usage_checkpoint_threshold_mib"));
-    }
-
-    #[test]
-    fn normalize_usage_query_accepts_explicit_archive_source() {
-        let query = normalize_usage_query(ListUsageEventsRequest {
-            key_id: None,
-            start_ms: None,
-            end_ms: None,
-            source: Some("archive".to_string()),
-            limit: Some(20),
-            offset: Some(0),
-        })
-        .expect("archive source should be valid");
-
-        assert_eq!(query.source, UsageEventSource::Archive);
-    }
-
-    #[test]
-    fn normalize_usage_query_rejects_unknown_source() {
-        let err = normalize_usage_query(ListUsageEventsRequest {
-            key_id: None,
-            start_ms: None,
-            end_ms: None,
-            source: Some("broad-scan".to_string()),
-            limit: Some(20),
-            offset: Some(0),
-        })
-        .expect_err("unknown usage source should fail");
-
-        assert_eq!(err.status, StatusCode::BAD_REQUEST);
-        assert!(err.message.contains("source must be one of"));
     }
 
     #[test]

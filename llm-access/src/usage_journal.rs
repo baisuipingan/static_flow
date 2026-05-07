@@ -24,7 +24,6 @@ pub(crate) trait JournalUsageWriter: Send {
     fn append_usage_events(&mut self, events: &[UsageEvent]) -> anyhow::Result<()>;
 
     /// Build a status snapshot.
-    #[allow(dead_code, reason = "used by the upcoming usage journal status endpoint")]
     fn status_snapshot(&self, write_failures_total: u64) -> anyhow::Result<JournalStatusSnapshot>;
 }
 
@@ -59,7 +58,6 @@ impl JournalUsageEventSink {
     }
 
     /// Return producer-side journal status.
-    #[allow(dead_code, reason = "used by the upcoming usage journal status endpoint")]
     pub(crate) fn status_snapshot(&self) -> anyhow::Result<JournalStatusSnapshot> {
         let writer = self
             .writer
@@ -96,6 +94,7 @@ impl UsageEventSink for JournalUsageEventSink {
 }
 
 struct DiskJournalUsageWriter {
+    enabled: bool,
     config: JournalConfig,
     writer: JournalWriter,
 }
@@ -104,6 +103,7 @@ impl DiskJournalUsageWriter {
     fn open(root_dir: PathBuf, runtime_config: &AdminRuntimeConfig) -> anyhow::Result<Self> {
         let config = journal_config_from_runtime(root_dir, runtime_config);
         Ok(Self {
+            enabled: runtime_config.usage_journal_enabled,
             writer: JournalWriter::open(config.clone())?,
             config,
         })
@@ -119,6 +119,9 @@ impl DiskJournalUsageWriter {
 
 impl JournalUsageWriter for DiskJournalUsageWriter {
     fn append_usage_events(&mut self, events: &[UsageEvent]) -> anyhow::Result<()> {
+        if !self.enabled {
+            return Ok(());
+        }
         self.writer.append_events(events)?;
         self.writer.flush()?;
         if self.should_seal()? {
@@ -134,7 +137,7 @@ impl JournalUsageWriter for DiskJournalUsageWriter {
     fn status_snapshot(&self, write_failures_total: u64) -> anyhow::Result<JournalStatusSnapshot> {
         let sealed = sealed_stats(&self.config.root_dir)?;
         Ok(JournalStatusSnapshot {
-            journal_enabled: true,
+            journal_enabled: self.enabled,
             journal_root: self.config.root_dir.display().to_string(),
             active_file_sequence: Some(self.writer.active_file_sequence()),
             active_file_bytes: self.writer.active_file_bytes().unwrap_or(0),
@@ -174,14 +177,12 @@ fn journal_config_from_runtime(
 }
 
 #[derive(Default)]
-#[allow(dead_code, reason = "used by the upcoming usage journal status endpoint")]
 struct SealedJournalStats {
     file_count: u64,
     bytes: u64,
     oldest_age_ms: Option<i64>,
 }
 
-#[allow(dead_code, reason = "used by the upcoming usage journal status endpoint")]
 fn sealed_stats(root_dir: &Path) -> anyhow::Result<SealedJournalStats> {
     let sealed_dir = root_dir.join("sealed");
     if !sealed_dir.exists() {

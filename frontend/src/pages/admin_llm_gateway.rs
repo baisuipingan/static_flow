@@ -27,19 +27,19 @@ use crate::{
         fetch_admin_llm_gateway_proxy_bindings, fetch_admin_llm_gateway_proxy_configs,
         fetch_admin_llm_gateway_sponsor_requests, fetch_admin_llm_gateway_token_requests,
         fetch_admin_llm_gateway_usage_event_detail, fetch_admin_llm_gateway_usage_events,
-        import_admin_legacy_kiro_proxy_configs, import_admin_llm_gateway_account,
-        patch_admin_llm_gateway_account, patch_admin_llm_gateway_account_group,
-        patch_admin_llm_gateway_key, patch_admin_llm_gateway_proxy_config,
-        refresh_admin_llm_gateway_account, update_admin_llm_gateway_config,
-        update_admin_llm_gateway_proxy_binding, AccountSummaryView, AdminAccountGroupView,
-        AdminLlmGatewayAccountContributionRequestView,
+        fetch_admin_usage_journal_status, import_admin_legacy_kiro_proxy_configs,
+        import_admin_llm_gateway_account, patch_admin_llm_gateway_account,
+        patch_admin_llm_gateway_account_group, patch_admin_llm_gateway_key,
+        patch_admin_llm_gateway_proxy_config, refresh_admin_llm_gateway_account,
+        update_admin_llm_gateway_config, update_admin_llm_gateway_proxy_binding,
+        AccountSummaryView, AdminAccountGroupView, AdminLlmGatewayAccountContributionRequestView,
         AdminLlmGatewayAccountContributionRequestsQuery, AdminLlmGatewayKeyView,
         AdminLlmGatewaySponsorRequestView, AdminLlmGatewaySponsorRequestsQuery,
         AdminLlmGatewayTokenRequestView, AdminLlmGatewayTokenRequestsQuery,
         AdminLlmGatewayUsageEventDetailView, AdminLlmGatewayUsageEventView,
         AdminLlmGatewayUsageEventsQuery, AdminUpstreamProxyBindingView,
         AdminUpstreamProxyCheckResponse, AdminUpstreamProxyCheckTargetView,
-        AdminUpstreamProxyConfigView, CodexAccountImportJobDetailView,
+        AdminUpstreamProxyConfigView, AdminUsageJournalStatusView, CodexAccountImportJobDetailView,
         CodexAccountImportJobSummaryView, CreateAdminAccountGroupInput,
         CreateAdminUpstreamProxyConfigInput, LlmGatewayRuntimeConfig, PatchAdminAccountGroupInput,
         PatchAdminLlmGatewayAccountInput, PatchAdminLlmGatewayKeyRequest,
@@ -291,6 +291,30 @@ fn format_optional_bytes(bytes: Option<u64>) -> String {
         format!("{:.1} KiB", bytes as f64 / 1024.0)
     } else {
         format!("{bytes} B")
+    }
+}
+
+fn format_optional_duration_ms(age_ms: Option<i64>) -> String {
+    let Some(age_ms) = age_ms.filter(|value| *value >= 0) else {
+        return "-".to_string();
+    };
+    if age_ms >= 3_600_000 {
+        format!("{:.1} h", age_ms as f64 / 3_600_000.0)
+    } else if age_ms >= 60_000 {
+        format!("{:.1} min", age_ms as f64 / 60_000.0)
+    } else if age_ms >= 1_000 {
+        format!("{:.1} s", age_ms as f64 / 1_000.0)
+    } else {
+        format!("{age_ms} ms")
+    }
+}
+
+fn usage_worker_state_tone(state: &str) -> &'static str {
+    match state {
+        "idle" => "bg-emerald-500/12 text-emerald-700 dark:text-emerald-200",
+        "importing" => "bg-sky-500/12 text-sky-700 dark:text-sky-200",
+        "unreachable" => "bg-red-500/12 text-red-700 dark:text-red-200",
+        _ => "bg-slate-500/12 text-slate-700 dark:text-slate-200",
     }
 }
 
@@ -1906,6 +1930,9 @@ pub fn admin_llm_gateway_page() -> Html {
     let usage_key_search = use_state(String::new);
     let usage_time_range = use_state(|| USAGE_TIME_RANGE_ALL.to_string());
     let usage_source = use_state(|| USAGE_SOURCE_HOT.to_string());
+    let usage_journal_status = use_state(|| None::<AdminUsageJournalStatusView>);
+    let usage_journal_loading = use_state(|| false);
+    let usage_journal_error = use_state(|| None::<String>);
     let token_requests = use_state(Vec::<AdminLlmGatewayTokenRequestView>::new);
     let token_request_total = use_state(|| 0_usize);
     let token_request_page = use_state(|| 1_usize);
@@ -2099,6 +2126,28 @@ pub fn admin_llm_gateway_page() -> Html {
                 });
             },
         )
+    };
+
+    let reload_usage_journal_status = {
+        let usage_journal_status = usage_journal_status.clone();
+        let usage_journal_loading = usage_journal_loading.clone();
+        let usage_journal_error = usage_journal_error.clone();
+        Callback::from(move |_| {
+            let usage_journal_status = usage_journal_status.clone();
+            let usage_journal_loading = usage_journal_loading.clone();
+            let usage_journal_error = usage_journal_error.clone();
+            usage_journal_loading.set(true);
+            wasm_bindgen_futures::spawn_local(async move {
+                match fetch_admin_usage_journal_status().await {
+                    Ok(status) => {
+                        usage_journal_status.set(Some(status));
+                        usage_journal_error.set(None);
+                    },
+                    Err(err) => usage_journal_error.set(Some(err)),
+                }
+                usage_journal_loading.set(false);
+            });
+        })
     };
 
     let reload_token_requests = {
@@ -2458,12 +2507,24 @@ pub fn admin_llm_gateway_page() -> Html {
         let reload_token_requests = reload_token_requests.clone();
         let reload_account_contribution_requests = reload_account_contribution_requests.clone();
         let reload_sponsor_requests = reload_sponsor_requests.clone();
+        let reload_usage_journal_status = reload_usage_journal_status.clone();
         use_effect_with((), move |_| {
             reload.emit(());
+            reload_usage_journal_status.emit(());
             reload_token_requests.emit((Some(1), Some(String::new())));
             reload_account_contribution_requests.emit((Some(1), Some(String::new())));
             reload_sponsor_requests.emit((Some(1), Some(String::new())));
             || ()
+        });
+    }
+
+    {
+        let reload_usage_journal_status = reload_usage_journal_status.clone();
+        use_effect_with((), move |_| {
+            let interval = Interval::new(5_000, move || {
+                reload_usage_journal_status.emit(());
+            });
+            move || drop(interval)
         });
     }
 
@@ -4655,6 +4716,102 @@ pub fn admin_llm_gateway_page() -> Html {
                 // ── Settings Tab ──
                 if *active_tab == TAB_SETTINGS {
                 <section class={classes!("grid", "gap-4", "xl:grid-cols-2")}>
+                    <section class={classes!("rounded-xl", "border", "border-[var(--border)]", "bg-[var(--surface)]", "p-5", "xl:col-span-2")}>
+                        <div class={classes!("flex", "items-start", "justify-between", "gap-3", "flex-wrap")}>
+                            <div>
+                                <h2 class={classes!("m-0", "font-mono", "text-base", "font-bold", "text-[var(--text)]")}>{ "Usage Journal Worker" }</h2>
+                                <p class={classes!("mt-2", "mb-0", "text-sm", "text-[var(--muted)]")}>
+                                    { "API writes local journal files; the worker imports sealed files into DuckDB on the independent query port." }
+                                </p>
+                            </div>
+                            <button
+                                class={classes!("btn-terminal", "btn-terminal-secondary")}
+                                onclick={{
+                                    let reload_usage_journal_status = reload_usage_journal_status.clone();
+                                    Callback::from(move |_| reload_usage_journal_status.emit(()))
+                                }}
+                                disabled={*usage_journal_loading}
+                            >
+                                { if *usage_journal_loading { "刷新中..." } else { "刷新状态" } }
+                            </button>
+                        </div>
+
+                        if let Some(status) = (*usage_journal_status).clone() {
+                            <div class={classes!("mt-4", "grid", "gap-3", "md:grid-cols-2", "xl:grid-cols-4")}>
+                                <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--bg)]", "p-3")}>
+                                    <div class={classes!("font-mono", "text-[11px]", "uppercase", "tracking-widest", "text-[var(--muted)]")}>{ "worker" }</div>
+                                    <div class={classes!("mt-2", "flex", "items-center", "gap-2", "flex-wrap")}>
+                                        <span class={classes!("rounded-full", "px-2.5", "py-1", "font-mono", "text-[11px]", "font-semibold", usage_worker_state_tone(&status.worker.state))}>
+                                            { status.worker.state.clone() }
+                                        </span>
+                                        <span class={classes!("text-xs", "text-[var(--muted)]")}>
+                                            { format!("heartbeat {}", format_optional_duration_ms(status.worker.heartbeat_age_ms)) }
+                                        </span>
+                                    </div>
+                                </div>
+                                <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--bg)]", "p-3")}>
+                                    <div class={classes!("font-mono", "text-[11px]", "uppercase", "tracking-widest", "text-[var(--muted)]")}>{ "sealed backlog" }</div>
+                                    <div class={classes!("mt-1", "font-mono", "text-2xl", "font-black", if status.sealed_file_count > 0 { "text-amber-600" } else { "text-emerald-600" })}>
+                                        { status.sealed_file_count }
+                                    </div>
+                                    <div class={classes!("text-xs", "text-[var(--muted)]")}>
+                                        { format!("{} · oldest {}", format_optional_bytes(Some(status.sealed_bytes)), format_optional_duration_ms(status.oldest_sealed_age_ms)) }
+                                    </div>
+                                </div>
+                                <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--bg)]", "p-3")}>
+                                    <div class={classes!("font-mono", "text-[11px]", "uppercase", "tracking-widest", "text-[var(--muted)]")}>{ "active file" }</div>
+                                    <div class={classes!("mt-1", "font-mono", "text-lg", "font-bold")}>
+                                        { status.active_file_sequence.map(|seq| format!("#{seq}")).unwrap_or_else(|| "-".to_string()) }
+                                    </div>
+                                    <div class={classes!("text-xs", "text-[var(--muted)]")}>
+                                        { format_optional_bytes(Some(status.active_file_bytes)) }
+                                    </div>
+                                </div>
+                                <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--bg)]", "p-3")}>
+                                    <div class={classes!("font-mono", "text-[11px]", "uppercase", "tracking-widest", "text-[var(--muted)]")}>{ "import progress" }</div>
+                                    <div class={classes!("mt-1", "font-mono", "text-lg", "font-bold")}>
+                                        { format!("{:.1}%", status.worker.progress_percent) }
+                                    </div>
+                                    <div class={classes!("text-xs", "text-[var(--muted)]")}>
+                                        { format!(
+                                            "{} / {} events · {} / {}",
+                                            format_number_u64(status.worker.processed_events),
+                                            format_number_u64(status.worker.total_events),
+                                            format_optional_bytes(Some(status.worker.processed_compressed_bytes)),
+                                            format_optional_bytes(Some(status.worker.total_compressed_bytes)),
+                                        ) }
+                                    </div>
+                                </div>
+                            </div>
+                            <div class={classes!("mt-3", "grid", "gap-2", "text-xs", "text-[var(--muted)]", "xl:grid-cols-2")}>
+                                <p class={classes!("m-0", "break-all")}>
+                                    { format!("journal_root: {}", status.journal_root) }
+                                </p>
+                                <p class={classes!("m-0", "break-all")}>
+                                    { format!("usage_query_base_url: {}", status.usage_query_base_url) }
+                                </p>
+                                if let Some(path) = status.worker.current_file_path.as_deref() {
+                                    <p class={classes!("m-0", "break-all")}>
+                                        { format!("current_file: {path}") }
+                                    </p>
+                                }
+                                if let Some(error) = status.worker.last_error.as_deref() {
+                                    <p class={classes!("m-0", "break-all", "text-red-600", "dark:text-red-300")}>
+                                        { format!("worker_error: {error}") }
+                                    </p>
+                                }
+                            </div>
+                        } else if let Some(error) = (*usage_journal_error).clone() {
+                            <div class={classes!("mt-4", "rounded-lg", "border", "border-red-500/30", "bg-red-500/10", "p-3", "text-sm", "text-red-700", "dark:text-red-200")}>
+                                { error }
+                            </div>
+                        } else {
+                            <div class={classes!("mt-4", "text-sm", "text-[var(--muted)]")}>
+                                { "尚未加载 usage journal 状态。" }
+                            </div>
+                        }
+                    </section>
+
                 <section class={classes!("rounded-xl", "border", "border-[var(--border)]", "bg-[var(--surface)]", "p-5")}>
                         <div class={classes!("flex", "items-start", "justify-between", "gap-3", "flex-wrap")}>
                             <div>

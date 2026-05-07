@@ -24,10 +24,11 @@ mod support;
 /// Usage-event helpers.
 pub mod usage;
 mod usage_journal;
+pub mod usage_query;
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 pub mod usage_worker;
 
-use std::sync::Arc;
+use std::{path::PathBuf, sync::Arc};
 
 use anyhow::Context;
 use axum::{
@@ -57,7 +58,6 @@ pub(crate) static KIRO_UPSTREAM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mute
 struct HttpState {
     provider_state: provider::ProviderState,
     geoip: geoip::GeoIpResolver,
-    request_activity: Arc<activity::RequestActivityTracker>,
     admin_config_store: Arc<dyn AdminConfigStore>,
     admin_key_store: Arc<dyn AdminKeyStore>,
     admin_account_group_store: Arc<dyn AdminAccountGroupStore>,
@@ -69,6 +69,9 @@ struct HttpState {
     public_community_store: Arc<dyn PublicCommunityStore>,
     public_usage_store: Arc<dyn PublicUsageStore>,
     usage_analytics_store: Arc<dyn UsageAnalyticsStore>,
+    usage_journal_dir: Option<PathBuf>,
+    #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
+    usage_journal_sink: Option<Arc<usage_journal::JournalUsageEventSink>>,
     admin_usage_query_gate: Arc<Semaphore>,
     public_submission_store: Arc<dyn PublicSubmissionStore>,
     public_submit_guard: Arc<submission::PublicSubmitGuard>,
@@ -123,7 +126,6 @@ pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
     let state = HttpState {
         provider_state,
         geoip,
-        request_activity,
         admin_config_store: runtime.admin_config_store(),
         admin_key_store: runtime.admin_key_store(),
         admin_account_group_store: runtime.admin_account_group_store(),
@@ -135,6 +137,9 @@ pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
         public_community_store: runtime.public_community_store(),
         public_usage_store: runtime.public_usage_store(),
         usage_analytics_store: runtime.usage_analytics_store(),
+        usage_journal_dir: runtime.usage_journal_dir(),
+        #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
+        usage_journal_sink: runtime.usage_journal_sink(),
         admin_usage_query_gate: Arc::new(Semaphore::new(1)),
         public_submission_store: runtime.public_submission_store(),
         public_submit_guard: Arc::new(submission::PublicSubmitGuard::default()),
@@ -212,6 +217,8 @@ pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
         )
         .route("/admin/llm-gateway/usage", get(admin::list_llm_gateway_usage_events))
         .route("/admin/llm-gateway/usage/:event_id", get(admin::get_llm_gateway_usage_event))
+        .route("/admin/llm-access/usage-journal/status", get(admin::get_usage_journal_status))
+        .route("/admin/llm-gateway/usage-journal/status", get(admin::get_usage_journal_status))
         .route("/admin/llm-gateway/token-requests", get(admin::list_llm_gateway_token_requests))
         .route(
             "/admin/llm-gateway/token-requests/:request_id/approve-and-issue",
@@ -433,23 +440,18 @@ async fn version() -> Json<VersionResponse> {
 mod tests {
     use std::{
         path::PathBuf,
-        sync::{
-            atomic::{AtomicUsize, Ordering},
-            Arc, Mutex,
-        },
+        sync::{Arc, Mutex},
     };
 
     use async_trait::async_trait;
     use axum::{
         body::{to_bytes, Body},
+        extract::Path,
         http::{header, Request, StatusCode},
         routing::get,
         Json, Router,
     };
-    use llm_access_core::store::{
-        AuthenticatedKey, ControlStore, UsageAnalyticsStore, UsageChartPoint, UsageEventPage,
-        UsageEventQuery,
-    };
+    use llm_access_core::store::{AuthenticatedKey, ControlStore};
     use serde_json::json;
     use tower::util::ServiceExt;
 
@@ -506,56 +508,6 @@ mod tests {
         assert!(response
             .headers()
             .contains_key(header::ACCESS_CONTROL_ALLOW_HEADERS));
-    }
-
-    struct BlockingUsageStore {
-        calls: Arc<AtomicUsize>,
-        entered: Arc<tokio::sync::Notify>,
-        release: Arc<tokio::sync::Notify>,
-    }
-
-    #[async_trait]
-    impl UsageAnalyticsStore for BlockingUsageStore {
-        async fn list_usage_events(
-            &self,
-            query: UsageEventQuery,
-        ) -> anyhow::Result<UsageEventPage> {
-            self.calls.fetch_add(1, Ordering::SeqCst);
-            self.entered.notify_one();
-            self.release.notified().await;
-            Ok(UsageEventPage {
-                total: 0,
-                offset: query.offset,
-                limit: query.limit,
-                has_more: false,
-                events: Vec::new(),
-            })
-        }
-
-        async fn get_usage_event(
-            &self,
-            _event_id: &str,
-        ) -> anyhow::Result<Option<llm_access_core::usage::UsageEvent>> {
-            Ok(None)
-        }
-
-        async fn usage_chart_points(
-            &self,
-            _key_id: &str,
-            _start_ms: i64,
-            _bucket_ms: i64,
-            _bucket_count: usize,
-        ) -> anyhow::Result<Vec<UsageChartPoint>> {
-            Ok(Vec::new())
-        }
-    }
-
-    fn test_router_with_usage_store(usage_store: Arc<dyn UsageAnalyticsStore>) -> axum::Router {
-        let runtime = crate::runtime::LlmAccessRuntime::new_with_usage_analytics_store_for_tests(
-            Arc::new(EmptyStore),
-            usage_store,
-        );
-        super::router(runtime)
     }
 
     async fn persistent_test_router(name: &str) -> (axum::Router, PathBuf) {
@@ -637,6 +589,122 @@ mod tests {
                 .expect("serve fake Kiro upstream");
         });
         upstream_base
+    }
+
+    async fn fake_usage_list() -> Json<serde_json::Value> {
+        Json(json!({
+            "total": 1,
+            "offset": 0,
+            "limit": 20,
+            "has_more": false,
+            "current_rpm": 0,
+            "current_in_flight": 0,
+            "events": [{
+                "id": "evt-proxied",
+                "key_id": "key-1",
+                "key_name": "for-yangshu",
+                "request_method": "POST",
+                "request_url": "/v1/chat/completions",
+                "latency_ms": 12,
+                "quota_failover_count": 0,
+                "endpoint": "/v1/chat/completions",
+                "model": "claude-opus-4-7",
+                "status_code": 200,
+                "input_uncached_tokens": 1,
+                "input_cached_tokens": 2,
+                "output_tokens": 3,
+                "billable_tokens": 4,
+                "usage_missing": false,
+                "credit_usage_missing": false,
+                "client_ip": "127.0.0.1",
+                "ip_region": "local",
+                "created_at": 1_700_000_000_000_i64
+            }],
+            "generated_at": 1_700_000_000_000_i64
+        }))
+    }
+
+    async fn fake_usage_detail(Path(event_id): Path<String>) -> Json<serde_json::Value> {
+        Json(json!({
+            "id": event_id,
+            "key_id": "key-1",
+            "key_name": "for-yangshu",
+            "request_method": "POST",
+            "request_url": "/v1/chat/completions",
+            "latency_ms": 12,
+            "quota_failover_count": 0,
+            "endpoint": "/v1/chat/completions",
+            "model": "claude-opus-4-7",
+            "status_code": 200,
+            "input_uncached_tokens": 1,
+            "input_cached_tokens": 2,
+            "output_tokens": 3,
+            "billable_tokens": 4,
+            "usage_missing": false,
+            "credit_usage_missing": false,
+            "client_ip": "127.0.0.1",
+            "ip_region": "local",
+            "created_at": 1_700_000_000_000_i64,
+            "request_headers_json": "{}"
+        }))
+    }
+
+    async fn fake_usage_worker_status() -> Json<serde_json::Value> {
+        Json(json!({
+            "state": "idle",
+            "current_file_path": null,
+            "current_file_sequence": null,
+            "processed_blocks": 0,
+            "total_blocks": 0,
+            "processed_events": 0,
+            "total_events": 0,
+            "processed_compressed_bytes": 0,
+            "total_compressed_bytes": 0,
+            "progress_percent": 0.0,
+            "import_rate_events_per_second": 0.0,
+            "heartbeat_at_ms": 1_700_000_000_000_i64,
+            "last_successful_file_sequence": null,
+            "last_successful_import_at_ms": null,
+            "last_error": null,
+            "last_error_at_ms": null
+        }))
+    }
+
+    async fn spawn_fake_usage_worker() -> String {
+        let app = Router::new()
+            .route("/admin/llm-gateway/usage", get(fake_usage_list))
+            .route("/admin/llm-gateway/usage/:event_id", get(fake_usage_detail))
+            .route("/admin/kiro-gateway/usage", get(fake_usage_list))
+            .route("/admin/kiro-gateway/usage/:event_id", get(fake_usage_detail))
+            .route("/admin/llm-access/usage-worker/status", get(fake_usage_worker_status));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake usage worker");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake usage worker");
+        });
+        upstream_base
+    }
+
+    async fn set_usage_query_base_url(router: &axum::Router, base_url: &str) {
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-gateway/config")
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(json!({ "usage_query_base_url": base_url }).to_string()))
+                    .expect("request"),
+            )
+            .await
+            .expect("config response");
+
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
@@ -1495,7 +1563,12 @@ mod tests {
 
     #[tokio::test]
     async fn router_serves_admin_llm_gateway_usage_for_local_request() {
-        let response = test_router()
+        let usage_worker_base = spawn_fake_usage_worker().await;
+        let (router, root) = persistent_test_router("usage-proxy").await;
+        set_usage_query_base_url(&router, &usage_worker_base).await;
+
+        let response = router
+            .clone()
             .oneshot(
                 Request::builder()
                     .uri("/admin/llm-gateway/usage")
@@ -1511,65 +1584,34 @@ mod tests {
             .await
             .expect("body");
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
-        assert_eq!(value["total"], 0);
-        assert_eq!(value["events"].as_array().expect("events array").len(), 0);
-    }
+        assert_eq!(value["total"], 1);
+        assert_eq!(value["events"][0]["id"], "evt-proxied");
 
-    #[tokio::test]
-    async fn router_rejects_concurrent_admin_usage_list_queries() {
-        let calls = Arc::new(AtomicUsize::new(0));
-        let entered = Arc::new(tokio::sync::Notify::new());
-        let release = Arc::new(tokio::sync::Notify::new());
-        let usage_store = Arc::new(BlockingUsageStore {
-            calls: Arc::clone(&calls),
-            entered: Arc::clone(&entered),
-            release: Arc::clone(&release),
-        });
-        let app = test_router_with_usage_store(usage_store);
-
-        let first_app = app.clone();
-        let first = tokio::spawn(async move {
-            first_app
-                .oneshot(
-                    Request::builder()
-                        .uri("/admin/llm-gateway/usage")
-                        .header(header::HOST, "localhost")
-                        .body(Body::empty())
-                        .expect("request"),
-                )
-                .await
-                .expect("first response")
-        });
-        entered.notified().await;
-
-        let second = tokio::time::timeout(
-            std::time::Duration::from_millis(100),
-            app.oneshot(
+        let response = router
+            .oneshot(
                 Request::builder()
-                    .uri("/admin/llm-gateway/usage")
+                    .uri("/admin/llm-gateway/usage/evt-proxied")
                     .header(header::HOST, "localhost")
                     .body(Body::empty())
                     .expect("request"),
-            ),
-        )
-        .await
-        .expect("concurrent usage query should return immediately")
-        .expect("second response");
+            )
+            .await
+            .expect("detail response");
 
-        assert_eq!(second.status(), StatusCode::TOO_MANY_REQUESTS);
-        assert_eq!(calls.load(Ordering::SeqCst), 1);
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
 
-        release.notify_one();
-        let first = first.await.expect("first task");
-        assert_eq!(first.status(), StatusCode::OK);
+        assert_eq!(response.status(), StatusCode::OK);
     }
 
     #[tokio::test]
-    async fn router_routes_admin_llm_gateway_usage_detail_to_store() {
-        let response = test_router()
+    async fn api_proxy_returns_503_when_usage_worker_is_unreachable() {
+        let (router, root) = persistent_test_router("usage-proxy-unreachable").await;
+        set_usage_query_base_url(&router, "http://127.0.0.1:9").await;
+
+        let response = router
             .oneshot(
                 Request::builder()
-                    .uri("/admin/llm-gateway/usage/missing")
+                    .uri("/admin/llm-gateway/usage")
                     .header(header::HOST, "localhost")
                     .body(Body::empty())
                     .expect("request"),
@@ -1577,12 +1619,40 @@ mod tests {
             .await
             .expect("response");
 
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
+
+        assert_eq!(response.status(), StatusCode::SERVICE_UNAVAILABLE);
+    }
+
+    #[tokio::test]
+    async fn combined_journal_status_returns_producer_state_when_worker_is_unreachable() {
+        let (router, root) = persistent_test_router("usage-journal-status").await;
+        set_usage_query_base_url(&router, "http://127.0.0.1:9").await;
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/llm-access/usage-journal/status")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
             .expect("body");
-        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
-        assert!(body.contains("LLM gateway usage event not found"));
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["journal_enabled"], true);
+        assert!(value["journal_root"]
+            .as_str()
+            .unwrap_or_default()
+            .ends_with("usage-journal"));
+        assert_eq!(value["worker"]["state"], "unreachable");
+
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
     }
 
     #[tokio::test]
