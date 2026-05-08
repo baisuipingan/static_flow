@@ -49,7 +49,6 @@ pub mod converter;
 pub mod stream;
 pub mod types;
 pub mod websearch;
-
 use static_flow_shared::llm_gateway_store::{
     compute_kiro_billable_tokens, KiroCachePolicy, LlmGatewayKeyRecord,
     DEFAULT_LLM_GATEWAY_MAX_REQUEST_BODY_BYTES,
@@ -2262,6 +2261,10 @@ async fn handle_stream_request_buffered(
 
 // Reads the full Kiro response body, decodes all events, assembles a
 // single JSON response with content blocks, and persists usage synchronously.
+//
+// This backend-integrated Kiro path is deprecated. Production traffic should
+// use the standalone llm-access service instead, so keep this code buildable
+// without mirroring every new llm-access-only event semantic here.
 async fn handle_non_stream_request(
     state: AppState,
     key_record: static_flow_shared::llm_gateway_store::LlmGatewayKeyRecord,
@@ -2348,6 +2351,7 @@ async fn handle_non_stream_request(
         match result {
             Ok(frame) => match Event::from_frame(frame) {
                 Ok(Event::AssistantResponse(event)) => text_content.push_str(&event.content),
+                Ok(Event::ReasoningContent(_)) => {},
                 Ok(Event::ToolUse(event)) => {
                     tool_use_orders
                         .entry(event.tool_use_id.clone())
