@@ -9,9 +9,9 @@ use std::{
 
 use anyhow::{anyhow, Context};
 use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
+use llm_access_core::store::UsageEventSink;
 use llm_access_store::duckdb::DuckDbUsageRepository;
 use llm_usage_journal::{JournalConsumerState, JournalReader, WorkerProgressSnapshot};
-use sha2::{Digest, Sha256};
 
 use crate::{
     process_memory::{read_current_process_memory_stats, ProcessMemoryStats},
@@ -20,6 +20,8 @@ use crate::{
         usage_chart_points, UsageQueryState,
     },
 };
+
+const WORKER_PROGRESS_UPDATE_INTERVAL_MS: i64 = 1_000;
 
 /// Usage journal consumer.
 pub struct UsageWorker {
@@ -194,48 +196,56 @@ impl UsageWorker {
         max_blocks: Option<usize>,
         finalize_file: bool,
     ) -> anyhow::Result<()> {
-        let file_bytes = fs::read(&claim.path)
-            .with_context(|| format!("failed to read journal `{}`", claim.path.display()))?;
-        let file_digest = sha256_hex(&file_bytes);
-        let total_compressed_bytes = file_bytes.len() as u64;
-        let batches = JournalReader::open(&claim.path)?.read_all_batches()?;
-        let total_blocks = batches.len() as u64;
-        let total_events = batches
-            .iter()
-            .map(|batch| batch.events.len() as u64)
-            .sum::<u64>();
-        let mut processed_events = 0u64;
+        let reader = JournalReader::open(&claim.path)?;
         let block_limit = max_blocks.unwrap_or(usize::MAX);
+        let mut stream = reader.stream_batches()?;
+        let total_compressed_bytes = stream.total_compressed_bytes();
+        let mut processed_blocks = 0u64;
+        let mut processed_events = 0u64;
+        let mut last_progress_update_ms = None;
 
-        for (index, batch) in batches.iter().take(block_limit).enumerate() {
+        for index in 0..block_limit {
+            let Some(batch) = stream.next_batch()? else {
+                break;
+            };
+            processed_blocks = processed_blocks.saturating_add(1);
             let events = batch
                 .events
-                .clone()
                 .into_iter()
                 .map(|event| event.into_usage_event())
                 .collect::<Vec<_>>();
-            self.duckdb_usage
-                .append_usage_events_if_new(&events)
-                .await?;
+            self.duckdb_usage.append_usage_events(&events).await?;
             processed_events = processed_events.saturating_add(events.len() as u64);
-            let processed_blocks = index as u64 + 1;
-            let progress = importing_progress(
-                &claim,
-                processed_blocks,
-                total_blocks,
-                processed_events,
-                total_events,
-                total_compressed_bytes,
-            );
-            self.state.update_progress(&progress, now_ms())?;
+            let now = now_ms();
+            let should_persist_progress = processed_blocks == 1
+                || last_progress_update_ms
+                    .map(|last| now.saturating_sub(last) >= WORKER_PROGRESS_UPDATE_INTERVAL_MS)
+                    .unwrap_or(true)
+                || index + 1 == block_limit;
+            if should_persist_progress {
+                let progress = importing_progress(
+                    &claim,
+                    processed_blocks,
+                    processed_events,
+                    stream.bytes_read(),
+                    total_compressed_bytes,
+                );
+                self.state.update_progress(&progress, now)?;
+                last_progress_update_ms = Some(now);
+            }
         }
 
         if max_blocks.is_some() {
             return Ok(());
         }
+        let report = stream.finish()?;
 
-        self.state
-            .record_consumed_file(claim.sequence, &file_digest, total_events, now_ms())?;
+        self.state.record_consumed_file(
+            claim.sequence,
+            &report.file_digest_hex,
+            report.footer.event_count,
+            now_ms(),
+        )?;
         if finalize_file {
             fs::remove_file(&claim.path).with_context(|| {
                 format!("failed to delete consumed journal `{}`", claim.path.display())
@@ -257,27 +267,26 @@ struct ClaimedJournalFile {
 fn importing_progress(
     claim: &ClaimedJournalFile,
     processed_blocks: u64,
-    total_blocks: u64,
     processed_events: u64,
-    total_events: u64,
+    processed_compressed_bytes: u64,
     total_compressed_bytes: u64,
 ) -> WorkerProgressSnapshot {
-    let processed_compressed_bytes = if total_blocks == 0 {
-        0
-    } else {
-        total_compressed_bytes.saturating_mul(processed_blocks) / total_blocks
-    };
     WorkerProgressSnapshot {
         state: "importing".to_string(),
         current_file_path: Some(claim.path.display().to_string()),
         current_file_sequence: Some(claim.sequence),
         processed_blocks,
-        total_blocks,
+        total_blocks: 0,
         processed_events,
-        total_events,
+        total_events: 0,
         processed_compressed_bytes,
         total_compressed_bytes,
-        progress_percent: progress_percent(processed_events, total_events),
+        progress_percent: progress_percent(
+            processed_events,
+            0,
+            processed_compressed_bytes,
+            total_compressed_bytes,
+        ),
         heartbeat_at_ms: Some(now_ms()),
         ..WorkerProgressSnapshot::default()
     }
@@ -291,11 +300,19 @@ fn idle_progress() -> WorkerProgressSnapshot {
     }
 }
 
-fn progress_percent(processed_events: u64, total_events: u64) -> f64 {
-    if total_events == 0 {
+fn progress_percent(
+    processed_events: u64,
+    total_events: u64,
+    processed_compressed_bytes: u64,
+    total_compressed_bytes: u64,
+) -> f64 {
+    if total_events > 0 {
+        return (processed_events as f64 / total_events as f64) * 100.0;
+    }
+    if total_compressed_bytes == 0 {
         0.0
     } else {
-        (processed_events as f64 / total_events as f64) * 100.0
+        (processed_compressed_bytes as f64 / total_compressed_bytes as f64) * 100.0
     }
 }
 
@@ -307,12 +324,6 @@ fn parse_journal_sequence(path: &Path) -> Option<u64> {
         .take_while(|ch| ch.is_ascii_digit())
         .collect::<String>();
     digits.parse().ok()
-}
-
-fn sha256_hex(bytes: &[u8]) -> String {
-    let mut hasher = Sha256::new();
-    hasher.update(bytes);
-    format!("{:x}", hasher.finalize())
 }
 
 fn now_ms() -> i64 {
@@ -343,7 +354,7 @@ mod tests {
     };
     use llm_access_core::{
         provider::{ProtocolFamily, ProviderType},
-        store::UsageAnalyticsStore,
+        store::{UsageAnalyticsStore, UsageEventSink},
         usage::{UsageEvent, UsageStreamDetails, UsageTiming},
     };
     use llm_access_store::duckdb::{DuckDbUsageRepository, TieredDuckDbUsageConfig};
@@ -376,7 +387,9 @@ mod tests {
 
         assert_eq!(progress.state, "importing");
         assert_eq!(progress.processed_blocks, 1);
-        assert_eq!(progress.total_blocks, 2);
+        assert_eq!(progress.total_blocks, 0);
+        assert_eq!(progress.total_events, 0);
+        assert!(progress.processed_compressed_bytes > 0);
         assert!(progress.progress_percent > 0.0);
     }
 
@@ -577,7 +590,7 @@ mod tests {
                     .into_iter()
                     .map(|event| event.into_usage_event())
                     .collect::<Vec<_>>();
-                self.duckdb.append_usage_events_if_new(&events).await?;
+                self.duckdb.append_usage_events(&events).await?;
             }
             Ok(())
         }

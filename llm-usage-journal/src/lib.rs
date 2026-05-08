@@ -12,7 +12,7 @@ pub mod writer;
 
 pub use config::JournalConfig;
 pub use inspect::collect_journal_file_lists;
-pub use reader::JournalReader;
+pub use reader::{JournalBatchStream, JournalFileSummary, JournalReader, JournalStreamReport};
 pub use state::JournalConsumerState;
 pub use status::{
     JournalFileListsSnapshot, JournalFileSnapshot, JournalStatusSnapshot, WorkerProgressSnapshot,

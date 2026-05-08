@@ -227,7 +227,8 @@ pub fn insert_usage_event_sql() -> &'static str {
         ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
         ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44,
         ?45, ?46, ?47, ?48
-     )"
+     )
+     ON CONFLICT DO NOTHING"
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -689,27 +690,15 @@ impl DuckDbUsageRepository {
         .context("duckdb key usage rollup task failed")?
     }
 
-    /// Append only events whose event ids are not already present.
+    /// Append a batch after removing only in-memory duplicates from the same
+    /// call.
     pub async fn append_usage_events_if_new(&self, events: &[UsageEvent]) -> anyhow::Result<usize> {
-        if events.is_empty() {
+        let deduped = dedupe_usage_events(events);
+        if deduped.is_empty() {
             return Ok(0);
         }
-        let mut seen = HashSet::new();
-        let mut new_events = Vec::new();
-        for event in events {
-            if !seen.insert(event.event_id.clone()) {
-                continue;
-            }
-            if UsageAnalyticsStore::get_usage_event(self, &event.event_id)
-                .await?
-                .is_none()
-            {
-                new_events.push(event.clone());
-            }
-        }
-        let inserted = new_events.len();
-        UsageEventSink::append_usage_events(self, &new_events).await?;
-        Ok(inserted)
+        UsageEventSink::append_usage_events(self, &deduped).await?;
+        Ok(deduped.len())
     }
 }
 
@@ -1514,6 +1503,18 @@ fn append_usage_events_to_tiered(
 }
 
 #[cfg(feature = "duckdb-runtime")]
+fn dedupe_usage_events(events: &[UsageEvent]) -> Vec<UsageEvent> {
+    let mut seen = HashSet::new();
+    let mut deduped = Vec::with_capacity(events.len());
+    for event in events {
+        if seen.insert(event.event_id.clone()) {
+            deduped.push(event.clone());
+        }
+    }
+    deduped
+}
+
+#[cfg(feature = "duckdb-runtime")]
 fn active_segment_disk_bytes(path: &Path) -> u64 {
     fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
         + fs::metadata(duckdb_wal_path(path))
@@ -1573,7 +1574,11 @@ impl UsageEventSink for DuckDbUsageRepository {
             return Ok(());
         }
         let inner = Arc::clone(&self.inner);
-        let rows = events
+        let deduped = dedupe_usage_events(events);
+        if deduped.is_empty() {
+            return Ok(());
+        }
+        let rows = deduped
             .iter()
             .map(UsageEventRow::from_usage_event)
             .collect::<Vec<_>>();
@@ -2521,6 +2526,55 @@ mod tests {
 
     #[cfg(feature = "duckdb-runtime")]
     #[tokio::test]
+    async fn duckdb_repository_append_usage_events_ignores_segment_local_duplicates() {
+        let root = std::env::temp_dir()
+            .join(format!("llm-access-duckdb-test-{}-dedup-batch-repository", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create duckdb test directory");
+        let db_path = root.join("usage.duckdb");
+        let repo = super::DuckDbUsageRepository::open_path(&db_path).expect("open duckdb usage db");
+
+        let mut existing = test_usage_event();
+        existing.event_id = "dedup-existing".to_string();
+        repo.append_usage_event(&existing)
+            .await
+            .expect("append existing event");
+
+        let mut first_new = test_usage_event();
+        first_new.event_id = "dedup-new-first".to_string();
+        first_new.created_at_ms = first_new.created_at_ms.saturating_add(1);
+        let mut second_new = test_usage_event();
+        second_new.event_id = "dedup-new-second".to_string();
+        second_new.created_at_ms = second_new.created_at_ms.saturating_add(2);
+
+        repo.append_usage_events(&[
+            existing.clone(),
+            first_new.clone(),
+            first_new.clone(),
+            second_new.clone(),
+        ])
+        .await
+        .expect("append deduplicated batch");
+
+        let page = repo
+            .list_usage_events(UsageEventQuery {
+                key_id: Some(existing.key_id.clone()),
+                provider_type: None,
+                source: UsageEventSource::All,
+                start_ms: None,
+                end_ms: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("list deduplicated page");
+        assert_eq!(page.total, 3);
+
+        std::fs::remove_dir_all(&root).expect("cleanup duckdb test directory");
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
+    #[tokio::test]
     async fn duckdb_repository_summarizes_key_usage_rollups() {
         let root = std::env::temp_dir()
             .join(format!("llm-access-duckdb-test-{}-key-rollups", std::process::id()));
@@ -2800,6 +2854,64 @@ mod tests {
 
     #[cfg(feature = "duckdb-runtime")]
     #[tokio::test]
+    async fn duckdb_tiered_repository_append_usage_events_allows_archived_duplicates() {
+        let root = std::env::temp_dir()
+            .join(format!("llm-access-duckdb-test-{}-tiered-dedup-archived", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create tiered duckdb test directory");
+        let repo = super::DuckDbUsageRepository::open_tiered(super::TieredDuckDbUsageConfig {
+            active_dir: root.join("active"),
+            archive_dir: root.join("archive"),
+            catalog_dir: root.join("catalog"),
+            rollover_bytes: 1,
+        })
+        .expect("open tiered duckdb usage db");
+
+        let mut archived = test_usage_event();
+        archived.event_id = "tiered-dedup-archived".to_string();
+        archived.created_at_ms = 1_700_000_000_000;
+        repo.append_usage_event(&archived)
+            .await
+            .expect("append archived event");
+
+        let mut active = test_usage_event();
+        active.event_id = "tiered-dedup-active".to_string();
+        active.created_at_ms = 1_700_000_060_000;
+        repo.append_usage_event(&active)
+            .await
+            .expect("append active event");
+
+        wait_for_archived_duckdb_file_count(&root.join("archive"), 2).await;
+        wait_for_tiered_usage_event(&repo, &archived.event_id).await;
+        wait_for_tiered_usage_event(&repo, &active.event_id).await;
+
+        let mut fresh = test_usage_event();
+        fresh.event_id = "tiered-dedup-fresh".to_string();
+        fresh.created_at_ms = 1_700_000_120_000;
+        repo.append_usage_events(&[archived.clone(), active.clone(), fresh.clone(), fresh.clone()])
+            .await
+            .expect("append deduplicated tiered batch");
+        wait_for_tiered_usage_event(&repo, &fresh.event_id).await;
+
+        let page = repo
+            .list_usage_events(UsageEventQuery {
+                key_id: Some(archived.key_id.clone()),
+                provider_type: None,
+                source: UsageEventSource::All,
+                start_ms: None,
+                end_ms: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("list tiered deduplicated page");
+        assert_eq!(page.total, 5);
+
+        std::fs::remove_dir_all(&root).expect("cleanup tiered duckdb test directory");
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
+    #[tokio::test]
     async fn duckdb_tiered_rolls_over_existing_oversized_active_before_append() {
         let root = std::env::temp_dir()
             .join(format!("llm-access-duckdb-test-{}-tiered-pre-rollover", std::process::id()));
@@ -2974,6 +3086,25 @@ mod tests {
             }
             if std::time::Instant::now() >= deadline {
                 panic!("timed out waiting for archived duckdb segment");
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
+    async fn wait_for_tiered_usage_event(repo: &super::DuckDbUsageRepository, event_id: &str) {
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if repo
+                .get_usage_event(event_id)
+                .await
+                .expect("query tiered usage event while waiting")
+                .is_some()
+            {
+                return;
+            }
+            if std::time::Instant::now() >= deadline {
+                panic!("timed out waiting for tiered usage event {event_id}");
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }

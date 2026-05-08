@@ -181,11 +181,14 @@ fn initialize_consumer_state(conn: &Connection) -> Result<()> {
 fn decode_progress(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerProgressSnapshot> {
     let processed_events = row.get::<_, i64>(5)?.max(0) as u64;
     let total_events = row.get::<_, i64>(6)?.max(0) as u64;
-    let progress_percent = if total_events == 0 {
-        0.0
-    } else {
-        (processed_events as f64 / total_events as f64) * 100.0
-    };
+    let processed_compressed_bytes = row.get::<_, i64>(7)?.max(0) as u64;
+    let total_compressed_bytes = row.get::<_, i64>(8)?.max(0) as u64;
+    let progress_percent = progress_percent(
+        processed_events,
+        total_events,
+        processed_compressed_bytes,
+        total_compressed_bytes,
+    );
     Ok(WorkerProgressSnapshot {
         state: row.get(0)?,
         current_file_path: row.get(1)?,
@@ -196,8 +199,8 @@ fn decode_progress(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerProgressSn
         total_blocks: row.get::<_, i64>(4)?.max(0) as u64,
         processed_events,
         total_events,
-        processed_compressed_bytes: row.get::<_, i64>(7)?.max(0) as u64,
-        total_compressed_bytes: row.get::<_, i64>(8)?.max(0) as u64,
+        processed_compressed_bytes,
+        total_compressed_bytes,
         progress_percent,
         import_rate_events_per_second: 0.0,
         heartbeat_at_ms: row.get(9)?,
@@ -208,6 +211,22 @@ fn decode_progress(row: &rusqlite::Row<'_>) -> rusqlite::Result<WorkerProgressSn
         last_error: row.get(12)?,
         last_error_at_ms: row.get(13)?,
     })
+}
+
+fn progress_percent(
+    processed_events: u64,
+    total_events: u64,
+    processed_compressed_bytes: u64,
+    total_compressed_bytes: u64,
+) -> f64 {
+    if total_events > 0 {
+        return (processed_events as f64 / total_events as f64) * 100.0;
+    }
+    if total_compressed_bytes == 0 {
+        0.0
+    } else {
+        (processed_compressed_bytes as f64 / total_compressed_bytes as f64) * 100.0
+    }
 }
 
 fn ensure_worker_progress_column(conn: &Connection, name: &str, sql_type: &str) -> Result<()> {

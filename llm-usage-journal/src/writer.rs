@@ -340,7 +340,7 @@ mod tests {
     use crate::{reader::JournalReader, retention, JournalConfig};
 
     #[test]
-    fn writer_seals_file_with_valid_footer_and_reader_reads_batch() {
+    fn writer_seals_file_with_valid_footer_and_reader_streams_batches_and_summary() {
         let dir = tempfile::tempdir().expect("tempdir");
         let config = JournalConfig::new(dir.path().to_path_buf());
         let mut writer = JournalWriter::open(config).expect("open writer");
@@ -348,12 +348,24 @@ mod tests {
             .append_events(&[test_usage_event("evt-journal-1")])
             .expect("append");
         let sealed = writer.seal_current_file().expect("seal");
-        let batches = JournalReader::open(&sealed)
-            .expect("open reader")
-            .read_all_batches()
-            .expect("read");
-        assert_eq!(batches.len(), 1);
-        assert_eq!(batches[0].events[0].event_id, "evt-journal-1");
+        let reader = JournalReader::open(&sealed).expect("open reader");
+        let summary = reader.scan_summary().expect("scan summary");
+        assert_eq!(summary.footer.block_count, 1);
+        assert_eq!(summary.footer.event_count, 1);
+        assert!(summary.total_compressed_bytes > 0);
+
+        let mut stream = reader.stream_batches().expect("stream");
+        let batch = stream
+            .next_batch()
+            .expect("read batch")
+            .expect("batch present");
+        assert_eq!(batch.events[0].event_id, "evt-journal-1");
+        assert!(stream.next_batch().expect("read footer").is_none());
+        let report = stream.finish().expect("finish stream");
+        assert_eq!(report.footer.block_count, 1);
+        assert_eq!(report.footer.event_count, 1);
+        assert_eq!(report.total_compressed_bytes, summary.total_compressed_bytes);
+        assert_eq!(report.file_digest_hex.len(), 64);
     }
 
     #[test]
