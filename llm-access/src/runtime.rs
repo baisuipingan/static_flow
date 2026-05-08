@@ -487,13 +487,19 @@ struct PendingUsageRollups {
 
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 impl PendingUsageRollups {
-    fn add_event(&self, event: &UsageEvent) -> anyhow::Result<()> {
-        let delta = UsageRollupDelta::from_event(event)?;
+    fn add_events(&self, events: &[UsageEvent]) -> anyhow::Result<()> {
+        let mut deltas = HashMap::<String, UsageRollupDelta>::new();
+        for event in events {
+            let delta = UsageRollupDelta::from_event(event)?;
+            deltas.entry(event.key_id.clone()).or_default().add(&delta);
+        }
         let mut rollups = self
             .rollups
             .write()
             .map_err(|_| anyhow!("pending usage rollups lock poisoned"))?;
-        rollups.entry(event.key_id.clone()).or_default().add(&delta);
+        for (key_id, delta) in deltas {
+            rollups.entry(key_id).or_default().add(&delta);
+        }
         Ok(())
     }
 
@@ -528,7 +534,7 @@ impl PendingUsageRollups {
 
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 struct UsageAccounting {
-    tx: mpsc::Sender<UsageEvent>,
+    tx: mpsc::Sender<Vec<UsageEvent>>,
     pending_rollups: Arc<PendingUsageRollups>,
 }
 
@@ -539,7 +545,7 @@ impl UsageAccounting {
         analytics_sink: Arc<dyn UsageEventSink>,
         runtime_config: Arc<RwLock<AdminRuntimeConfig>>,
     ) -> (Arc<Self>, Arc<UsageEventFlusherHandle>) {
-        let (tx, rx) = mpsc::channel::<UsageEvent>(USAGE_EVENT_CHANNEL_CAPACITY);
+        let (tx, rx) = mpsc::channel::<Vec<UsageEvent>>(USAGE_EVENT_CHANNEL_CAPACITY);
         let pending_rollups = Arc::new(PendingUsageRollups::default());
         let handle = spawn_usage_event_flusher(
             rollup_sink,
@@ -612,29 +618,32 @@ impl UsageAccounting {
         }
         key
     }
+
+    async fn enqueue_events(&self, events: Vec<UsageEvent>) -> anyhow::Result<()> {
+        if events.is_empty() {
+            return Ok(());
+        }
+        self.pending_rollups.add_events(&events)?;
+        match self.tx.send(events).await {
+            Ok(()) => Ok(()),
+            Err(err) => {
+                let failed_events = err.0;
+                let _ = self.pending_rollups.subtract_events(&failed_events);
+                Err(anyhow!("failed to enqueue llm access usage event batch"))
+            },
+        }
+    }
 }
 
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 #[async_trait]
 impl UsageEventSink for UsageAccounting {
-    async fn append_usage_event(&self, event: &UsageEvent) -> anyhow::Result<()> {
-        self.pending_rollups.add_event(event)?;
-        self.tx
-            .send(event.clone())
-            .await
-            .context("failed to enqueue llm access usage event")
-            .inspect_err(|_err| {
-                let _ = self
-                    .pending_rollups
-                    .subtract_events(std::slice::from_ref(event));
-            })
+    async fn append_usage_events(&self, events: &[UsageEvent]) -> anyhow::Result<()> {
+        self.enqueue_events(events.to_vec()).await
     }
 
-    async fn append_usage_events(&self, events: &[UsageEvent]) -> anyhow::Result<()> {
-        for event in events {
-            self.append_usage_event(event).await?;
-        }
-        Ok(())
+    async fn append_usage_events_owned(&self, events: Vec<UsageEvent>) -> anyhow::Result<()> {
+        self.enqueue_events(events).await
     }
 }
 
@@ -658,7 +667,7 @@ fn spawn_usage_event_flusher(
     analytics_sink: Arc<dyn UsageEventSink>,
     pending_rollups: Arc<PendingUsageRollups>,
     runtime_config: Arc<RwLock<AdminRuntimeConfig>>,
-    mut rx: mpsc::Receiver<UsageEvent>,
+    mut rx: mpsc::Receiver<Vec<UsageEvent>>,
 ) -> Arc<UsageEventFlusherHandle> {
     let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
     let join = tokio::spawn(async move {
@@ -689,9 +698,12 @@ fn spawn_usage_event_flusher(
                 tokio::select! {
                     _ = shutdown_rx.changed() => {
                         if *shutdown_rx.borrow() {
-                            while let Ok(event) = rx.try_recv() {
-                                buffered_bytes = buffered_bytes.saturating_add(estimate_usage_event_bytes(&event));
-                                buffer.push(event);
+                            while let Ok(events) = rx.try_recv() {
+                                append_usage_event_batch(
+                                    &mut buffer,
+                                    &mut buffered_bytes,
+                                    events,
+                                );
                             }
                             let _ = flush_usage_event_buffer(
                                 UsageEventFlushTargets {
@@ -740,9 +752,12 @@ fn spawn_usage_event_flusher(
             tokio::select! {
                 _ = shutdown_rx.changed() => {
                     if *shutdown_rx.borrow() {
-                        while let Ok(event) = rx.try_recv() {
-                            buffered_bytes = buffered_bytes.saturating_add(estimate_usage_event_bytes(&event));
-                            buffer.push(event);
+                        while let Ok(events) = rx.try_recv() {
+                            append_usage_event_batch(
+                                &mut buffer,
+                                &mut buffered_bytes,
+                                events,
+                            );
                         }
                         let _ = flush_usage_event_buffer(
                             UsageEventFlushTargets {
@@ -765,20 +780,24 @@ fn spawn_usage_event_flusher(
                         return;
                     }
                 }
-                maybe_event = rx.recv() => {
-                    match maybe_event {
-                        Some(event) => {
-                            buffered_bytes = buffered_bytes.saturating_add(estimate_usage_event_bytes(&event));
-                            buffer.push(event);
+                maybe_events = rx.recv() => {
+                    match maybe_events {
+                        Some(events) => {
+                            append_usage_event_batch(
+                                &mut buffer,
+                                &mut buffered_bytes,
+                                events,
+                            );
                             while buffer.len() < flush_config.batch_size
                                 && buffered_bytes < flush_config.max_buffer_bytes
                             {
                                 match rx.try_recv() {
-                                    Ok(event) => {
-                                        buffered_bytes = buffered_bytes.saturating_add(
-                                            estimate_usage_event_bytes(&event),
+                                    Ok(events) => {
+                                        append_usage_event_batch(
+                                            &mut buffer,
+                                            &mut buffered_bytes,
+                                            events,
                                         );
-                                        buffer.push(event);
                                     },
                                     Err(_) => break,
                                 }
@@ -859,6 +878,17 @@ fn spawn_usage_event_flusher(
 }
 
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
+fn append_usage_event_batch(
+    buffer: &mut Vec<UsageEvent>,
+    buffered_bytes: &mut usize,
+    mut events: Vec<UsageEvent>,
+) {
+    *buffered_bytes =
+        buffered_bytes.saturating_add(events.iter().map(estimate_usage_event_bytes).sum::<usize>());
+    buffer.append(&mut events);
+}
+
+#[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 struct UsageEventFlusherHandle {
     shutdown_tx: watch::Sender<bool>,
     join: Mutex<Option<JoinHandle<()>>>,
@@ -930,7 +960,7 @@ async fn flush_usage_event_buffer(
         let count = analytics_batch.len();
         match targets
             .analytics_sink
-            .append_usage_events(&analytics_batch)
+            .append_usage_events_owned(analytics_batch)
             .await
         {
             Ok(()) => {
@@ -1038,6 +1068,12 @@ impl ControlStore for UsageAccountingControlStore {
 
     async fn apply_usage_rollup(&self, event: &UsageEvent) -> anyhow::Result<()> {
         self.usage_accounting.append_usage_event(event).await
+    }
+
+    async fn apply_usage_rollup_owned(&self, event: UsageEvent) -> anyhow::Result<()> {
+        self.usage_accounting
+            .append_usage_events_owned(vec![event])
+            .await
     }
 }
 
@@ -1358,11 +1394,9 @@ mod tests {
         let analytics_sink = FailingUsageEventSink::default();
         let pending_rollups = super::PendingUsageRollups::default();
         let mut buffer = vec![sample_usage_event("evt-1"), sample_usage_event("evt-2")];
-        for event in &buffer {
-            pending_rollups
-                .add_event(event)
-                .expect("add pending rollup");
-        }
+        pending_rollups
+            .add_events(&buffer)
+            .expect("add pending rollups");
         let mut analytics_retry_buffer = Vec::new();
         let mut buffered_bytes = buffer
             .iter()

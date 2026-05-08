@@ -43,7 +43,11 @@ pub struct PreparedGatewayRequest {
     /// HTTP method.
     pub method: Method,
     /// Body exactly as presented by the client after local content decoding.
-    pub client_request_body: Bytes,
+    ///
+    /// This is retained only when a caller explicitly needs the original
+    /// client shape for diagnostics. Most requests avoid keeping a second full
+    /// body copy and leave this empty.
+    pub client_request_body: Option<Bytes>,
     /// Body sent to the upstream Codex backend.
     pub request_body: Bytes,
     /// Upstream model after local mapping.
@@ -64,6 +68,18 @@ pub struct PreparedGatewayRequest {
     pub tool_name_restore_map: BTreeMap<String, String>,
     /// Request-level billable-token multiplier.
     pub billable_multiplier: u64,
+    /// Last text-like user content extracted from the original client body.
+    pub last_message_content: Option<String>,
+}
+
+impl PreparedGatewayRequest {
+    /// Return the original client body when it was retained; otherwise fall
+    /// back to the upstream body.
+    pub fn client_request_body_or_upstream(&self) -> &Bytes {
+        self.client_request_body
+            .as_ref()
+            .unwrap_or(&self.request_body)
+    }
 }
 
 /// Response adaptation mode selected by the incoming OpenAI-compatible

@@ -2235,7 +2235,7 @@ fn build_gateway_usage_event_record(
         client_request_body_json: None,
         upstream_request_body_json: None,
         full_request_json: capture_request_details
-            .then(|| maybe_raw_request_body_text(&args.prepared.client_request_body))
+            .then(|| maybe_raw_request_body_text(args.prepared.client_request_body_or_upstream()))
             .flatten(),
         created_at: now_ms(),
     }
@@ -2259,8 +2259,8 @@ fn build_codex_failure_diagnostic_payload(
         "endpoint": prepared.upstream_path,
         "model": prepared.model,
         "account_name": selected_account_name,
-        "original_last_message_content": extract_last_message_content(&prepared.client_request_body).ok().flatten(),
-        "client_request_body": maybe_parse_gateway_json_bytes(&prepared.client_request_body),
+        "original_last_message_content": prepared.last_message_content.clone(),
+        "client_request_body": maybe_parse_gateway_json_bytes(prepared.client_request_body_or_upstream()),
         "upstream_request_body": maybe_parse_gateway_json_bytes(&prepared.request_body),
         "error": error,
         "details": details.unwrap_or_else(|| json!({})),
@@ -2312,11 +2312,15 @@ fn build_failure_prepared_gateway_request(
 ) -> PreparedGatewayRequest {
     let original_path = format!("{gateway_path}{query}");
     let (model, wants_stream) = extract_request_model_and_stream(&raw_body);
+    let last_message_content = match extract_last_message_content(&raw_body) {
+        Ok(content) => content,
+        Err(_err) => Some(LAST_MESSAGE_CONTENT_EXTRACT_FAILED.to_string()),
+    };
     PreparedGatewayRequest {
         original_path: original_path.clone(),
         upstream_path: original_path,
         method,
-        client_request_body: raw_body,
+        client_request_body: Some(raw_body.clone()),
         request_body: Bytes::new(),
         model,
         client_visible_model: None,
@@ -2331,6 +2335,7 @@ fn build_failure_prepared_gateway_request(
         thread_anchor: None,
         tool_name_restore_map: BTreeMap::new(),
         billable_multiplier: 1,
+        last_message_content,
     }
 }
 
@@ -5107,7 +5112,7 @@ async fn forward_upstream_response(
                 response_json
             };
             let adapted_json = adapt_completed_response_json(
-                &response_json,
+                response_json,
                 response_adapter,
                 Some(&prepared.tool_name_restore_map),
             );
@@ -5583,17 +5588,7 @@ async fn persist_gateway_usage(
             "LLM gateway usage payload was missing and fell back to zeroed counters"
         );
     }
-    let last_message_content = match extract_last_message_content(&prepared.client_request_body) {
-        Ok(content) => content,
-        Err(err) => {
-            tracing::debug!(
-                key_id = %current.id,
-                upstream_path = prepared.upstream_path,
-                "Failed to extract last message content from request body: {err}"
-            );
-            Some(LAST_MESSAGE_CONTENT_EXTRACT_FAILED.to_string())
-        },
-    };
+    let last_message_content = prepared.last_message_content.clone();
     let event = build_gateway_usage_event_record(GatewayUsageEventBuild {
         current: &current,
         prepared,
@@ -6538,7 +6533,7 @@ mod tests {
             original_path: "/v1/responses".to_string(),
             upstream_path: "/v1/responses".to_string(),
             method: axum::http::Method::POST,
-            client_request_body: Bytes::from_static(br#"{"input":"hello"}"#),
+            client_request_body: Some(Bytes::from_static(br#"{"input":"hello"}"#)),
             request_body: Bytes::from_static(br#"{"input":"hello","stream":true}"#),
             model: Some("gpt-5.3-codex".to_string()),
             client_visible_model: None,
@@ -6549,6 +6544,7 @@ mod tests {
             thread_anchor: None,
             tool_name_restore_map: BTreeMap::new(),
             billable_multiplier: 1,
+            last_message_content: Some("hello".to_string()),
         }
     }
 
@@ -6774,7 +6770,7 @@ mod tests {
         assert_eq!(event.request_headers_json, context.request_headers_json);
         assert_eq!(
             event.full_request_json,
-            maybe_raw_request_body_text(&prepared.client_request_body)
+            maybe_raw_request_body_text(prepared.client_request_body_or_upstream())
         );
     }
 

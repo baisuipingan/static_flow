@@ -21,14 +21,14 @@ use futures_util::{StreamExt, TryStreamExt};
 use llm_access_codex::{
     request::{
         apply_gpt53_codex_spark_mapping, external_origin, extract_client_ip_from_headers,
-        extract_last_message_content, prepare_gateway_request_from_bytes,
-        resolve_request_url_from_headers, serialize_headers_json,
+        prepare_gateway_request_from_bytes, resolve_request_url_from_headers,
+        serialize_headers_json,
     },
     response::{
         adapt_completed_response_json, apply_upstream_response_headers,
         convert_json_response_to_chat_completion, convert_response_event_to_chat_chunk,
         encode_json_sse_chunk, encode_sse_event_with_model_alias, extract_usage_from_bytes,
-        rewrite_json_response_model_alias, SseUsageCollector,
+        rewrite_json_response_model_alias, rewrite_json_value_model_alias, SseUsageCollector,
     },
     types::{ChatStreamMetadata, GatewayResponseAdapter, PreparedGatewayRequest, UsageBreakdown},
 };
@@ -865,9 +865,7 @@ async fn dispatch_codex_proxy(
         Err(err) => return (err.status, err.message).into_response(),
     };
     usage_meta.mark_pre_handler_done(clamp_duration_ms(parse_started.elapsed()));
-    usage_meta.last_message_content = extract_last_message_content(&prepared.client_request_body)
-        .ok()
-        .flatten();
+    usage_meta.last_message_content = prepared.last_message_content.clone();
     let method = match reqwest::Method::from_bytes(prepared.method.as_str().as_bytes()) {
         Ok(method) => method,
         Err(_) => return (StatusCode::METHOD_NOT_ALLOWED, "unsupported method").into_response(),
@@ -1051,7 +1049,7 @@ async fn adapt_codex_upstream_response(
             prepared.client_visible_model.as_deref(),
         );
         let adapted = adapt_completed_response_json(
-            &completed_response,
+            completed_response,
             prepared.response_adapter,
             Some(&prepared.tool_name_restore_map),
         );
@@ -1115,26 +1113,6 @@ async fn adapt_codex_upstream_response(
     };
     usage_meta.mark_post_headers_body();
     usage_meta.mark_stream_finish();
-    let response_body = if status.is_success()
-        && prepared.response_adapter == GatewayResponseAdapter::ChatCompletions
-    {
-        match convert_json_response_to_chat_completion(
-            &bytes,
-            Some(&prepared.tool_name_restore_map),
-            prepared.model.as_deref(),
-            prepared.client_visible_model.as_deref(),
-        ) {
-            Ok(body) => body,
-            Err(err) => return (StatusCode::BAD_GATEWAY, err).into_response(),
-        }
-    } else {
-        rewrite_json_response_model_alias(
-            &bytes,
-            prepared.model.as_deref(),
-            prepared.client_visible_model.as_deref(),
-        )
-        .unwrap_or_else(|| bytes.to_vec())
-    };
     let usage = if status.is_success() {
         extract_usage_from_bytes(&bytes).unwrap_or_else(missing_codex_usage)
     } else {
@@ -1161,12 +1139,33 @@ async fn adapt_codex_upstream_response(
     } else {
         &content_type
     };
+    let response_body = if status.is_success()
+        && prepared.response_adapter == GatewayResponseAdapter::ChatCompletions
+    {
+        match convert_json_response_to_chat_completion(
+            &bytes,
+            Some(&prepared.tool_name_restore_map),
+            prepared.model.as_deref(),
+            prepared.client_visible_model.as_deref(),
+        ) {
+            Ok(body) => Body::from(body),
+            Err(err) => return (StatusCode::BAD_GATEWAY, err).into_response(),
+        }
+    } else if let Some(body) = rewrite_json_response_model_alias(
+        &bytes,
+        prepared.model.as_deref(),
+        prepared.client_visible_model.as_deref(),
+    ) {
+        Body::from(body)
+    } else {
+        Body::from(bytes)
+    };
     let builder = Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, response_content_type)
         .header(header::CACHE_CONTROL, "no-store");
     apply_upstream_response_headers(builder, &upstream_headers)
-        .body(Body::from(response_body))
+        .body(response_body)
         .unwrap_or_else(|_| {
             (StatusCode::BAD_GATEWAY, "codex upstream response build failed").into_response()
         })
@@ -4412,7 +4411,7 @@ async fn record_kiro_usage(record: KiroUsageRecord<'_>) -> anyhow::Result<()> {
         timing: record.meta.to_timing(),
         stream: record.meta.to_stream_details(),
     };
-    record.control_store.apply_usage_rollup(&event).await
+    record.control_store.apply_usage_rollup_owned(event).await
 }
 
 struct KiroWebsearchUsageRecord<'a> {
@@ -4481,7 +4480,7 @@ async fn record_kiro_websearch_usage(record: KiroWebsearchUsageRecord<'_>) -> an
         timing: record.meta.to_timing(),
         stream: record.meta.to_stream_details(),
     };
-    record.control_store.apply_usage_rollup(&event).await
+    record.control_store.apply_usage_rollup_owned(event).await
 }
 
 fn kiro_billable_tokens(model: &str, usage: KiroUsageSummary, cache_ctx: &KiroCacheContext) -> u64 {
@@ -4942,19 +4941,6 @@ fn sse_data_payloads(bytes: &[u8]) -> Vec<String> {
         .collect()
 }
 
-fn rewrite_json_value_model_alias(
-    value: Value,
-    model_from: Option<&str>,
-    model_to: Option<&str>,
-) -> Value {
-    let Ok(bytes) = serde_json::to_vec(&value) else {
-        return value;
-    };
-    rewrite_json_response_model_alias(&bytes, model_from, model_to)
-        .and_then(|bytes| serde_json::from_slice::<Value>(&bytes).ok())
-        .unwrap_or(value)
-}
-
 async fn record_codex_usage(
     control_store: &dyn ControlStore,
     key: &AuthenticatedKey,
@@ -4985,7 +4971,7 @@ async fn record_codex_usage(
         status_code: i64::from(status.as_u16()),
         request_body_bytes: meta
             .request_body_bytes
-            .or(Some(clamp_usize_to_i64(prepared.client_request_body.len()))),
+            .or(Some(clamp_usize_to_i64(prepared.request_body.len()))),
         quota_failover_count: meta.quota_failover_count,
         routing_diagnostics_json: meta.routing_diagnostics_json.clone(),
         input_uncached_tokens: clamp_u64_to_i64(usage.input_uncached_tokens),
@@ -5007,7 +4993,7 @@ async fn record_codex_usage(
         timing: meta.to_timing(),
         stream: meta.to_stream_details(),
     };
-    control_store.apply_usage_rollup(&event).await
+    control_store.apply_usage_rollup_owned(event).await
 }
 
 fn missing_codex_usage() -> UsageBreakdown {

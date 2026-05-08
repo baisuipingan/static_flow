@@ -783,7 +783,7 @@ impl DuckDbUsageRepository {
     /// Append a batch after removing only in-memory duplicates from the same
     /// call.
     pub async fn append_usage_events_if_new(&self, events: &[UsageEvent]) -> anyhow::Result<usize> {
-        let deduped = dedupe_usage_events(events);
+        let deduped = dedupe_usage_events_owned(events.to_vec());
         if deduped.is_empty() {
             return Ok(0);
         }
@@ -1592,12 +1592,12 @@ fn append_usage_events_to_tiered(
 }
 
 #[cfg(feature = "duckdb-runtime")]
-fn dedupe_usage_events(events: &[UsageEvent]) -> Vec<UsageEvent> {
+fn dedupe_usage_events_owned(events: Vec<UsageEvent>) -> Vec<UsageEvent> {
     let mut seen = HashSet::new();
     let mut deduped = Vec::with_capacity(events.len());
     for event in events {
         if seen.insert(event.event_id.clone()) {
-            deduped.push(event.clone());
+            deduped.push(event);
         }
     }
     deduped
@@ -1654,16 +1654,16 @@ fn checkpoint_duckdb_path(path: &Path) -> anyhow::Result<()> {
 #[cfg(feature = "duckdb-runtime")]
 #[async_trait]
 impl UsageEventSink for DuckDbUsageRepository {
-    async fn append_usage_event(&self, event: &UsageEvent) -> anyhow::Result<()> {
-        self.append_usage_events(std::slice::from_ref(event)).await
+    async fn append_usage_events(&self, events: &[UsageEvent]) -> anyhow::Result<()> {
+        self.append_usage_events_owned(events.to_vec()).await
     }
 
-    async fn append_usage_events(&self, events: &[UsageEvent]) -> anyhow::Result<()> {
+    async fn append_usage_events_owned(&self, events: Vec<UsageEvent>) -> anyhow::Result<()> {
         if events.is_empty() {
             return Ok(());
         }
         let inner = Arc::clone(&self.inner);
-        let deduped = dedupe_usage_events(events);
+        let deduped = dedupe_usage_events_owned(events);
         if deduped.is_empty() {
             return Ok(());
         }

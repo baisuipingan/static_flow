@@ -203,14 +203,14 @@ fn map_response_to_chat_completion(
 
 /// Adapt a completed upstream response according to the selected response mode.
 pub fn adapt_completed_response_json(
-    response: &Value,
+    response: Value,
     adapter: GatewayResponseAdapter,
     tool_name_restore_map: Option<&BTreeMap<String, String>>,
 ) -> Value {
     match adapter {
-        GatewayResponseAdapter::Responses => response.clone(),
+        GatewayResponseAdapter::Responses => response,
         GatewayResponseAdapter::ChatCompletions => {
-            map_response_to_chat_completion(response, tool_name_restore_map)
+            map_response_to_chat_completion(&response, tool_name_restore_map)
         },
     }
 }
@@ -564,9 +564,28 @@ pub fn rewrite_json_response_model_alias(
     model_from: Option<&str>,
     model_to: Option<&str>,
 ) -> Option<Vec<u8>> {
+    if !should_rewrite_model_alias(model_from, model_to) {
+        return None;
+    }
     let value = serde_json::from_slice::<Value>(bytes).ok()?;
     let value = maybe_apply_model_alias(value, model_from, model_to);
     serde_json::to_vec(&value).ok()
+}
+
+/// Rewrite model aliases inside an already-parsed JSON value.
+pub fn rewrite_json_value_model_alias(
+    value: Value,
+    model_from: Option<&str>,
+    model_to: Option<&str>,
+) -> Value {
+    if !should_rewrite_model_alias(model_from, model_to) {
+        return value;
+    }
+    maybe_apply_model_alias(value, model_from, model_to)
+}
+
+fn should_rewrite_model_alias(model_from: Option<&str>, model_to: Option<&str>) -> bool {
+    matches!((model_from, model_to), (Some(from), Some(to)) if from != to)
 }
 
 /// Parse a non-streaming JSON body and extract usage accounting when present.

@@ -85,7 +85,6 @@ pub fn prepare_gateway_request_from_bytes(
         .filter(|value| !value.is_empty())
         .unwrap_or("application/json")
         .to_string();
-    let client_request_body = body.clone();
     let is_json_content = content_type
         .to_ascii_lowercase()
         .starts_with("application/json");
@@ -103,6 +102,9 @@ pub fn prepare_gateway_request_from_bytes(
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToString::to_string);
+    let last_message_content = json_value
+        .as_ref()
+        .and_then(extract_last_message_content_from_value);
     let billable_multiplier =
         if gateway_path == "/v1/chat/completions" || gateway_path == "/v1/responses" {
             resolve_billable_multiplier(json_value.as_ref())
@@ -164,7 +166,7 @@ pub fn prepare_gateway_request_from_bytes(
         original_path,
         upstream_path,
         method,
-        client_request_body,
+        client_request_body: None,
         request_body,
         model,
         client_visible_model: None,
@@ -175,6 +177,7 @@ pub fn prepare_gateway_request_from_bytes(
         thread_anchor,
         tool_name_restore_map,
         billable_multiplier,
+        last_message_content,
     })
 }
 
@@ -260,17 +263,22 @@ pub fn extract_last_message_content(body: &Bytes) -> Result<Option<String>, Stri
     }
     let value: Value = serde_json::from_slice(body)
         .map_err(|err| format!("failed to parse request body: {err}"))?;
-    let Some(root) = value.as_object() else {
+    if !value.is_object() {
         return Err("request body is not a JSON object".to_string());
-    };
+    }
+    Ok(extract_last_message_content_from_value(&value))
+}
+
+fn extract_last_message_content_from_value(value: &Value) -> Option<String> {
+    let root = value.as_object()?;
 
     if let Some(messages) = root.get("messages").and_then(Value::as_array) {
-        return Ok(extract_last_message_from_chat_messages(messages));
+        return extract_last_message_from_chat_messages(messages);
     }
     if let Some(input) = root.get("input") {
-        return Ok(extract_last_text_from_responses_input(input));
+        return extract_last_text_from_responses_input(input);
     }
-    Ok(None)
+    None
 }
 
 /// Convert request-level service tier hints into a billing multiplier.
@@ -1671,7 +1679,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_gateway_request_keeps_raw_client_body_and_normalized_upstream_body() {
+    async fn prepare_gateway_request_keeps_last_message_content_without_raw_body_copy() {
         let headers = axum::http::HeaderMap::new();
         let body = Body::from(r#"{"model":"gpt-5.3-codex","input":"hello"}"#);
 
@@ -1686,12 +1694,11 @@ mod tests {
         .await
         .expect("responses request should normalize");
 
-        let raw: serde_json::Value =
-            serde_json::from_slice(&prepared.client_request_body).expect("raw body json");
         let upstream: serde_json::Value =
             serde_json::from_slice(&prepared.request_body).expect("upstream body json");
 
-        assert_eq!(raw["input"], "hello");
+        assert!(prepared.client_request_body.is_none());
+        assert_eq!(prepared.last_message_content.as_deref(), Some("hello"));
         assert_eq!(upstream["input"][0]["type"], "message");
         assert_eq!(upstream["input"][0]["role"], "user");
         assert_eq!(upstream["input"][0]["content"][0]["type"], "input_text");
@@ -1937,6 +1944,7 @@ mod tests {
 
         assert_eq!(upstream["input"][0]["content"][0]["text"], "compressed hello");
         assert_eq!(upstream["stream"], true);
-        assert_eq!(prepared.client_request_body.as_ref()[0], b'{');
+        assert!(prepared.client_request_body.is_none());
+        assert_eq!(prepared.last_message_content.as_deref(), Some("compressed hello"));
     }
 }

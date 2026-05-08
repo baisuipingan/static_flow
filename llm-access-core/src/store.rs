@@ -1707,6 +1707,11 @@ pub trait ControlStore: Send + Sync {
 
     /// Increment usage counters for a key after a usage event is accepted.
     async fn apply_usage_rollup(&self, event: &UsageEvent) -> anyhow::Result<()>;
+
+    /// Increment usage counters for one owned usage event.
+    async fn apply_usage_rollup_owned(&self, event: UsageEvent) -> anyhow::Result<()> {
+        self.apply_usage_rollup(&event).await
+    }
 }
 
 /// Provider route/account resolution used by data-plane dispatch.
@@ -3123,15 +3128,17 @@ impl PublicStatusStore for EmptyPublicStatusStore {
 /// Analytics sink used by provider runtimes.
 #[async_trait]
 pub trait UsageEventSink: Send + Sync {
-    /// Persist one usage event.
-    async fn append_usage_event(&self, event: &UsageEvent) -> anyhow::Result<()>;
-
     /// Persist a batch of usage events.
-    async fn append_usage_events(&self, events: &[UsageEvent]) -> anyhow::Result<()> {
-        for event in events {
-            self.append_usage_event(event).await?;
-        }
-        Ok(())
+    async fn append_usage_events(&self, events: &[UsageEvent]) -> anyhow::Result<()>;
+
+    /// Persist one usage event.
+    async fn append_usage_event(&self, event: &UsageEvent) -> anyhow::Result<()> {
+        self.append_usage_events(std::slice::from_ref(event)).await
+    }
+
+    /// Persist an owned batch of usage events.
+    async fn append_usage_events_owned(&self, events: Vec<UsageEvent>) -> anyhow::Result<()> {
+        self.append_usage_events(&events).await
     }
 }
 

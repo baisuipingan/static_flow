@@ -748,7 +748,10 @@ impl ControlStore for SqliteControlRepository {
     }
 
     async fn apply_usage_rollup(&self, event: &UsageEvent) -> anyhow::Result<()> {
-        let event = event.clone();
+        self.apply_usage_rollup_owned(event.clone()).await
+    }
+
+    async fn apply_usage_rollup_owned(&self, event: UsageEvent) -> anyhow::Result<()> {
         let inner = Arc::clone(&self.inner);
         task::spawn_blocking(move || {
             let mut store = inner
@@ -904,15 +907,14 @@ impl ProviderRouteStore for SqliteControlRepository {
 
 #[async_trait]
 impl UsageEventSink for SqliteControlRepository {
-    async fn append_usage_event(&self, event: &UsageEvent) -> anyhow::Result<()> {
-        self.apply_usage_rollup(event).await
+    async fn append_usage_events(&self, events: &[UsageEvent]) -> anyhow::Result<()> {
+        self.append_usage_events_owned(events.to_vec()).await
     }
 
-    async fn append_usage_events(&self, events: &[UsageEvent]) -> anyhow::Result<()> {
+    async fn append_usage_events_owned(&self, events: Vec<UsageEvent>) -> anyhow::Result<()> {
         if events.is_empty() {
             return Ok(());
         }
-        let events = events.to_vec();
         let inner = Arc::clone(&self.inner);
         task::spawn_blocking(move || {
             let mut store = inner

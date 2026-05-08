@@ -248,8 +248,9 @@ impl UsageWorker {
                 .into_iter()
                 .map(|event| event.into_usage_event())
                 .collect::<Vec<_>>();
-            self.duckdb_usage.append_usage_events(&events).await?;
-            processed_events = processed_events.saturating_add(events.len() as u64);
+            let event_count = events.len() as u64;
+            self.duckdb_usage.append_usage_events_owned(events).await?;
+            processed_events = processed_events.saturating_add(event_count);
             let now = now_ms();
             let should_persist_progress = processed_blocks == 1
                 || last_progress_update_ms
@@ -666,7 +667,7 @@ mod tests {
                     .into_iter()
                     .map(|event| event.into_usage_event())
                     .collect::<Vec<_>>();
-                self.duckdb.append_usage_events(&events).await?;
+                self.duckdb.append_usage_events_owned(events).await?;
             }
             Ok(())
         }
