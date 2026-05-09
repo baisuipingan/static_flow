@@ -46,7 +46,7 @@ use llm_access_kiro::{
     anthropic::{
         converter::{
             convert_normalized_request_with_resolved_session, current_user_message_range,
-            extract_tool_result_content, map_model, normalize_request, preview_session_value,
+            extract_tool_result_content, normalize_request, preview_session_value,
             resolve_conversation_id_from_metadata, ConversionError, ResolvedConversationId,
             SessionFallbackReason, SessionIdSource, SessionTracking,
         },
@@ -84,7 +84,6 @@ const MAX_PROVIDER_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
 const DEFAULT_WIRE_ORIGINATOR: &str = "codex_cli_rs";
 const MAX_CODEX_CLIENT_VERSION_LEN: usize = 64;
 const KIRO_PROVIDER_AWS_SDK_VERSION: &str = "1.0.34";
-const KIRO_GENERATE_REQUEST_MAX_BODY_BYTES: usize = 1_600_000;
 const KIRO_REMOTE_IMAGE_MAX_BYTES: usize = 1_000_000;
 const KIRO_REMOTE_DOCUMENT_MAX_BYTES: usize = 8 * 1024 * 1024;
 const KIRO_REMOTE_MEDIA_TIMEOUT: Duration = Duration::from_secs(15);
@@ -1393,7 +1392,12 @@ impl KiroRemoteMediaFetcher for ReqwestKiroRemoteMediaFetcher {
 fn kiro_remote_media_accept_header(kind: KiroRemoteMediaKind) -> &'static str {
     match kind {
         KiroRemoteMediaKind::Image => "image/jpeg,image/png,image/gif,image/webp",
-        KiroRemoteMediaKind::Document => "application/pdf,text/plain,text/*",
+        KiroRemoteMediaKind::Document => {
+            "application/pdf,text/csv,application/msword,application/vnd.\
+             openxmlformats-officedocument.wordprocessingml.document,application/vnd.ms-excel,\
+             application/vnd.openxmlformats-officedocument.spreadsheetml.sheet,text/html,text/\
+             plain,text/markdown"
+        },
     }
 }
 
@@ -1582,16 +1586,22 @@ fn build_kiro_remote_document_source(
         .or_else(|| document_media_type_from_url(url))
         .ok_or_else(|| {
             KiroRemoteMediaResolutionError::new(
-                "URL document source must resolve to application/pdf or text/plain",
+                "URL document source must resolve to a supported Kiro document type",
             )
         })?;
     match media_type {
-        "application/pdf" => Ok(serde_json::json!({
-            "type": "base64",
-            "media_type": "application/pdf",
-            "data": base64::engine::general_purpose::STANDARD.encode(bytes)
-        })),
-        "text/plain" => {
+        "application/pdf"
+        | "application/msword"
+        | "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+        | "application/vnd.ms-excel"
+        | "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            Ok(serde_json::json!({
+                "type": "base64",
+                "media_type": media_type,
+                "data": base64::engine::general_purpose::STANDARD.encode(bytes)
+            }))
+        },
+        "text/plain" | "text/markdown" | "text/html" | "text/csv" => {
             let text = std::str::from_utf8(bytes).map_err(|err| {
                 KiroRemoteMediaResolutionError::new(format!(
                     "URL text document source is not valid UTF-8: {err}"
@@ -1599,7 +1609,7 @@ fn build_kiro_remote_document_source(
             })?;
             Ok(serde_json::json!({
                 "type": "text",
-                "media_type": "text/plain",
+                "media_type": media_type,
                 "data": text
             }))
         },
@@ -1629,8 +1639,18 @@ fn canonical_image_media_type(media_type: &str) -> Option<&'static str> {
 fn canonical_document_media_type(media_type: &str) -> Option<&'static str> {
     match media_type {
         "application/pdf" => Some("application/pdf"),
+        "text/csv" => Some("text/csv"),
+        "application/msword" => Some("application/msword"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        },
+        "application/vnd.ms-excel" => Some("application/vnd.ms-excel"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        },
+        "text/html" => Some("text/html"),
         "text/plain" => Some("text/plain"),
-        value if value.starts_with("text/") => Some("text/plain"),
+        "text/markdown" | "text/md" | "text/x-markdown" => Some("text/markdown"),
         _ => None,
     }
 }
@@ -1648,7 +1668,16 @@ fn image_media_type_from_url(url: &str) -> Option<&'static str> {
 fn document_media_type_from_url(url: &str) -> Option<&'static str> {
     match lower_url_path_extension(url).as_deref() {
         Some("pdf") => Some("application/pdf"),
+        Some("csv") => Some("text/csv"),
+        Some("doc") => Some("application/msword"),
+        Some("docx") => {
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        },
+        Some("xls") => Some("application/vnd.ms-excel"),
+        Some("xlsx") => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        Some("html" | "htm") => Some("text/html"),
         Some("txt") => Some("text/plain"),
+        Some("md" | "markdown") => Some("text/markdown"),
         _ => None,
     }
 }
@@ -1758,7 +1787,7 @@ struct KiroVisionBridgeImage {
 }
 
 fn kiro_opus_vision_bridge_required(payload: &MessagesRequest) -> bool {
-    matches!(map_model(&payload.model).as_deref(), Some("claude-opus-4.6" | "claude-opus-4.7"))
+    matches!(payload.model.as_str(), "claude-opus-4-6" | "claude-opus-4-7")
         && !collect_kiro_vision_bridge_images(payload).is_empty()
 }
 
@@ -1804,6 +1833,10 @@ fn collect_kiro_vision_bridge_images(payload: &MessagesRequest) -> Vec<KiroVisio
                 data: data.to_string(),
             });
         }
+    }
+    if images.len() > 10 {
+        let keep_from = images.len() - 10;
+        images.drain(0..keep_from);
     }
     images
 }
@@ -1868,6 +1901,7 @@ fn build_kiro_vision_bridge_request(
             .iter()
             .map(|image| KiroImage::from_base64(image.format.clone(), image.data.clone()))
             .collect(),
+        documents: Vec::new(),
         origin: Some("AI_EDITOR".to_string()),
     };
     let conversation_state = ConversationState::new(uuid::Uuid::new_v4().to_string())
@@ -1890,15 +1924,11 @@ fn kiro_assistant_text_from_response_bytes(bytes: &[u8]) -> Result<String, Strin
             Event::Error {
                 error_code,
                 error_message,
-            } => {
-                return Err(format!("{error_code}: {error_message}"));
-            },
+            } => return Err(format!("{error_code}: {error_message}")),
             Event::Exception {
                 exception_type,
                 message,
-            } => {
-                return Err(format!("{exception_type}: {message}"));
-            },
+            } => return Err(format!("{exception_type}: {message}")),
             Event::ToolUse(tool) => {
                 return Err(format!("vision bridge unexpectedly requested tool `{}`", tool.name));
             },
@@ -1945,13 +1975,6 @@ async fn describe_kiro_images_with_sonnet_bridge(
                 ));
             },
         };
-        if request_body.len() > KIRO_GENERATE_REQUEST_MAX_BODY_BYTES {
-            return Err(kiro_json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "image payload is too large for Kiro vision bridge",
-            ));
-        }
         let upstream_url = format!(
             "{}/generateAssistantResponse",
             kiro_refresh::runtime_upstream_base_url(&route.api_region)
@@ -2366,36 +2389,6 @@ async fn dispatch_kiro_proxy(
         if route.zero_cache_debug_enabled || route.full_request_logging_enabled {
             capture_client_request_body_json(&mut usage_meta, &body);
             capture_upstream_request_body_json(&mut usage_meta, &request_body);
-        }
-        if request_body.len() > KIRO_GENERATE_REQUEST_MAX_BODY_BYTES {
-            capture_client_request_body_json(&mut usage_meta, &body);
-            capture_upstream_request_body_json(&mut usage_meta, &request_body);
-            usage_meta.mark_stream_finish();
-            if let Err(err) = record_kiro_usage(KiroUsageRecord {
-                control_store: control_store.as_ref(),
-                key: &key,
-                route: &route,
-                endpoint: public_path,
-                model: &effective_model,
-                status: StatusCode::BAD_REQUEST,
-                usage: zero_kiro_usage_summary(),
-                cache_ctx: &cache_ctx,
-                meta: &usage_meta,
-            })
-            .await
-            {
-                tracing::warn!(
-                    key_id = %key.key_id,
-                    account = %route.account_name,
-                    error = %err,
-                    "failed to record kiro oversized request usage"
-                );
-            }
-            return kiro_json_error(
-                StatusCode::BAD_REQUEST,
-                "invalid_request_error",
-                "Context window is full. Reduce conversation history, system prompt, or tools.",
-            );
         }
         let upstream_url = format!(
             "{}/generateAssistantResponse",
@@ -5487,7 +5480,7 @@ mod tests {
             &self,
             request: super::KiroRemoteMediaRequest<'_>,
         ) -> Result<super::ResolvedKiroRemoteMedia, super::KiroRemoteMediaResolutionError> {
-            assert_eq!(request.url, "https://example.test/asset");
+            assert!(request.url.starts_with("https://example.test/asset"));
             Ok(super::ResolvedKiroRemoteMedia {
                 media_type: Some(self.media_type.to_string()),
                 bytes: super::Bytes::from_static(self.bytes),
@@ -5558,6 +5551,38 @@ mod tests {
         assert_eq!(source["type"], "base64");
         assert_eq!(source["media_type"], "application/pdf");
         assert_eq!(source["data"], "JVBERi0xLjQ=");
+    }
+
+    #[tokio::test]
+    async fn kiro_remote_media_resolver_rewrites_url_markdown_documents() {
+        let mut payload =
+            serde_json::from_value::<llm_access_kiro::anthropic::types::MessagesRequest>(json!({
+                "model": "claude-sonnet-4-6",
+                "max_tokens": 128,
+                "messages": [{
+                    "role": "user",
+                    "content": [{
+                        "type": "document",
+                        "source": {"type": "url", "url": "https://example.test/asset.md"}
+                    }]
+                }]
+            }))
+            .expect("request payload");
+
+        super::resolve_kiro_remote_media_sources_with_fetcher(
+            &mut payload,
+            &StaticRemoteMediaFetcher {
+                media_type: "text/markdown",
+                bytes: b"# Heading\n\nbody",
+            },
+        )
+        .await
+        .expect("remote markdown should resolve");
+
+        let source = &payload.messages[0].content[0]["source"];
+        assert_eq!(source["type"], "text");
+        assert_eq!(source["media_type"], "text/markdown");
+        assert_eq!(source["data"], "# Heading\n\nbody");
     }
 
     #[test]
@@ -6099,42 +6124,6 @@ mod tests {
     }
 
     #[test]
-    fn kiro_opus_vision_bridge_is_required_for_opus_46_and_47_images() {
-        let opus_payload = serde_json::from_value(json!({
-            "model": "claude-opus-4-6",
-            "max_tokens": 64,
-            "messages": [{
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "What color is this?"},
-                    {
-                        "type": "image",
-                        "source": {
-                            "type": "base64",
-                            "media_type": "image/png",
-                            "data": "aGVsbG8="
-                        }
-                    }
-                ]
-            }]
-        }))
-        .expect("request should deserialize");
-        assert!(super::kiro_opus_vision_bridge_required(&opus_payload));
-
-        let mut opus_47_payload = opus_payload.clone();
-        opus_47_payload.model = "claude-opus-4-7".to_string();
-        assert!(super::kiro_opus_vision_bridge_required(&opus_47_payload));
-
-        let mut sonnet_payload = opus_payload.clone();
-        sonnet_payload.model = "claude-sonnet-4-6".to_string();
-        assert!(!super::kiro_opus_vision_bridge_required(&sonnet_payload));
-
-        let mut text_payload = opus_payload;
-        text_payload.messages[0].content = json!("hello");
-        assert!(!super::kiro_opus_vision_bridge_required(&text_payload));
-    }
-
-    #[test]
     fn override_kiro_thinking_aligns_opus_47_with_opus_46() {
         let mut payload: llm_access_kiro::anthropic::types::MessagesRequest =
             serde_json::from_value(json!({
@@ -6164,6 +6153,69 @@ mod tests {
     #[test]
     fn normalize_kiro_kmodel_name_maps_opus_47_back_to_public_name() {
         assert_eq!(super::normalize_kiro_kmodel_name("claude-opus-4.7"), "claude-opus-4-7");
+    }
+
+    #[test]
+    fn kiro_opus_vision_bridge_is_required_for_opus_46_and_47_images() {
+        let opus_payload: llm_access_kiro::anthropic::types::MessagesRequest =
+            serde_json::from_value(json!({
+                "model": "claude-opus-4-6",
+                "max_tokens": 64,
+                "messages": [{
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": "What color is this?"},
+                        {
+                            "type": "image",
+                            "source": {
+                                "type": "base64",
+                                "media_type": "image/png",
+                                "data": "aGVsbG8="
+                            }
+                        }
+                    ]
+                }]
+            }))
+            .expect("request should deserialize");
+        assert!(super::kiro_opus_vision_bridge_required(&opus_payload));
+
+        let mut opus_47_payload = opus_payload.clone();
+        opus_47_payload.model = "claude-opus-4-7".to_string();
+        assert!(super::kiro_opus_vision_bridge_required(&opus_47_payload));
+
+        let mut sonnet_payload = opus_payload.clone();
+        sonnet_payload.model = "claude-sonnet-4-6".to_string();
+        assert!(!super::kiro_opus_vision_bridge_required(&sonnet_payload));
+
+        let mut text_payload = opus_payload;
+        text_payload.messages[0].content = json!("hello");
+        assert!(!super::kiro_opus_vision_bridge_required(&text_payload));
+    }
+
+    #[test]
+    fn kiro_vision_bridge_keeps_only_the_last_ten_images() {
+        let payload: llm_access_kiro::anthropic::types::MessagesRequest =
+            serde_json::from_value(json!({
+                "model": "claude-opus-4-7",
+                "max_tokens": 64,
+                "messages": [{
+                    "role": "user",
+                    "content": (0..11).map(|index| json!({
+                        "type": "image",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "image/png",
+                            "data": format!("image-{index}")
+                        }
+                    })).collect::<Vec<_>>()
+                }]
+            }))
+            .expect("request should deserialize");
+
+        let images = super::collect_kiro_vision_bridge_images(&payload);
+        assert_eq!(images.len(), 10);
+        assert_eq!(images[0].data, "image-1");
+        assert_eq!(images[9].data, "image-10");
     }
 
     #[test]
@@ -6223,6 +6275,69 @@ mod tests {
             .get("text")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|text| text.contains("solid red square"))));
+    }
+
+    #[tokio::test]
+    async fn kiro_dispatch_routes_opus_images_through_vision_bridge() {
+        let _guard = crate::KIRO_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("kiro upstream env lock");
+        let captured = Arc::new(CapturedKiroUpstream::default());
+        let upstream_base = spawn_fake_kiro_upstream(captured.clone()).await;
+        std::env::set_var("KIRO_UPSTREAM_BASE_URL", upstream_base);
+
+        let state = super::ProviderState::new(Arc::new(TestStore), static_kiro_route_store());
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/api/kiro-gateway/v1/messages")
+                .header("x-api-key", "valid-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "claude-opus-4-7",
+                        "max_tokens": 128,
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "text", "text": "What color is this?"},
+                                {
+                                    "type": "image",
+                                    "source": {
+                                        "type": "base64",
+                                        "media_type": "image/png",
+                                        "data": "aGVsbG8="
+                                    }
+                                }
+                            ]
+                        }],
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        std::env::remove_var("KIRO_UPSTREAM_BASE_URL");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = captured.requests.lock().expect("captured requests");
+        assert_eq!(requests.len(), 2);
+
+        let bridge = &requests[0].body["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(bridge["modelId"], "claude-sonnet-4.6");
+        assert_eq!(bridge["origin"], "AI_EDITOR");
+        assert_eq!(bridge["images"].as_array().map(Vec::len), Some(1));
+
+        let current = &requests[1].body["conversationState"]["currentMessage"]["userInputMessage"];
+        assert_eq!(current["modelId"], "claude-opus-4.7");
+        assert!(
+            current["content"].as_str().is_some_and(
+                |text| text.contains("<image_context source=\"kiro-sonnet-4.6-vision\">")
+            )
+        );
     }
 
     #[test]
@@ -6633,6 +6748,45 @@ mod tests {
             .expect("upstream response")
     }
 
+    async fn fake_kiro_generate_content_length_error(
+        State(captured): State<Arc<CapturedKiroUpstream>>,
+        headers: HeaderMap,
+        request: Request<Body>,
+    ) -> Response {
+        let path = request.uri().path().to_string();
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("upstream request body");
+        let body = serde_json::from_slice::<serde_json::Value>(&body).expect("upstream json");
+        captured
+            .requests
+            .lock()
+            .expect("captured requests")
+            .push(CapturedKiroRequest {
+                path,
+                authorization: headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string),
+                user_agent: super::header_value(&headers, header::USER_AGENT.as_str()),
+                x_amz_user_agent: super::header_value(&headers, "x-amz-user-agent"),
+                host: super::header_value(&headers, "host"),
+                token_type: super::header_value(&headers, "TokenType"),
+                redirect_for_internal: super::header_value(&headers, "redirect-for-internal"),
+                agent_mode: super::header_value(&headers, "x-amzn-kiro-agent-mode"),
+                opt_out: super::header_value(&headers, "x-amzn-codewhisperer-optout"),
+                body,
+            });
+        (
+            StatusCode::BAD_REQUEST,
+            Json(json!({
+                "reason": "CONTENT_LENGTH_EXCEEDS_THRESHOLD",
+                "message": "Input is too long."
+            })),
+        )
+            .into_response()
+    }
+
     async fn fake_kiro_usage_limits(
         State(captured): State<Arc<CapturedKiroUpstream>>,
         headers: HeaderMap,
@@ -6763,6 +6917,26 @@ mod tests {
     async fn spawn_fake_kiro_reasoning_upstream(captured: Arc<CapturedKiroUpstream>) -> String {
         let app = Router::new()
             .route("/generateAssistantResponse", post(fake_kiro_generate_reasoning))
+            .route("/mcp", post(fake_kiro_mcp))
+            .route("/getUsageLimits", get(fake_kiro_usage_limits))
+            .with_state(captured);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake upstream");
+        });
+        upstream_base
+    }
+
+    async fn spawn_fake_kiro_content_length_error_upstream(
+        captured: Arc<CapturedKiroUpstream>,
+    ) -> String {
+        let app = Router::new()
+            .route("/generateAssistantResponse", post(fake_kiro_generate_content_length_error))
             .route("/mcp", post(fake_kiro_mcp))
             .route("/getUsageLimits", get(fake_kiro_usage_limits))
             .with_state(captured);
@@ -7813,7 +7987,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn kiro_dispatch_rejects_oversized_upstream_generate_body_before_upstream() {
+    async fn kiro_dispatch_rejects_more_than_five_documents_before_upstream() {
         let _guard = crate::KIRO_UPSTREAM_ENV_LOCK
             .lock()
             .expect("kiro upstream env lock");
@@ -7821,7 +7995,135 @@ mod tests {
         let upstream_base = spawn_fake_kiro_upstream(captured.clone()).await;
         std::env::set_var("KIRO_UPSTREAM_BASE_URL", upstream_base);
 
-        let oversized_text = "a".repeat(super::KIRO_GENERATE_REQUEST_MAX_BODY_BYTES + 1);
+        let store = Arc::new(RecordingControlStore::default());
+        let state = super::ProviderState::new(store.clone(), static_kiro_route_store());
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/api/kiro-gateway/v1/messages")
+                .header("x-api-key", "valid-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 128,
+                        "messages": [{
+                            "role": "user",
+                            "content": [
+                                {"type": "document", "name": "doc-1.txt", "source": {"type": "text", "media_type": "text/plain", "data": "one"}},
+                                {"type": "document", "name": "doc-2.txt", "source": {"type": "text", "media_type": "text/plain", "data": "two"}},
+                                {"type": "document", "name": "doc-3.txt", "source": {"type": "text", "media_type": "text/plain", "data": "three"}},
+                                {"type": "document", "name": "doc-4.txt", "source": {"type": "text", "media_type": "text/plain", "data": "four"}},
+                                {"type": "document", "name": "doc-5.txt", "source": {"type": "text", "media_type": "text/plain", "data": "five"}},
+                                {"type": "document", "name": "doc-6.txt", "source": {"type": "text", "media_type": "text/plain", "data": "six"}},
+                                {"type": "text", "text": "Summarize these documents."}
+                            ]
+                        }],
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        std::env::remove_var("KIRO_UPSTREAM_BASE_URL");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8 response");
+        assert!(body.contains("Too many documents attached"));
+        assert!(captured
+            .requests
+            .lock()
+            .expect("captured requests")
+            .is_empty());
+        let events = store.usage_events.lock().expect("usage events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status_code, 400);
+    }
+
+    #[tokio::test]
+    async fn kiro_dispatch_keeps_only_the_last_ten_images_before_upstream() {
+        let _guard = crate::KIRO_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("kiro upstream env lock");
+        let captured = Arc::new(CapturedKiroUpstream::default());
+        let upstream_base = spawn_fake_kiro_upstream(captured.clone()).await;
+        std::env::set_var("KIRO_UPSTREAM_BASE_URL", upstream_base);
+
+        let store = Arc::new(RecordingControlStore::default());
+        let state = super::ProviderState::new(store.clone(), static_kiro_route_store());
+        let images = (0..11)
+            .map(|index| {
+                serde_json::json!({
+                    "type": "image",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "image/png",
+                        "data": format!("image-{index}")
+                    }
+                })
+            })
+            .collect::<Vec<_>>();
+        let mut content = images;
+        content.push(serde_json::json!({
+            "type": "text",
+            "text": "Describe these images."
+        }));
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/api/kiro-gateway/v1/messages")
+                .header("x-api-key", "valid-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 128,
+                        "messages": [{
+                            "role": "user",
+                            "content": content
+                        }],
+                        "stream": false
+                    })
+                    .to_string(),
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        std::env::remove_var("KIRO_UPSTREAM_BASE_URL");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = captured.requests.lock().expect("captured requests");
+        assert_eq!(requests.len(), 1);
+        let images = requests[0].body["conversationState"]["currentMessage"]["userInputMessage"]
+            ["images"]
+            .as_array()
+            .expect("images array");
+        assert_eq!(images.len(), 10);
+        assert_eq!(images[0]["source"]["bytes"], "image-1");
+        assert_eq!(images[9]["source"]["bytes"], "image-10");
+        let events = store.usage_events.lock().expect("usage events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status_code, 200);
+    }
+
+    #[tokio::test]
+    async fn kiro_dispatch_passthroughs_upstream_content_length_errors() {
+        let _guard = crate::KIRO_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("kiro upstream env lock");
+        let captured = Arc::new(CapturedKiroUpstream::default());
+        let upstream_base = spawn_fake_kiro_content_length_error_upstream(captured.clone()).await;
+        std::env::set_var("KIRO_UPSTREAM_BASE_URL", upstream_base);
+
+        let oversized_text = "a".repeat(2 * 1024 * 1024);
         let body = serde_json::json!({
             "model": "claude-sonnet-4-6",
             "max_tokens": 128,
@@ -7848,12 +8150,9 @@ mod tests {
             .await
             .expect("response body");
         let body = String::from_utf8(body.to_vec()).expect("utf8 response");
-        assert!(body.contains("Context window is full"));
-        assert!(captured
-            .requests
-            .lock()
-            .expect("captured requests")
-            .is_empty());
+        assert!(body.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD"));
+        assert!(body.contains("Input is too long."));
+        assert!(captured.requests.lock().expect("captured requests").len() == 1);
     }
 
     #[tokio::test]

@@ -716,6 +716,7 @@ fn canonicalize_current_turn_as_history(message: &UserInputMessage) -> Vec<Strin
     canonicalize_user_message("history_user", &UserMessage {
         content: message.content.clone(),
         images: message.images.clone(),
+        documents: message.documents.clone(),
         user_input_message_context: message.user_input_message_context.clone(),
         model_id: message.model_id.clone(),
         origin: message.origin.clone(),
@@ -729,6 +730,7 @@ fn canonicalize_current_turn_for_input(message: &UserInputMessage) -> Vec<Canoni
     canonicalize_user_message("current_user", &UserMessage {
         content: message.content.clone(),
         images: message.images.clone(),
+        documents: message.documents.clone(),
         user_input_message_context: message.user_input_message_context.clone(),
         model_id: message.model_id.clone(),
         origin: message.origin.clone(),
@@ -754,6 +756,19 @@ fn canonicalize_user_message(kind_prefix: &str, message: &UserMessage) -> Vec<Ca
             kind: format!("{kind_prefix}_image"),
             format: normalize_text(&image.format),
             digest: sha256_hex(image.source.bytes.as_bytes()),
+        });
+        units.push(CanonicalInputUnit {
+            key,
+            token_atoms: Vec::new(),
+        });
+    }
+
+    for document in &message.documents {
+        let key = serialize_canonical_segment(&CanonicalDocumentSegment {
+            kind: format!("{kind_prefix}_document"),
+            name: normalize_text(&document.name),
+            format: normalize_text(&document.format),
+            digest: sha256_hex(document.source.bytes.as_bytes()),
         });
         units.push(CanonicalInputUnit {
             key,
@@ -975,6 +990,14 @@ struct CanonicalTextSegment {
 #[derive(Serialize)]
 struct CanonicalImageSegment {
     kind: String,
+    format: String,
+    digest: String,
+}
+
+#[derive(Serialize)]
+struct CanonicalDocumentSegment {
+    kind: String,
+    name: String,
     format: String,
     digest: String,
 }

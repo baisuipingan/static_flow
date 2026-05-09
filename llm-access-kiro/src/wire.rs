@@ -93,6 +93,8 @@ pub struct UserInputMessage {
     pub model_id: String,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<KiroDocument>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub origin: Option<String>,
 }
@@ -104,6 +106,7 @@ impl UserInputMessage {
             content: content.into(),
             model_id: model_id.into(),
             images: Vec::new(),
+            documents: Vec::new(),
             origin: Some("AI_EDITOR".to_string()),
         }
     }
@@ -119,6 +122,11 @@ impl UserInputMessage {
             // Kiro rejects current-turn image payloads when `origin` is present.
             self.origin = None;
         }
+        self
+    }
+
+    pub fn with_documents(mut self, documents: Vec<KiroDocument>) -> Self {
+        self.documents = documents;
         self
     }
 
@@ -183,6 +191,36 @@ pub struct KiroImageSource {
     pub bytes: String,
 }
 
+/// Base64-encoded document attachment for a Kiro message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct KiroDocument {
+    pub name: String,
+    pub format: String,
+    pub source: KiroDocumentSource,
+}
+
+impl KiroDocument {
+    pub fn from_base64(
+        name: impl Into<String>,
+        format: impl Into<String>,
+        data: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            format: format.into(),
+            source: KiroDocumentSource {
+                bytes: data.into(),
+            },
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct KiroDocumentSource {
+    pub bytes: String,
+}
+
 /// A conversation history entry: either a user message or an assistant
 /// response. Deserialized via `#[serde(untagged)]` — user messages are tried
 /// first.
@@ -217,6 +255,8 @@ pub struct UserMessage {
     pub origin: Option<String>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub images: Vec<KiroImage>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub documents: Vec<KiroDocument>,
     #[serde(default, skip_serializing_if = "is_default_context")]
     pub user_input_message_context: UserInputMessageContext,
 }
@@ -232,12 +272,18 @@ impl UserMessage {
             model_id: model_id.into(),
             origin: Some("AI_EDITOR".to_string()),
             images: Vec::new(),
+            documents: Vec::new(),
             user_input_message_context: UserInputMessageContext::default(),
         }
     }
 
     pub fn with_context(mut self, context: UserInputMessageContext) -> Self {
         self.user_input_message_context = context;
+        self
+    }
+
+    pub fn with_documents(mut self, documents: Vec<KiroDocument>) -> Self {
+        self.documents = documents;
         self
     }
 }

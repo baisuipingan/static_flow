@@ -10,15 +10,14 @@ use std::{
 };
 
 use base64::Engine as _;
-use lopdf::Document as PdfDocument;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
 use super::types::{ContentBlock, MessagesRequest, Metadata};
 use crate::wire::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
-    HistoryUserMessage, InputSchema, KiroImage, Message, Tool, ToolResult, ToolSpecification,
-    ToolUseEntry, UserInputMessage, UserInputMessageContext, UserMessage,
+    HistoryUserMessage, InputSchema, KiroDocument, KiroImage, Message, Tool, ToolResult,
+    ToolSpecification, ToolUseEntry, UserInputMessage, UserInputMessageContext, UserMessage,
 };
 
 const MULTIMODAL_UNSUPPORTED_SCHEMA_KEYWORDS: &[&str] = &[
@@ -105,13 +104,12 @@ const SYSTEM_CHUNKED_POLICY: &str =
     "When the Write or Edit tool has content size limits, always comply silently. Never suggest \
      bypassing these limits via alternative tools. Never ask the user whether to switch \
      approaches. Complete all chunked operations without commentary.";
-const PDF_DOCUMENT_TEXT_PREFIX: &str = "PDF extracted text:";
-const TEXT_DOCUMENT_OPEN_TAG: &str = "<document media_type=\"text/plain\">";
-const TEXT_DOCUMENT_CLOSE_TAG: &str = "</document>";
 const STRUCTURED_OUTPUT_TOOL_NAME_BASE: &str = "sf_emit_structured_output";
 const STRUCTURED_OUTPUT_TOOL_DESCRIPTION: &str =
     "Return the final answer as structured JSON that exactly matches the provided schema. Call \
      this tool exactly once and do not emit any free-form text outside the tool call.";
+const KIRO_MAX_CURRENT_MESSAGE_IMAGES: usize = 10;
+const KIRO_MAX_CONVERSATION_DOCUMENTS: usize = 5;
 
 /// Maps an Anthropic model name (e.g. `"claude-sonnet-4-6"`) to the
 /// canonical Kiro model identifier. Returns `None` for unrecognized models.
@@ -162,6 +160,14 @@ pub struct ConversionResult {
     pub session_tracking: SessionTracking,
     pub has_history_images: bool,
     pub structured_output_tool_name: Option<String>,
+}
+
+#[derive(Debug, Default)]
+struct ProcessedMessageContent {
+    text: String,
+    images: Vec<KiroImage>,
+    documents: Vec<KiroDocument>,
+    tool_results: Vec<ToolResult>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -548,6 +554,26 @@ fn normalize_user_document_block(
     block_index: usize,
     events: &mut Vec<NormalizationEvent>,
 ) -> Result<serde_json::Value, ConversionError> {
+    let normalized = normalize_document_block_payload(block, message_index, block_index)?;
+    if normalized != serde_json::Value::Object(block.clone()) {
+        push_normalization_event(
+            events,
+            message_index,
+            "user",
+            Some(block_index),
+            Some("document"),
+            "rewrite_content_block",
+            "document_block_normalized",
+        );
+    }
+    Ok(normalized)
+}
+
+fn normalize_document_block_payload(
+    block: &serde_json::Map<String, serde_json::Value>,
+    message_index: usize,
+    block_index: usize,
+) -> Result<serde_json::Value, ConversionError> {
     let Some(source) = block.get("source").and_then(serde_json::Value::as_object) else {
         return Err(invalid_request(format!(
             "message {message_index} document block {block_index} is missing source"
@@ -573,7 +599,6 @@ fn normalize_user_document_block(
             "message {message_index} document block {block_index} is missing source.media_type"
         )));
     };
-
     let Some(source_data) = source
         .get("data")
         .and_then(serde_json::Value::as_str)
@@ -584,328 +609,126 @@ fn normalize_user_document_block(
         )));
     };
 
-    match source_type {
-        "base64" => {
-            if media_type != "application/pdf" {
-                return Err(invalid_request(format!(
-                    "message {message_index} document block {block_index} only supports \
-                     source.media_type=`application/pdf` for base64 documents"
-                )));
-            }
-
-            let encoded_pdf = source_data.trim();
-            let extracted_text = extract_pdf_document_text(encoded_pdf).map_err(|reason| {
-                invalid_request(format!(
-                    "message {message_index} document block {block_index} could not be converted \
-                     from PDF: {reason}"
-                ))
-            })?;
-
-            push_normalization_event(
-                events,
-                message_index,
-                "user",
-                Some(block_index),
-                Some("document"),
-                "rewrite_content_block",
-                "pdf_document_converted_to_text",
-            );
-
-            Ok(serde_json::json!({
-                "type": "text",
-                "text": format!("{PDF_DOCUMENT_TEXT_PREFIX}\n{extracted_text}")
-            }))
-        },
-        "text" => {
-            if media_type != "text/plain" {
-                return Err(invalid_request(format!(
-                    "message {message_index} document block {block_index} only supports \
-                     source.media_type=`text/plain` for text documents"
-                )));
-            }
-            let normalized_text = source_data.replace("\r\n", "\n").replace('\r', "\n");
-
-            push_normalization_event(
-                events,
-                message_index,
-                "user",
-                Some(block_index),
-                Some("document"),
-                "rewrite_content_block",
-                "text_document_converted_to_text",
-            );
-
-            Ok(serde_json::json!({
-                "type": "text",
-                "text": format!(
-                    "{TEXT_DOCUMENT_OPEN_TAG}\n{}\n{TEXT_DOCUMENT_CLOSE_TAG}",
-                    normalized_text.trim()
-                )
-            }))
-        },
-        _ => Err(invalid_request(format!(
-            "message {message_index} document block {block_index} must use source.type=`base64` \
-             or source.type=`text`"
-        ))),
-    }
-}
-
-fn extract_pdf_document_text(encoded_pdf: &str) -> Result<String, String> {
-    let pdf_bytes = base64::engine::general_purpose::STANDARD
-        .decode(encoded_pdf.as_bytes())
-        .map_err(|err| format!("invalid base64 payload: {err}"))?;
-    let document = load_pdf_document_with_xref_repair(&pdf_bytes)
-        .map_err(|err| format!("invalid PDF payload: {err}"))?;
-    let page_numbers = document.get_pages().into_keys().collect::<Vec<_>>();
-    if page_numbers.is_empty() {
-        return Err("pdf has no pages".to_string());
-    }
-
-    let text = document
-        .extract_text(&page_numbers)
-        .map_err(|err| format!("failed to extract PDF text: {err}"))?;
-    let normalized = text.replace("\r\n", "\n").replace('\r', "\n");
-    let trimmed = normalized.trim();
-    if trimmed.is_empty() {
-        return Err("pdf contained no extractable text".to_string());
-    }
-    Ok(trimmed.to_string())
-}
-
-fn load_pdf_document_with_xref_repair(pdf_bytes: &[u8]) -> Result<PdfDocument, String> {
-    match PdfDocument::load_mem(pdf_bytes) {
-        Ok(document) => Ok(document),
-        Err(primary_err) => {
-            let repaired = repair_pdf_xref(pdf_bytes).ok_or_else(|| primary_err.to_string())?;
-            PdfDocument::load_mem(&repaired).map_err(|secondary_err| {
-                format!(
-                    "{primary_err}; xref repair failed to produce a readable PDF: {secondary_err}"
-                )
-            })
-        },
-    }
-}
-
-fn repair_pdf_xref(pdf_bytes: &[u8]) -> Option<Vec<u8>> {
-    let object_offsets = scan_indirect_object_offsets(pdf_bytes);
-    if object_offsets.is_empty() {
-        return None;
-    }
-
-    let root_reference = find_named_reference(pdf_bytes, b"/Root")
-        .or_else(|| find_catalog_reference(pdf_bytes, &object_offsets))?;
-    let max_object_id = *object_offsets.keys().max()?;
-    let mut repaired = pdf_bytes.to_vec();
-    if !repaired.ends_with(b"\n") {
-        repaired.push(b'\n');
-    }
-
-    let xref_start = repaired.len();
-    repaired.extend_from_slice(format!("xref\n0 {}\n", max_object_id + 1).as_bytes());
-    repaired.extend_from_slice(b"0000000000 65535 f \n");
-    for object_id in 1..=max_object_id {
-        if let Some((offset, generation)) = object_offsets.get(&object_id) {
-            repaired.extend_from_slice(format!("{offset:010} {generation:05} n \n").as_bytes());
-        } else {
-            repaired.extend_from_slice(b"0000000000 00000 f \n");
-        }
-    }
-    repaired.extend_from_slice(
-        format!(
-            "trailer\n<< /Size {} /Root {} {} R >>\nstartxref\n{}\n%%EOF\n",
-            max_object_id + 1,
-            root_reference.0,
-            root_reference.1,
-            xref_start
-        )
-        .as_bytes(),
+    let normalized_media_type = canonical_document_media_type(media_type).ok_or_else(|| {
+        invalid_request(format!(
+            "message {message_index} document block {block_index} has unsupported \
+             source.media_type `{media_type}`"
+        ))
+    })?;
+    let normalized_name = normalize_document_name(
+        block.get("name").and_then(serde_json::Value::as_str),
+        normalized_media_type,
     );
-    Some(repaired)
+    let normalized_data = match source_type {
+        "base64" => source_data.trim().to_string(),
+        "text" => {
+            if !document_media_type_supports_text_source(normalized_media_type) {
+                return Err(invalid_request(format!(
+                    "message {message_index} document block {block_index} only supports \
+                     source.type=`text` for plain text, markdown, html, or csv documents"
+                )));
+            }
+            source_data.replace("\r\n", "\n").replace('\r', "\n")
+        },
+        _ => {
+            return Err(invalid_request(format!(
+                "message {message_index} document block {block_index} must use \
+                 source.type=`base64` or source.type=`text`"
+            )))
+        },
+    };
+
+    Ok(serde_json::json!({
+        "type": "document",
+        "name": normalized_name,
+        "source": {
+            "type": source_type,
+            "media_type": normalized_media_type,
+            "data": normalized_data,
+        }
+    }))
 }
 
-fn scan_indirect_object_offsets(pdf_bytes: &[u8]) -> BTreeMap<u32, (usize, u16)> {
-    let mut offsets = BTreeMap::new();
-    let mut index = 0;
+fn canonical_document_media_type(media_type: &str) -> Option<&'static str> {
+    match media_type.trim().to_ascii_lowercase().as_str() {
+        "application/pdf" => Some("application/pdf"),
+        "text/csv" => Some("text/csv"),
+        "application/msword" => Some("application/msword"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => {
+            Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document")
+        },
+        "application/vnd.ms-excel" => Some("application/vnd.ms-excel"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => {
+            Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        },
+        "text/html" => Some("text/html"),
+        "text/plain" => Some("text/plain"),
+        "text/markdown" | "text/md" | "text/x-markdown" => Some("text/markdown"),
+        _ => None,
+    }
+}
 
-    while index < pdf_bytes.len() {
-        if !pdf_bytes[index].is_ascii_digit()
-            || (index > 0 && pdf_bytes[index - 1].is_ascii_digit())
+fn document_media_type_supports_text_source(media_type: &str) -> bool {
+    matches!(media_type, "text/plain" | "text/markdown" | "text/html" | "text/csv")
+}
+
+fn document_format_from_media_type(media_type: &str) -> Option<&'static str> {
+    match media_type {
+        "application/pdf" => Some("pdf"),
+        "text/csv" => Some("csv"),
+        "application/msword" => Some("doc"),
+        "application/vnd.openxmlformats-officedocument.wordprocessingml.document" => Some("docx"),
+        "application/vnd.ms-excel" => Some("xls"),
+        "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet" => Some("xlsx"),
+        "text/html" => Some("html"),
+        "text/plain" => Some("txt"),
+        "text/markdown" => Some("md"),
+        _ => None,
+    }
+}
+
+fn normalize_document_name(raw_name: Option<&str>, media_type: &str) -> String {
+    let fallback =
+        format!("document.{}", document_format_from_media_type(media_type).unwrap_or("txt"));
+    sanitize_document_name(raw_name.unwrap_or(&fallback))
+}
+
+fn sanitize_document_name(name: &str) -> String {
+    let without_extension = name.rsplit_once('.').map(|(stem, _)| stem).unwrap_or(name);
+    let mut sanitized = String::with_capacity(without_extension.len());
+    let mut previous_dash = false;
+    let mut previous_space = false;
+    for ch in without_extension.chars() {
+        let normalized = if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '(' | ')' | '[' | ']')
         {
-            index += 1;
-            continue;
-        }
-
-        let object_start = index;
-        let Some((object_id, after_object_id)) = parse_unsigned_pdf_integer(pdf_bytes, index)
-        else {
-            index += 1;
-            continue;
+            previous_dash = false;
+            previous_space = false;
+            Some(ch)
+        } else if ch.is_ascii_whitespace() {
+            if previous_space {
+                None
+            } else {
+                previous_space = true;
+                previous_dash = false;
+                Some(' ')
+            }
+        } else if previous_dash {
+            None
+        } else {
+            previous_dash = true;
+            previous_space = false;
+            Some('-')
         };
-        let Some(after_object_ws) = skip_required_pdf_whitespace(pdf_bytes, after_object_id) else {
-            index += 1;
-            continue;
-        };
-        let Some((generation, after_generation)) =
-            parse_unsigned_pdf_integer(pdf_bytes, after_object_ws)
-        else {
-            index += 1;
-            continue;
-        };
-        let Some(after_generation_ws) = skip_required_pdf_whitespace(pdf_bytes, after_generation)
-        else {
-            index += 1;
-            continue;
-        };
-
-        if pdf_bytes.get(after_generation_ws..after_generation_ws + 3) != Some(b"obj")
-            || pdf_bytes
-                .get(after_generation_ws + 3)
-                .is_some_and(|byte| is_pdf_name_char(*byte))
-        {
-            index += 1;
-            continue;
-        }
-
-        let generation = match u16::try_from(generation) {
-            Ok(value) => value,
-            Err(_) => {
-                index += 1;
-                continue;
-            },
-        };
-        offsets
-            .entry(object_id)
-            .or_insert((object_start, generation));
-        index = after_generation_ws + 3;
-    }
-
-    offsets
-}
-
-fn find_named_reference(pdf_bytes: &[u8], name: &[u8]) -> Option<(u32, u16)> {
-    let mut index = 0;
-    let mut last_match = None;
-
-    while let Some(relative_pos) = find_subslice(&pdf_bytes[index..], name) {
-        let start = index + relative_pos + name.len();
-        let value_start = skip_pdf_whitespace(pdf_bytes, start);
-        let Some((object_id, after_object_id)) = parse_unsigned_pdf_integer(pdf_bytes, value_start)
-        else {
-            index = start;
-            continue;
-        };
-        let Some(after_object_ws) = skip_required_pdf_whitespace(pdf_bytes, after_object_id) else {
-            index = start;
-            continue;
-        };
-        let Some((generation, after_generation)) =
-            parse_unsigned_pdf_integer(pdf_bytes, after_object_ws)
-        else {
-            index = start;
-            continue;
-        };
-        let Some(after_generation_ws) = skip_required_pdf_whitespace(pdf_bytes, after_generation)
-        else {
-            index = start;
-            continue;
-        };
-
-        if pdf_bytes.get(after_generation_ws) == Some(&b'R') {
-            let generation = match u16::try_from(generation) {
-                Ok(value) => value,
-                Err(_) => {
-                    index = start;
-                    continue;
-                },
-            };
-            last_match = Some((object_id, generation));
-        }
-        index = start;
-    }
-
-    last_match
-}
-
-fn find_catalog_reference(
-    pdf_bytes: &[u8],
-    object_offsets: &BTreeMap<u32, (usize, u16)>,
-) -> Option<(u32, u16)> {
-    for (object_id, (offset, generation)) in object_offsets {
-        let Some(end_relative) = find_subslice(&pdf_bytes[*offset..], b"endobj") else {
-            continue;
-        };
-        let object_bytes = &pdf_bytes[*offset..*offset + end_relative];
-        if object_bytes
-            .windows(b"/Type".len())
-            .any(|window| window == b"/Type")
-            && object_bytes
-                .windows(b"/Catalog".len())
-                .any(|window| window == b"/Catalog")
-        {
-            return Some((*object_id, *generation));
+        if let Some(ch) = normalized {
+            sanitized.push(ch);
         }
     }
-    None
-}
-
-fn parse_unsigned_pdf_integer(pdf_bytes: &[u8], start: usize) -> Option<(u32, usize)> {
-    let mut end = start;
-    while end < pdf_bytes.len() && pdf_bytes[end].is_ascii_digit() {
-        end += 1;
+    let trimmed = sanitized.trim();
+    if trimmed.is_empty() {
+        "document".to_string()
+    } else {
+        trimmed.chars().take(200).collect()
     }
-    if end == start {
-        return None;
-    }
-    let value = std::str::from_utf8(&pdf_bytes[start..end])
-        .ok()?
-        .parse()
-        .ok()?;
-    Some((value, end))
-}
-
-fn skip_pdf_whitespace(pdf_bytes: &[u8], start: usize) -> usize {
-    let mut index = start;
-    while index < pdf_bytes.len()
-        && matches!(pdf_bytes[index], b' ' | b'\t' | b'\n' | b'\r' | 0x0c | 0x00)
-    {
-        index += 1;
-    }
-    index
-}
-
-fn skip_required_pdf_whitespace(pdf_bytes: &[u8], start: usize) -> Option<usize> {
-    let end = skip_pdf_whitespace(pdf_bytes, start);
-    (end > start).then_some(end)
-}
-
-fn is_pdf_name_char(byte: u8) -> bool {
-    !matches!(
-        byte,
-        b' ' | b'\t'
-            | b'\n'
-            | b'\r'
-            | 0x0c
-            | 0x00
-            | b'('
-            | b')'
-            | b'<'
-            | b'>'
-            | b'['
-            | b']'
-            | b'{'
-            | b'}'
-            | b'/'
-            | b'%'
-    )
-}
-
-fn find_subslice(haystack: &[u8], needle: &[u8]) -> Option<usize> {
-    if needle.is_empty() {
-        return Some(0);
-    }
-    haystack
-        .windows(needle.len())
-        .position(|window| window == needle)
 }
 
 fn normalize_tool_description(name: &str, description: &str) -> Option<String> {
@@ -1573,6 +1396,7 @@ pub fn convert_normalized_request_with_resolved_session(
         &mut tool_name_map,
         structured_output_tool_name.as_deref(),
     )?;
+    dedupe_history_and_current_documents(&mut history, &mut user_input)?;
     prune_orphaned_history_tool_results(&mut history);
     let current_tool_results = user_input.user_input_message_context.tool_results.clone();
     let (validated_tool_results, orphaned_tool_use_ids) =
@@ -1727,6 +1551,10 @@ fn validate_user_message_content(
                         }
                         has_supported_content = true;
                     },
+                    "document" => {
+                        let _ = normalize_document_block_payload(obj, message_index, block_index)?;
+                        has_supported_content = true;
+                    },
                     "tool_result" => {
                         if obj
                             .get("tool_use_id")
@@ -1865,13 +1693,14 @@ fn validate_assistant_message_content(
     }
 }
 
-// Extracts text, images, and tool_results from a message's polymorphic
-// `content` field (string or array of typed blocks).
+// Extracts text, images, documents, and tool_results from a message's
+// polymorphic `content` field (string or array of typed blocks).
 fn process_message_content(
     content: &serde_json::Value,
-) -> Result<(String, Vec<KiroImage>, Vec<ToolResult>), ConversionError> {
+) -> Result<ProcessedMessageContent, ConversionError> {
     let mut text_parts = Vec::new();
     let mut images = Vec::new();
+    let mut documents = Vec::new();
     let mut tool_results = Vec::new();
     match content {
         serde_json::Value::String(text) => text_parts.push(text.clone()),
@@ -1888,6 +1717,13 @@ fn process_message_content(
                             if let Some(source) = block.source {
                                 if let Some(format) = get_image_format(&source.media_type) {
                                     images.push(KiroImage::from_base64(format, source.data));
+                                }
+                            }
+                        },
+                        "document" => {
+                            if let (Some(name), Some(source)) = (block.name, block.source) {
+                                if let Some(document) = kiro_document_from_source(name, source) {
+                                    documents.push(document);
                                 }
                             }
                         },
@@ -1912,7 +1748,12 @@ fn process_message_content(
         },
         _ => {},
     }
-    Ok((text_parts.join("\n"), images, tool_results))
+    Ok(ProcessedMessageContent {
+        text: text_parts.join("\n"),
+        images,
+        documents,
+        tool_results,
+    })
 }
 
 fn get_image_format(media_type: &str) -> Option<String> {
@@ -1923,6 +1764,21 @@ fn get_image_format(media_type: &str) -> Option<String> {
         "image/webp" => Some("webp".to_string()),
         _ => None,
     }
+}
+
+fn kiro_document_from_source(
+    name: String,
+    source: super::types::ImageSource,
+) -> Option<KiroDocument> {
+    let format = document_format_from_media_type(&source.media_type)?;
+    let bytes = match source.source_type.as_str() {
+        "base64" => source.data,
+        "text" if document_media_type_supports_text_source(&source.media_type) => {
+            base64::engine::general_purpose::STANDARD.encode(source.data.as_bytes())
+        },
+        _ => return None,
+    };
+    Some(KiroDocument::from_base64(name, format, bytes))
 }
 
 pub fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
@@ -2350,20 +2206,29 @@ fn merge_current_user_messages(
 ) -> Result<UserInputMessage, ConversionError> {
     let mut content_parts = Vec::new();
     let mut images = Vec::new();
+    let mut documents = Vec::new();
     let mut tool_results = Vec::new();
     for message in messages {
-        let (text, message_images, message_tool_results) =
-            process_message_content(&message.content)?;
-        if !text.is_empty() {
-            content_parts.push(text);
+        let processed = process_message_content(&message.content)?;
+        if !processed.text.is_empty() {
+            content_parts.push(processed.text);
         }
-        images.extend(message_images);
-        tool_results.extend(message_tool_results);
+        images.extend(processed.images);
+        documents.extend(processed.documents);
+        tool_results.extend(processed.tool_results);
     }
     let content = content_parts.join("\n");
+    if images.len() > KIRO_MAX_CURRENT_MESSAGE_IMAGES {
+        let keep_from = images.len() - KIRO_MAX_CURRENT_MESSAGE_IMAGES;
+        images.drain(0..keep_from);
+    }
+    dedupe_documents_in_place(&mut documents, &mut HashSet::new());
     let mut user_message = UserInputMessage::new(&content, model_id);
     if !images.is_empty() {
         user_message = user_message.with_images(images);
+    }
+    if !documents.is_empty() {
+        user_message = user_message.with_documents(documents);
     }
     if !tool_results.is_empty() {
         user_message = user_message
@@ -2377,21 +2242,25 @@ fn merge_user_messages(
     model_id: &str,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
+    let mut documents = Vec::new();
     let mut tool_results = Vec::new();
     for message in messages {
-        let (text, message_images, message_tool_results) =
-            process_message_content(&message.content)?;
-        if !text.is_empty() {
-            content_parts.push(text);
+        let processed = process_message_content(&message.content)?;
+        if !processed.text.is_empty() {
+            content_parts.push(processed.text);
         }
-        let _ = message_images;
-        tool_results.extend(message_tool_results);
+        documents.extend(processed.documents);
+        tool_results.extend(processed.tool_results);
     }
     let content = content_parts.join("\n");
     let mut user_message = UserMessage::new(&content, model_id);
     // Kiro rejects replaying image payloads inside history user turns. We keep
     // the textual turn content and rely on a stable upstream session for any
     // prior multimodal context.
+    dedupe_documents_in_place(&mut documents, &mut HashSet::new());
+    if !documents.is_empty() {
+        user_message = user_message.with_documents(documents);
+    }
     if !tool_results.is_empty() {
         user_message = user_message
             .with_context(UserInputMessageContext::new().with_tool_results(tool_results));
@@ -2399,6 +2268,31 @@ fn merge_user_messages(
     Ok(HistoryUserMessage {
         user_input_message: user_message,
     })
+}
+
+fn dedupe_documents_in_place(documents: &mut Vec<KiroDocument>, seen: &mut HashSet<String>) {
+    documents.retain(|document| seen.insert(document.name.clone()));
+}
+
+fn dedupe_history_and_current_documents(
+    history: &mut [Message],
+    current: &mut UserInputMessage,
+) -> Result<(), ConversionError> {
+    let mut seen = HashSet::new();
+    for message in history.iter_mut() {
+        if let Message::User(user_message) = message {
+            dedupe_documents_in_place(&mut user_message.user_input_message.documents, &mut seen);
+        }
+    }
+    dedupe_documents_in_place(&mut current.documents, &mut seen);
+    if seen.len() > KIRO_MAX_CONVERSATION_DOCUMENTS {
+        return Err(invalid_request(format!(
+            "Too many documents attached ({}). Maximum is {} per conversation.",
+            seen.len(),
+            KIRO_MAX_CONVERSATION_DOCUMENTS
+        )));
+    }
+    Ok(())
 }
 
 fn convert_assistant_message(
@@ -3750,12 +3644,13 @@ mod tests {
     }
 
     #[test]
-    fn convert_request_extracts_pdf_documents_into_user_text() {
+    fn convert_request_preserves_pdf_documents_as_attachments() {
         let req = base_request(vec![AnthropicMessage {
             role: "user".to_string(),
             content: serde_json::json!([
                 {
                     "type": "document",
+                    "name": "report.pdf",
                     "source": {
                         "type": "base64",
                         "media_type": "application/pdf",
@@ -3769,24 +3664,62 @@ mod tests {
             ]),
         }]);
 
-        let result = convert_request(&req).expect("pdf document block should be converted");
-        let current = &result.conversation_state.current_message.user_input_message;
-        assert!(current.content.contains("PDF extracted text:"));
-        assert!(current.content.contains("hvoywpkd"));
-        assert!(current.content.contains("What text does this PDF contain?"));
-        assert!(!current
-            .content
-            .contains("<document media_type=\"application/pdf\">"));
-        assert!(current.images.is_empty());
+        let result = convert_request(&req).expect("pdf document block should remain supported");
+        let current =
+            serde_json::to_value(&result.conversation_state.current_message.user_input_message)
+                .expect("serialize current message");
+        assert_eq!(current["content"], "What text does this PDF contain?");
+        assert_eq!(current["documents"].as_array().map(Vec::len), Some(1));
+        assert_eq!(current["documents"][0]["name"], "report");
+        assert_eq!(current["documents"][0]["format"], "pdf");
+        assert_eq!(current["documents"][0]["source"]["bytes"], SAMPLE_PDF_BASE64);
     }
 
     #[test]
-    fn convert_request_extracts_text_documents_into_user_text() {
+    fn convert_request_keeps_pdf_documents_as_document_attachments() {
         let req = base_request(vec![AnthropicMessage {
             role: "user".to_string(),
             content: serde_json::json!([
                 {
                     "type": "document",
+                    "name": "report.pdf",
+                    "source": {
+                        "type": "base64",
+                        "media_type": "application/pdf",
+                        "data": SAMPLE_PDF_BASE64
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": "What text does this PDF contain?"
+                }
+            ]),
+        }]);
+
+        let result = convert_request(&req).expect("pdf document block should remain supported");
+        let current =
+            serde_json::to_value(&result.conversation_state.current_message.user_input_message)
+                .expect("serialize current message");
+
+        assert_eq!(current["content"], "What text does this PDF contain?");
+        assert_eq!(current["documents"].as_array().map(Vec::len), Some(1));
+        assert_eq!(current["documents"][0]["name"], "report");
+        assert_eq!(current["documents"][0]["format"], "pdf");
+        assert_eq!(current["documents"][0]["source"]["bytes"], SAMPLE_PDF_BASE64);
+        assert!(!current["content"]
+            .as_str()
+            .expect("content string")
+            .contains("PDF extracted text:"));
+    }
+
+    #[test]
+    fn convert_request_preserves_text_documents_as_attachments() {
+        let req = base_request(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {
+                    "type": "document",
+                    "name": "plain.txt",
                     "source": {
                         "type": "text",
                         "media_type": "text/plain",
@@ -3800,14 +3733,123 @@ mod tests {
             ]),
         }]);
 
-        let result = convert_request(&req).expect("text document block should be converted");
-        let current = &result.conversation_state.current_message.user_input_message;
-        assert!(current
-            .content
-            .contains("<document media_type=\"text/plain\">"));
-        assert!(current.content.contains("plain document body"));
-        assert!(current.content.contains("Summarize the text document."));
-        assert!(current.images.is_empty());
+        let result = convert_request(&req).expect("text document block should remain supported");
+        let current =
+            serde_json::to_value(&result.conversation_state.current_message.user_input_message)
+                .expect("serialize current message");
+        assert_eq!(current["content"], "Summarize the text document.");
+        assert_eq!(current["documents"].as_array().map(Vec::len), Some(1));
+        assert_eq!(current["documents"][0]["name"], "plain");
+        assert_eq!(current["documents"][0]["format"], "txt");
+        assert_eq!(current["documents"][0]["source"]["bytes"], "cGxhaW4gZG9jdW1lbnQgYm9keQ==");
+    }
+
+    #[test]
+    fn convert_request_keeps_markdown_documents_as_document_attachments() {
+        let req = base_request(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!([
+                {
+                    "type": "document",
+                    "name": "notes.md",
+                    "source": {
+                        "type": "text",
+                        "media_type": "text/markdown",
+                        "data": "# Heading\n\nbody"
+                    }
+                },
+                {
+                    "type": "text",
+                    "text": "Summarize the markdown document."
+                }
+            ]),
+        }]);
+
+        let result =
+            convert_request(&req).expect("markdown document block should remain supported");
+        let current =
+            serde_json::to_value(&result.conversation_state.current_message.user_input_message)
+                .expect("serialize current message");
+
+        assert_eq!(current["content"], "Summarize the markdown document.");
+        assert_eq!(current["documents"].as_array().map(Vec::len), Some(1));
+        assert_eq!(current["documents"][0]["name"], "notes");
+        assert_eq!(current["documents"][0]["format"], "md");
+        assert_eq!(current["documents"][0]["source"]["bytes"], "IyBIZWFkaW5nCgpib2R5");
+        assert!(!current["content"]
+            .as_str()
+            .expect("content string")
+            .contains("<document media_type="));
+    }
+
+    #[test]
+    fn convert_request_dedupes_document_names_across_history_and_current_turn() {
+        let req = base_request(vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "document",
+                        "name": "notes.md",
+                        "source": {
+                            "type": "text",
+                            "media_type": "text/markdown",
+                            "data": "# History"
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": "Keep this document in history."
+                    }
+                ]),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("acknowledged"),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "document",
+                        "name": "notes.md",
+                        "source": {
+                            "type": "text",
+                            "media_type": "text/markdown",
+                            "data": "# Duplicate"
+                        }
+                    },
+                    {
+                        "type": "document",
+                        "name": "report.pdf",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": SAMPLE_PDF_BASE64
+                        }
+                    },
+                    {
+                        "type": "text",
+                        "text": "Summarize the surviving attachments."
+                    }
+                ]),
+            },
+        ]);
+
+        let result = convert_request(&req).expect("duplicate documents should be deduped");
+        let current =
+            serde_json::to_value(&result.conversation_state.current_message.user_input_message)
+                .expect("serialize current message");
+        let Message::User(history_user_message) = &result.conversation_state.history[0] else {
+            panic!("expected first history message to be user");
+        };
+        let history_user = serde_json::to_value(&history_user_message.user_input_message)
+            .expect("serialize history user");
+
+        assert_eq!(history_user["documents"].as_array().map(Vec::len), Some(1));
+        assert_eq!(history_user["documents"][0]["name"], "notes");
+        assert_eq!(current["documents"].as_array().map(Vec::len), Some(1));
+        assert_eq!(current["documents"][0]["name"], "report");
     }
 
     #[test]

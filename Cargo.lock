@@ -6185,7 +6185,6 @@ dependencies = [
  "crc",
  "hex",
  "llm-access-core",
- "lopdf",
  "lru 0.12.5",
  "parking_lot",
  "rusqlite",

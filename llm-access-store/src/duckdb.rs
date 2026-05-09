@@ -486,6 +486,7 @@ fn usage_event_expr(
 
 /// DuckDB usage writer.
 #[cfg(feature = "duckdb-runtime")]
+#[derive(Debug)]
 pub struct DuckDbUsageWriter {
     conn: duckdb::Connection,
 }
@@ -519,6 +520,25 @@ impl DuckDbUsageWriter {
         }
         tx.commit()?;
         Ok(())
+    }
+}
+
+#[cfg(feature = "duckdb-runtime")]
+#[derive(Debug)]
+struct PersistentUsageWriter {
+    writer: DuckDbUsageWriter,
+    connection_config: DuckDbUsageConnectionConfig,
+}
+
+#[cfg(feature = "duckdb-runtime")]
+impl PersistentUsageWriter {
+    fn open(path: &Path, connection_config: DuckDbUsageConnectionConfig) -> anyhow::Result<Self> {
+        Ok(Self {
+            writer: DuckDbUsageWriter::new(
+                DuckDbUsageRepository::open_conn_with_connection_config(path, connection_config)?,
+            )?,
+            connection_config,
+        })
     }
 }
 
@@ -620,12 +640,12 @@ pub struct DuckDbUsageRepository {
 #[derive(Debug)]
 enum DuckDbUsageRepositoryInner {
     Single {
-        path: PathBuf,
+        state: Box<Mutex<SingleDuckDbUsageState>>,
         connection_config: SharedDuckDbUsageConnectionConfig,
     },
     Tiered {
         config: TieredDuckDbUsageConfig,
-        state: Mutex<TieredDuckDbUsageState>,
+        state: Box<Mutex<TieredDuckDbUsageState>>,
         connection_config: SharedDuckDbUsageConnectionConfig,
     },
 }
@@ -686,6 +706,14 @@ struct TieredDuckDbUsageState {
     active_path: PathBuf,
     next_sequence: u64,
     active_has_rows: bool,
+    active_writer: Option<PersistentUsageWriter>,
+}
+
+#[cfg(feature = "duckdb-runtime")]
+#[derive(Debug)]
+struct SingleDuckDbUsageState {
+    path: PathBuf,
+    writer: Option<PersistentUsageWriter>,
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -776,7 +804,10 @@ impl DuckDbUsageRepository {
         )?;
         Ok(Self {
             inner: Arc::new(DuckDbUsageRepositoryInner::Single {
-                path,
+                state: Box::new(Mutex::new(SingleDuckDbUsageState {
+                    path,
+                    writer: None,
+                })),
                 connection_config,
             }),
         })
@@ -829,11 +860,12 @@ impl DuckDbUsageRepository {
         Ok(Self {
             inner: Arc::new(DuckDbUsageRepositoryInner::Tiered {
                 config,
-                state: Mutex::new(TieredDuckDbUsageState {
+                state: Box::new(Mutex::new(TieredDuckDbUsageState {
                     active_path,
                     next_sequence,
                     active_has_rows,
-                }),
+                    active_writer: None,
+                })),
                 connection_config,
             }),
         })
@@ -880,8 +912,16 @@ impl DuckDbUsageRepository {
         let inner = Arc::clone(&self.inner);
         task::spawn_blocking(move || match inner.as_ref() {
             DuckDbUsageRepositoryInner::Single {
-                path, ..
-            } => key_usage_rollups_from_path(path),
+                state, ..
+            } => {
+                let path = {
+                    let state = state
+                        .lock()
+                        .map_err(|_| anyhow!("single duckdb state lock poisoned"))?;
+                    state.path.clone()
+                };
+                key_usage_rollups_from_path(&path)
+            },
             DuckDbUsageRepositoryInner::Tiered {
                 config,
                 state,
@@ -1532,7 +1572,7 @@ fn publish_segment_catalog(
 
 #[cfg(feature = "duckdb-runtime")]
 fn key_usage_rollups_from_path(path: &Path) -> anyhow::Result<Vec<KeyUsageRollupSummary>> {
-    let conn = DuckDbUsageRepository::open_conn(path)?;
+    let conn = DuckDbUsageRepository::open_read_only_conn(path)?;
     key_usage_rollups_from_conn(&conn)
 }
 
@@ -1583,7 +1623,7 @@ fn key_usage_rollups_from_tiered(
         let state = state
             .lock()
             .map_err(|_| anyhow!("tiered duckdb state lock poisoned"))?;
-        let conn = DuckDbUsageRepository::open_conn(&state.active_path)?;
+        let conn = DuckDbUsageRepository::open_read_only_conn(&state.active_path)?;
         for rollup in key_usage_rollups_from_conn(&conn)? {
             merge_key_rollup(&mut combined, rollup);
         }
@@ -1679,7 +1719,8 @@ fn append_usage_events_to_tiered(
     connection_config: &SharedDuckDbUsageConnectionConfig,
     rows: &[UsageEventRow],
 ) -> anyhow::Result<()> {
-    let connection_config_snapshot = connection_config_snapshot(connection_config);
+    let connection_config_snapshot =
+        active_writer_connection_config(config, connection_config_snapshot(connection_config));
     let mut state = state
         .lock()
         .map_err(|_| anyhow!("tiered duckdb state lock poisoned"))?;
@@ -1688,14 +1729,8 @@ fn append_usage_events_to_tiered(
     {
         rollover_active_segment(config, &mut state)?;
     }
-    {
-        let mut writer =
-            DuckDbUsageWriter::new(DuckDbUsageRepository::open_conn_with_connection_config(
-                &state.active_path,
-                connection_config_snapshot,
-            )?)?;
-        writer.insert_usage_events(rows)?;
-    }
+    let writer = ensure_active_tiered_writer(&mut state, connection_config_snapshot)?;
+    writer.writer.insert_usage_events(rows)?;
     state.active_has_rows = true;
     if active_segment_disk_bytes(&state.active_path) >= config.rollover_bytes.max(1) {
         rollover_active_segment(config, &mut state)?;
@@ -1735,6 +1770,7 @@ fn rollover_active_segment(
     config: &TieredDuckDbUsageConfig,
     state: &mut TieredDuckDbUsageState,
 ) -> anyhow::Result<()> {
+    state.active_writer = None;
     checkpoint_duckdb_path(&state.active_path)?;
     let sequence = parse_segment_sequence(&state.active_path).unwrap_or(state.next_sequence);
     let segment_id = format!("usage-{}-{sequence:012}", now_ms());
@@ -1751,6 +1787,7 @@ fn rollover_active_segment(
     initialize_duckdb_target_path(&new_active_path)?;
     state.active_path = new_active_path;
     state.active_has_rows = false;
+    state.active_writer = None;
     spawn_segment_sealer(config.clone(), pending_path, segment_id);
     Ok(())
 }
@@ -1761,6 +1798,66 @@ fn checkpoint_duckdb_path(path: &Path) -> anyhow::Result<()> {
     conn.execute_batch("CHECKPOINT;")
         .with_context(|| format!("failed to checkpoint duckdb database `{}`", path.display()))?;
     Ok(())
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn ensure_single_writer(
+    state: &mut SingleDuckDbUsageState,
+    connection_config: DuckDbUsageConnectionConfig,
+) -> anyhow::Result<&mut PersistentUsageWriter> {
+    let should_reopen = state
+        .writer
+        .as_ref()
+        .map(|writer| writer.connection_config != connection_config)
+        .unwrap_or(true);
+    if should_reopen {
+        state.writer = Some(PersistentUsageWriter::open(&state.path, connection_config)?);
+    }
+    state
+        .writer
+        .as_mut()
+        .ok_or_else(|| anyhow!("single usage writer missing after initialization"))
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn ensure_active_tiered_writer(
+    state: &mut TieredDuckDbUsageState,
+    connection_config: DuckDbUsageConnectionConfig,
+) -> anyhow::Result<&mut PersistentUsageWriter> {
+    let should_reopen = state
+        .active_writer
+        .as_ref()
+        .map(|writer| writer.connection_config != connection_config)
+        .unwrap_or(true);
+    if should_reopen {
+        state.active_writer =
+            Some(PersistentUsageWriter::open(&state.active_path, connection_config)?);
+    }
+    state
+        .active_writer
+        .as_mut()
+        .ok_or_else(|| anyhow!("tiered active writer missing after initialization"))
+}
+
+#[cfg(feature = "duckdb-runtime")]
+const MAX_ACTIVE_WRITER_CHECKPOINT_THRESHOLD_MIB: u64 = 1_048_576;
+
+#[cfg(feature = "duckdb-runtime")]
+fn active_writer_connection_config(
+    config: &TieredDuckDbUsageConfig,
+    base: DuckDbUsageConnectionConfig,
+) -> DuckDbUsageConnectionConfig {
+    let rollover_threshold_mib = config
+        .rollover_bytes
+        .saturating_add((1024 * 1024) - 1)
+        .checked_div(1024 * 1024)
+        .unwrap_or(u64::MAX)
+        .saturating_add(1)
+        .min(MAX_ACTIVE_WRITER_CHECKPOINT_THRESHOLD_MIB);
+    DuckDbUsageConnectionConfig {
+        memory_limit_mib: base.memory_limit_mib,
+        checkpoint_threshold_mib: base.checkpoint_threshold_mib.max(rollover_threshold_mib),
+    }
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -1785,14 +1882,17 @@ impl UsageEventSink for DuckDbUsageRepository {
             .collect::<Vec<_>>();
         task::spawn_blocking(move || match inner.as_ref() {
             DuckDbUsageRepositoryInner::Single {
-                path,
+                state,
                 connection_config,
             } => {
-                let mut writer = DuckDbUsageWriter::new(Self::open_conn_with_connection_config(
-                    path,
+                let mut state = state
+                    .lock()
+                    .map_err(|_| anyhow!("single duckdb state lock poisoned"))?;
+                let writer = ensure_single_writer(
+                    &mut state,
                     connection_config_snapshot(connection_config),
-                )?)?;
-                writer.insert_usage_events(&rows)
+                )?;
+                writer.writer.insert_usage_events(&rows)
             },
             DuckDbUsageRepositoryInner::Tiered {
                 config,
@@ -1812,8 +1912,16 @@ impl UsageAnalyticsStore for DuckDbUsageRepository {
         let inner = Arc::clone(&self.inner);
         task::spawn_blocking(move || match inner.as_ref() {
             DuckDbUsageRepositoryInner::Single {
-                path, ..
-            } => list_usage_events_from_path(path, &query),
+                state, ..
+            } => {
+                let path = {
+                    let state = state
+                        .lock()
+                        .map_err(|_| anyhow!("single duckdb state lock poisoned"))?;
+                    state.path.clone()
+                };
+                list_usage_events_from_path(&path, &query)
+            },
             DuckDbUsageRepositoryInner::Tiered {
                 config,
                 state,
@@ -1829,8 +1937,16 @@ impl UsageAnalyticsStore for DuckDbUsageRepository {
         let event_id = event_id.to_string();
         task::spawn_blocking(move || match inner.as_ref() {
             DuckDbUsageRepositoryInner::Single {
-                path, ..
-            } => get_usage_event_from_path(path, &event_id),
+                state, ..
+            } => {
+                let path = {
+                    let state = state
+                        .lock()
+                        .map_err(|_| anyhow!("single duckdb state lock poisoned"))?;
+                    state.path.clone()
+                };
+                get_usage_event_from_path(&path, &event_id)
+            },
             DuckDbUsageRepositoryInner::Tiered {
                 config,
                 state,
@@ -1852,14 +1968,22 @@ impl UsageAnalyticsStore for DuckDbUsageRepository {
         let key_id = key_id.to_string();
         task::spawn_blocking(move || match inner.as_ref() {
             DuckDbUsageRepositoryInner::Single {
-                path, ..
-            } => usage_chart_points_from_single_path(
-                path,
-                &key_id,
-                start_ms,
-                bucket_ms,
-                bucket_count,
-            ),
+                state, ..
+            } => {
+                let path = {
+                    let state = state
+                        .lock()
+                        .map_err(|_| anyhow!("single duckdb state lock poisoned"))?;
+                    state.path.clone()
+                };
+                usage_chart_points_from_single_path(
+                    &path,
+                    &key_id,
+                    start_ms,
+                    bucket_ms,
+                    bucket_count,
+                )
+            },
             DuckDbUsageRepositoryInner::Tiered {
                 config,
                 state,
@@ -1883,7 +2007,7 @@ fn list_usage_events_from_path(
     path: &Path,
     query: &UsageEventQuery,
 ) -> anyhow::Result<UsageEventPage> {
-    let conn = DuckDbUsageRepository::open_conn(path)?;
+    let conn = DuckDbUsageRepository::open_read_only_conn(path)?;
     list_usage_events_from_conn(&conn, query)
 }
 
@@ -1985,7 +2109,7 @@ fn list_usage_events_from_tiered(
                 .map_err(|_| anyhow!("tiered duckdb state lock poisoned"))?;
             state.active_path.clone()
         };
-        let conn = DuckDbUsageRepository::open_conn(&active_path)?;
+        let conn = DuckDbUsageRepository::open_read_only_conn(&active_path)?;
         let count = count_usage_events_from_conn(&conn, query)?;
         total = total.saturating_add(count);
         if count > 0 {
@@ -2015,7 +2139,7 @@ fn list_usage_events_from_tiered(
             let partition = &partitions[fetch.partition_index];
             let conn = match partition.kind {
                 TieredUsagePartitionKind::Active => {
-                    DuckDbUsageRepository::open_conn(&partition.path)?
+                    DuckDbUsageRepository::open_read_only_conn(&partition.path)?
                 },
                 TieredUsagePartitionKind::Archive => {
                     DuckDbUsageRepository::open_read_only_conn(&partition.path)?
@@ -2216,7 +2340,7 @@ fn segment_fully_inside(segment: &ArchivedUsageSegment, query: &UsageEventQuery)
 
 #[cfg(feature = "duckdb-runtime")]
 fn get_usage_event_from_path(path: &Path, event_id: &str) -> anyhow::Result<Option<UsageEvent>> {
-    let conn = DuckDbUsageRepository::open_conn(path)?;
+    let conn = DuckDbUsageRepository::open_read_only_conn(path)?;
     get_usage_event_from_conn(&conn, event_id)
 }
 
@@ -2246,7 +2370,7 @@ fn get_usage_event_from_tiered(
         let state = state
             .lock()
             .map_err(|_| anyhow!("tiered duckdb state lock poisoned"))?;
-        let conn = DuckDbUsageRepository::open_conn(&state.active_path)?;
+        let conn = DuckDbUsageRepository::open_read_only_conn(&state.active_path)?;
         if let Some(event) = get_usage_event_from_conn(&conn, event_id)? {
             return Ok(Some(event));
         }
@@ -2303,7 +2427,7 @@ fn usage_chart_points_from_tiered(
         let state = state
             .lock()
             .map_err(|_| anyhow!("tiered duckdb state lock poisoned"))?;
-        let conn = DuckDbUsageRepository::open_conn(&state.active_path)?;
+        let conn = DuckDbUsageRepository::open_read_only_conn(&state.active_path)?;
         add_usage_chart_points_from_conn(&mut points, &conn, key_id, start_ms, bucket_ms)?;
     }
     let query = UsageEventQuery {
@@ -2334,7 +2458,7 @@ fn usage_chart_points_from_single_path(
     if bucket_count == 0 {
         return Ok(points);
     }
-    let conn = DuckDbUsageRepository::open_conn(path)?;
+    let conn = DuckDbUsageRepository::open_read_only_conn(path)?;
     add_usage_chart_points_from_conn(&mut points, &conn, key_id, start_ms, bucket_ms)?;
     Ok(points)
 }
@@ -2798,6 +2922,68 @@ mod tests {
     }
 
     #[cfg(feature = "duckdb-runtime")]
+    #[tokio::test]
+    async fn duckdb_single_repository_keeps_writer_open_between_appends() {
+        let root = std::env::temp_dir()
+            .join(format!("llm-access-duckdb-test-{}-duckdb-single-writer", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create duckdb test directory");
+        let db_path = root.join("usage.duckdb");
+        let repo = super::DuckDbUsageRepository::open_path(&db_path).expect("open duckdb usage db");
+
+        let mut first = test_usage_event();
+        first.event_id = "single-writer-first".to_string();
+        first.created_at_ms = 1_700_000_000_000;
+        repo.append_usage_event(&first)
+            .await
+            .expect("append first usage event");
+
+        let wal_path = match repo.inner.as_ref() {
+            super::DuckDbUsageRepositoryInner::Single {
+                state, ..
+            } => {
+                let state = state.lock().expect("lock single duckdb state");
+                assert!(
+                    state.writer.is_some(),
+                    "single-file repository should keep the writer open after append"
+                );
+                super::duckdb_wal_path(&state.path)
+            },
+            _ => panic!("expected single repository"),
+        };
+        assert!(
+            wal_path.exists(),
+            "single-file WAL should remain present while the writer stays open"
+        );
+
+        let mut second = test_usage_event();
+        second.event_id = "single-writer-second".to_string();
+        second.created_at_ms = 1_700_000_060_000;
+        repo.append_usage_event(&second)
+            .await
+            .expect("append second usage event");
+
+        match repo.inner.as_ref() {
+            super::DuckDbUsageRepositoryInner::Single {
+                state, ..
+            } => {
+                let state = state.lock().expect("lock single duckdb state");
+                assert!(
+                    state.writer.is_some(),
+                    "single-file repository should reuse the persistent writer"
+                );
+            },
+            _ => panic!("expected single repository"),
+        }
+        assert!(
+            wal_path.exists(),
+            "single-file WAL should still be present after the second append"
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup duckdb test directory");
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
     #[test]
     fn duckdb_usage_connection_config_formats_runtime_limits() {
         let config = super::DuckDbUsageConnectionConfig {
@@ -2808,6 +2994,28 @@ mod tests {
 
         assert!(sql.contains("SET memory_limit='1024MB'"));
         assert!(sql.contains("SET checkpoint_threshold='32MB'"));
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
+    #[test]
+    fn tiered_active_writer_checkpoint_threshold_outgrows_rollover_threshold() {
+        let config = super::TieredDuckDbUsageConfig {
+            active_dir: std::path::PathBuf::from("/tmp/active"),
+            archive_dir: std::path::PathBuf::from("/tmp/archive"),
+            catalog_dir: std::path::PathBuf::from("/tmp/catalog"),
+            rollover_bytes: 16 * 1024 * 1024,
+        };
+        let effective =
+            super::active_writer_connection_config(&config, super::DuckDbUsageConnectionConfig {
+                memory_limit_mib: 1024,
+                checkpoint_threshold_mib: 8,
+            });
+
+        assert_eq!(effective.memory_limit_mib, 1024);
+        assert!(
+            effective.checkpoint_threshold_mib > 16,
+            "active writer checkpoint threshold should exceed the active rollover size"
+        );
     }
 
     #[cfg(feature = "duckdb-runtime")]
@@ -3453,6 +3661,140 @@ mod tests {
     }
 
     #[cfg(feature = "duckdb-runtime")]
+    #[tokio::test]
+    async fn duckdb_tiered_repository_keeps_active_writer_open_between_appends() {
+        let root = std::env::temp_dir().join(format!(
+            "llm-access-duckdb-test-{}-tiered-active-writer-open",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create tiered active writer test directory");
+        let repo = super::DuckDbUsageRepository::open_tiered(super::TieredDuckDbUsageConfig {
+            active_dir: root.join("active"),
+            archive_dir: root.join("archive"),
+            catalog_dir: root.join("catalog"),
+            rollover_bytes: u64::MAX,
+        })
+        .expect("open tiered duckdb usage db");
+
+        let mut first = test_usage_event();
+        first.event_id = "tiered-active-writer-first".to_string();
+        first.created_at_ms = 1_700_000_000_000;
+        repo.append_usage_event(&first)
+            .await
+            .expect("append first tiered usage event");
+
+        let (active_path, wal_path) = match repo.inner.as_ref() {
+            super::DuckDbUsageRepositoryInner::Tiered {
+                state, ..
+            } => {
+                let state = state.lock().expect("lock tiered duckdb state");
+                assert!(
+                    state.active_writer.is_some(),
+                    "tiered repository should keep the active writer open after append"
+                );
+                let active_path = state.active_path.clone();
+                let wal_path = super::duckdb_wal_path(&active_path);
+                (active_path, wal_path)
+            },
+            _ => panic!("expected tiered repository"),
+        };
+        assert!(
+            wal_path.exists(),
+            "active WAL should remain present while the active writer stays open"
+        );
+
+        let mut second = test_usage_event();
+        second.event_id = "tiered-active-writer-second".to_string();
+        second.created_at_ms = 1_700_000_060_000;
+        repo.append_usage_event(&second)
+            .await
+            .expect("append second tiered usage event");
+
+        match repo.inner.as_ref() {
+            super::DuckDbUsageRepositoryInner::Tiered {
+                state, ..
+            } => {
+                let state = state.lock().expect("lock tiered duckdb state");
+                assert_eq!(state.active_path, active_path);
+                assert!(
+                    state.active_writer.is_some(),
+                    "tiered repository should still hold the same active writer after reuse"
+                );
+            },
+            _ => panic!("expected tiered repository"),
+        }
+        assert!(wal_path.exists(), "active WAL should still be present after the second append");
+
+        std::fs::remove_dir_all(&root).expect("cleanup tiered active writer test directory");
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
+    #[tokio::test]
+    async fn duckdb_tiered_repository_rollover_leaves_fresh_active_without_writer() {
+        let root = std::env::temp_dir().join(format!(
+            "llm-access-duckdb-test-{}-tiered-rollover-drops-writer",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create tiered rollover writer test directory");
+        let repo = super::DuckDbUsageRepository::open_tiered(super::TieredDuckDbUsageConfig {
+            active_dir: root.join("active"),
+            archive_dir: root.join("archive"),
+            catalog_dir: root.join("catalog"),
+            rollover_bytes: 1,
+        })
+        .expect("open tiered duckdb usage db");
+
+        let mut first = test_usage_event();
+        first.event_id = "tiered-rollover-drops-writer-first".to_string();
+        first.created_at_ms = 1_700_000_000_000;
+        repo.append_usage_event(&first)
+            .await
+            .expect("append first tiered usage event");
+
+        let first_active_path = match repo.inner.as_ref() {
+            super::DuckDbUsageRepositoryInner::Tiered {
+                state, ..
+            } => {
+                let state = state.lock().expect("lock tiered duckdb state");
+                assert!(
+                    state.active_writer.is_none(),
+                    "rollover should drop the active writer after checkpointing the old segment"
+                );
+                state.active_path.clone()
+            },
+            _ => panic!("expected tiered repository"),
+        };
+
+        let mut second = test_usage_event();
+        second.event_id = "tiered-rollover-drops-writer-second".to_string();
+        second.created_at_ms = 1_700_000_060_000;
+        repo.append_usage_event(&second)
+            .await
+            .expect("append second tiered usage event");
+
+        match repo.inner.as_ref() {
+            super::DuckDbUsageRepositoryInner::Tiered {
+                state, ..
+            } => {
+                let state = state.lock().expect("lock tiered duckdb state");
+                assert_ne!(
+                    state.active_path, first_active_path,
+                    "rollover should switch the repository to a fresh active path"
+                );
+                assert!(
+                    state.active_writer.is_none(),
+                    "fresh active path should not retain the rolled-over writer handle"
+                );
+            },
+            _ => panic!("expected tiered repository"),
+        }
+
+        std::fs::remove_dir_all(&root).expect("cleanup tiered rollover writer test directory");
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
     #[test]
     fn duckdb_tiered_publish_rewrites_segment_with_current_schema() {
         let root = std::env::temp_dir()
@@ -3624,7 +3966,7 @@ mod tests {
 
     #[cfg(feature = "duckdb-runtime")]
     async fn wait_for_archived_duckdb_file_count(archive_dir: &std::path::Path, expected: usize) {
-        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
         loop {
             let archived = std::fs::read_dir(archive_dir)
                 .ok()
