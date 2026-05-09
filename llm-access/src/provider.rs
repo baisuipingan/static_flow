@@ -5483,8 +5483,6 @@ mod tests {
 
     use super::ProviderDispatcher;
 
-    static CODEX_UPSTREAM_ENV_LOCK: Mutex<()> = Mutex::new(());
-
     #[test]
     fn codex_backend_api_base_uses_upstream_codex_paths() {
         assert_eq!(
@@ -6857,7 +6855,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_dispatch_adapts_non_streaming_chat_completion_through_responses_sse() {
-        let _guard = CODEX_UPSTREAM_ENV_LOCK
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
             .expect("codex upstream env lock");
         let captured = Arc::new(CapturedCodexUpstream::default());
@@ -6918,7 +6916,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_dispatch_reconstructs_non_streaming_output_from_sse_item_events() {
-        let _guard = CODEX_UPSTREAM_ENV_LOCK
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
             .expect("codex upstream env lock");
         let captured = Arc::new(CapturedCodexUpstream::default());
@@ -6970,7 +6968,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_dispatch_rewrites_thread_headers_like_legacy_backend() {
-        let _guard = CODEX_UPSTREAM_ENV_LOCK
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
             .expect("codex upstream env lock");
         let captured = Arc::new(CapturedCodexUpstream::default());
@@ -7023,7 +7021,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_models_fetches_upstream_with_runtime_client_version() {
-        let _guard = CODEX_UPSTREAM_ENV_LOCK
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
             .expect("codex upstream env lock");
         let captured = Arc::new(CapturedCodexUpstream::default());
@@ -7128,7 +7126,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_dispatch_streams_chat_completion_chunks_from_responses_sse() {
-        let _guard = CODEX_UPSTREAM_ENV_LOCK
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
             .expect("codex upstream env lock");
         let captured = Arc::new(CapturedCodexUpstream::default());
@@ -7194,7 +7192,7 @@ mod tests {
 
     #[tokio::test]
     async fn codex_dispatch_records_usage_rollup_from_completed_response() {
-        let _guard = CODEX_UPSTREAM_ENV_LOCK
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
             .expect("codex upstream env lock");
         let captured = Arc::new(CapturedCodexUpstream::default());

@@ -19,13 +19,13 @@ use axum::{
 use llm_access_core::{
     provider::RouteStrategy,
     store::{
-        self as core_store, AdminAccountGroupPatch, AdminCodexAccountPatch,
-        AdminCodexImportJobItemResult, AdminKeyPatch, AdminProxyConfigPatch,
-        AdminReviewQueueAction, AdminRuntimeConfig, NewAdminAccountGroup, NewAdminCodexAccount,
-        NewAdminCodexImportJob, NewAdminCodexImportJobItem, NewAdminKey, NewAdminKiroAccount,
-        NewAdminProxyConfig, UpdateAdminRuntimeConfig, KEY_STATUS_ACTIVE, KEY_STATUS_DISABLED,
-        KIRO_PREFIX_CACHE_MODE_FORMULA, PROTOCOL_ANTHROPIC, PROTOCOL_OPENAI, PROVIDER_CODEX,
-        PROVIDER_KIRO,
+        self as core_store, AdminAccountContributionRequest, AdminAccountGroupPatch,
+        AdminCodexAccountPatch, AdminCodexImportJobItemResult, AdminKeyPatch,
+        AdminProxyConfigPatch, AdminReviewQueueAction, AdminRuntimeConfig, NewAdminAccountGroup,
+        NewAdminCodexAccount, NewAdminCodexImportJob, NewAdminCodexImportJobItem, NewAdminKey,
+        NewAdminKiroAccount, NewAdminProxyConfig, UpdateAdminRuntimeConfig, KEY_STATUS_ACTIVE,
+        KEY_STATUS_DISABLED, KIRO_PREFIX_CACHE_MODE_FORMULA, PROTOCOL_ANTHROPIC, PROTOCOL_OPENAI,
+        PROVIDER_CODEX, PROVIDER_KIRO,
     },
 };
 use llm_access_kiro::{
@@ -2386,6 +2386,7 @@ pub(crate) async fn approve_and_issue_llm_gateway_account_contribution_request(
         .await
     {
         Ok(Some(request)) => {
+            prime_codex_status_after_account_contribution_issue(&state, &request).await;
             match account_contribution_issue_email_policy(&request, state.email_notifier.is_some())
             {
                 AccountContributionIssueEmailPolicy::SkipNoRecipient => {},
@@ -2422,6 +2423,56 @@ pub(crate) async fn approve_and_issue_llm_gateway_account_contribution_request(
         Err(_) => internal_error("Failed to issue llm gateway account contribution request")
             .into_response(),
     }
+}
+
+async fn prime_codex_status_after_account_contribution_issue(
+    state: &HttpState,
+    request: &AdminAccountContributionRequest,
+) {
+    let account_name = request
+        .imported_account_name
+        .as_deref()
+        .unwrap_or(request.account_name.as_str());
+    let route_store = state.provider_state.route_store();
+    let refreshed = match codex_status::prime_single_codex_account_status(
+        &state.admin_config_store,
+        &state.admin_codex_account_store,
+        &route_store,
+        &state.public_status_store,
+        account_name,
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(err) => {
+            tracing::warn!(
+                request_id = %request.request_id,
+                account_name,
+                "failed to prime issued Codex account status: {err:#}",
+            );
+            return;
+        },
+    };
+    if let Err(err) = state
+        .admin_codex_account_store
+        .refresh_admin_codex_account(account_name, now_ms())
+        .await
+    {
+        tracing::warn!(
+            request_id = %request.request_id,
+            account_name,
+            "failed to update issued Codex account refresh timestamp after priming status: {err:#}",
+        );
+        return;
+    }
+    tracing::info!(
+        request_id = %request.request_id,
+        account_name,
+        plan_type = refreshed.plan_type.as_deref().unwrap_or("unknown"),
+        primary_remaining_percent = refreshed.primary_remaining_percent.unwrap_or_default(),
+        secondary_remaining_percent = refreshed.secondary_remaining_percent.unwrap_or_default(),
+        "primed issued Codex account status",
+    );
 }
 
 pub(crate) async fn reject_llm_gateway_account_contribution_request(

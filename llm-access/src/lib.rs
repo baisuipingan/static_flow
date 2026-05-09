@@ -53,6 +53,9 @@ use tokio::sync::Semaphore;
 use tower_http::cors::{Any, CorsLayer};
 
 #[cfg(test)]
+pub(crate) static CODEX_UPSTREAM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+#[cfg(test)]
 pub(crate) static KIRO_UPSTREAM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Clone)]
@@ -471,7 +474,10 @@ mod tests {
         routing::get,
         Json, Router,
     };
-    use llm_access_core::store::{AuthenticatedKey, ControlStore};
+    use llm_access_core::store::{
+        AdminReviewQueueAction, AdminReviewQueueStore, AuthenticatedKey, ControlStore,
+        NewPublicAccountContributionRequest, PublicSubmissionStore,
+    };
     use serde_json::json;
     use tower::util::ServiceExt;
 
@@ -609,6 +615,98 @@ mod tests {
                 .expect("serve fake Kiro upstream");
         });
         upstream_base
+    }
+
+    async fn fake_codex_usage_status() -> Json<serde_json::Value> {
+        Json(json!({
+            "plan_type": "pro",
+            "rate_limit": {
+                "primary_window": {
+                    "used_percent": 25.0,
+                    "limit_window_seconds": 18_000,
+                    "reset_at": 1_777_777_777_i64
+                },
+                "secondary_window": {
+                    "used_percent": 12.0,
+                    "limit_window_seconds": 604_800,
+                    "reset_at": 1_778_888_888_i64
+                }
+            }
+        }))
+    }
+
+    async fn fake_codex_usage_status_failure() -> (StatusCode, Json<serde_json::Value>) {
+        (
+            StatusCode::BAD_GATEWAY,
+            Json(json!({
+                "error": "upstream unavailable"
+            })),
+        )
+    }
+
+    async fn spawn_fake_codex_usage_upstream(success: bool) -> String {
+        let app = if success {
+            Router::new()
+                .route("/api/codex/usage", get(fake_codex_usage_status))
+                .route("/backend-api/wham/usage", get(fake_codex_usage_status))
+        } else {
+            Router::new()
+                .route("/api/codex/usage", get(fake_codex_usage_status_failure))
+                .route("/backend-api/wham/usage", get(fake_codex_usage_status_failure))
+        };
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Codex upstream");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake Codex upstream");
+        });
+        upstream_base
+    }
+
+    async fn seed_validated_account_contribution(
+        root: &std::path::Path,
+        request_id: &str,
+        account_name: &str,
+    ) {
+        let repo = llm_access_store::repository::SqliteControlRepository::open_path(
+            root.join("control/llm-access.sqlite3"),
+        )
+        .expect("open sqlite control repository");
+        repo.create_public_account_contribution_request(NewPublicAccountContributionRequest {
+            request_id: request_id.to_string(),
+            account_name: account_name.to_string(),
+            account_id: Some("acct-prime".to_string()),
+            id_token: "id-seed".to_string(),
+            access_token: "access-seed".to_string(),
+            refresh_token: "refresh-seed".to_string(),
+            requester_email: String::new(),
+            contributor_message: "shared account".to_string(),
+            github_id: None,
+            frontend_page_url: None,
+            fingerprint: format!("fingerprint-{request_id}"),
+            client_ip: "198.51.100.31".to_string(),
+            ip_region: "unknown".to_string(),
+            created_at_ms: 10,
+        })
+        .await
+        .expect("create contribution request");
+        repo.validate_admin_account_contribution_request(
+            request_id,
+            Some("acct-prime".to_string()),
+            "id-valid".to_string(),
+            "access-valid".to_string(),
+            "refresh-valid".to_string(),
+            AdminReviewQueueAction {
+                admin_note: Some("validated".to_string()),
+                updated_at_ms: 20,
+            },
+        )
+        .await
+        .expect("validate contribution request")
+        .expect("validated contribution request exists");
     }
 
     async fn fake_usage_list() -> Json<serde_json::Value> {
@@ -1210,6 +1308,141 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(value["user_id"], "kiro-import-user");
         assert_eq!(value["remaining"], 93.0);
+    }
+
+    #[tokio::test]
+    async fn router_primes_codex_status_after_account_contribution_issue() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("Codex upstream env lock");
+        let upstream_base = spawn_fake_codex_usage_upstream(true).await;
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+        let (router, root) = persistent_test_router("codex-status-prime-after-issue").await;
+        seed_validated_account_contribution(&root, "llmacct-prime", "codex-prime").await;
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(
+                        "/admin/llm-gateway/account-contribution-requests/llmacct-prime/\
+                         approve-and-issue",
+                    )
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"admin_note":"issued"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("issue response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("issue body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("issue json");
+        assert_eq!(value["status"], "issued");
+        assert_eq!(value["imported_account_name"], "codex-prime");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/llm-gateway/accounts")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("accounts response");
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("accounts body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("accounts json");
+        let account = value["accounts"]
+            .as_array()
+            .expect("accounts array")
+            .iter()
+            .find(|item| item["name"] == "codex-prime")
+            .expect("issued account present");
+        assert_eq!(account["plan_type"], "Pro");
+        assert_eq!(account["primary_remaining_percent"], 75.0);
+        assert_eq!(account["secondary_remaining_percent"], 88.0);
+        assert!(account["usage_error_message"].is_null());
+    }
+
+    #[tokio::test]
+    async fn router_keeps_issue_success_when_post_issue_codex_status_refresh_fails() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("Codex upstream env lock");
+        let upstream_base = spawn_fake_codex_usage_upstream(false).await;
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+        let (router, root) = persistent_test_router("codex-status-prime-after-issue-failure").await;
+        seed_validated_account_contribution(&root, "llmacct-prime-fail", "codex-prime-fail").await;
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(
+                        "/admin/llm-gateway/account-contribution-requests/llmacct-prime-fail/\
+                         approve-and-issue",
+                    )
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"admin_note":"issued"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("issue response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("issue body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("issue json");
+        assert_eq!(value["status"], "issued");
+        assert_eq!(value["imported_account_name"], "codex-prime-fail");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/llm-gateway/accounts")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("accounts response");
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("accounts body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("accounts json");
+        let account = value["accounts"]
+            .as_array()
+            .expect("accounts array")
+            .iter()
+            .find(|item| item["name"] == "codex-prime-fail")
+            .expect("issued account present");
+        assert!(account["plan_type"].is_null());
+        assert!(account["primary_remaining_percent"].is_null());
+        assert!(account["secondary_remaining_percent"].is_null());
+        assert!(account["usage_error_message"]
+            .as_str()
+            .expect("usage error message")
+            .contains("Codex usage status returned 502 Bad Gateway"));
     }
 
     #[tokio::test]

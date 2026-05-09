@@ -171,6 +171,43 @@ pub(crate) async fn refresh_single_codex_account_status(
     status_store: &Arc<dyn PublicStatusStore>,
     account_name: &str,
 ) -> anyhow::Result<CodexPublicAccountStatus> {
+    refresh_single_codex_account_status_with_mode(
+        config_store,
+        account_store,
+        route_store,
+        status_store,
+        account_name,
+        true,
+    )
+    .await
+}
+
+pub(crate) async fn prime_single_codex_account_status(
+    config_store: &Arc<dyn AdminConfigStore>,
+    account_store: &Arc<dyn AdminCodexAccountStore>,
+    route_store: &Arc<dyn ProviderRouteStore>,
+    status_store: &Arc<dyn PublicStatusStore>,
+    account_name: &str,
+) -> anyhow::Result<CodexPublicAccountStatus> {
+    refresh_single_codex_account_status_with_mode(
+        config_store,
+        account_store,
+        route_store,
+        status_store,
+        account_name,
+        false,
+    )
+    .await
+}
+
+async fn refresh_single_codex_account_status_with_mode(
+    config_store: &Arc<dyn AdminConfigStore>,
+    account_store: &Arc<dyn AdminCodexAccountStore>,
+    route_store: &Arc<dyn ProviderRouteStore>,
+    status_store: &Arc<dyn PublicStatusStore>,
+    account_name: &str,
+    force_refresh: bool,
+) -> anyhow::Result<CodexPublicAccountStatus> {
     let config = config_store
         .get_admin_runtime_config()
         .await
@@ -189,7 +226,7 @@ pub(crate) async fn refresh_single_codex_account_status(
         account_store.as_ref(),
         route_store.as_ref(),
         &config,
-        true,
+        force_refresh,
     )
     .await;
     let snapshot = merge_account_status_refresh(
