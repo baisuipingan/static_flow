@@ -1639,6 +1639,9 @@ impl SqliteControlStore {
         let Some(mut record) = self.get_codex_account(name)? else {
             return Ok(None);
         };
+        if let Some(value) = patch.status.as_ref() {
+            record.status = value.clone();
+        }
         let mut settings = decode_codex_account_settings(&record.settings_json)?;
         if let Some(value) = patch.map_gpt53_codex_to_spark {
             settings.map_gpt53_codex_to_spark = value;
@@ -2181,6 +2184,16 @@ impl SqliteControlStore {
         let object = auth_value
             .as_object_mut()
             .context("kiro auth json must be an object")?;
+        if let Some(status) = patch.status.as_ref() {
+            record.status = status.clone();
+            set_json_optional_bool(
+                object,
+                "disabled",
+                Some(status == core_store::KEY_STATUS_DISABLED),
+            );
+            object.remove("disabledReason");
+            object.remove("disabled_reason");
+        }
         if let Some(value) = patch.max_concurrency {
             record.max_concurrency = Some(value as i64);
             set_json_optional_u64(object, "kiroChannelMaxConcurrency", Some(value));
@@ -3179,6 +3192,7 @@ impl SqliteControlStore {
                     processed_at_ms
                  FROM llm_account_contribution_requests
                  WHERE status = 'issued'
+                   AND show_on_public_wall = 1
                  ORDER BY COALESCE(processed_at_ms, created_at_ms) DESC
                  LIMIT ?1",
             )
@@ -4039,13 +4053,13 @@ impl SqliteControlStore {
             .execute(
                 "INSERT INTO llm_account_contribution_requests (
                     request_id, account_name, account_id, id_token, access_token, refresh_token,
-                    requester_email, contributor_message, github_id, frontend_page_url, status,
-                    fingerprint, client_ip, ip_region, admin_note, failure_reason,
-                    imported_account_name, issued_key_id, issued_key_name, created_at_ms,
-                    updated_at_ms, processed_at_ms
+                    requester_email, contributor_message, github_id, frontend_page_url,
+                    show_on_public_wall, status, fingerprint, client_ip, ip_region,
+                    admin_note, failure_reason, imported_account_name, issued_key_id,
+                    issued_key_name, created_at_ms, updated_at_ms, processed_at_ms
                 ) VALUES (
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14,
-                    NULL, NULL, NULL, NULL, NULL, ?15, ?15, NULL
+                    ?15, NULL, NULL, NULL, NULL, NULL, ?16, ?16, NULL
                 )",
                 params![
                     &request.request_id,
@@ -4058,6 +4072,7 @@ impl SqliteControlStore {
                     &request.contributor_message,
                     &request.github_id,
                     &request.frontend_page_url,
+                    if request.show_on_public_wall { 1_i64 } else { 0_i64 },
                     PUBLIC_TOKEN_REQUEST_STATUS_PENDING,
                     &request.fingerprint,
                     &request.client_ip,
@@ -4510,6 +4525,21 @@ fn set_json_optional_string(
     match value {
         Some(value) => {
             object.insert(key.to_string(), serde_json::Value::String(value));
+        },
+        None => {
+            object.remove(key);
+        },
+    }
+}
+
+fn set_json_optional_bool(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<bool>,
+) {
+    match value {
+        Some(value) => {
+            object.insert(key.to_string(), serde_json::Value::Bool(value));
         },
         None => {
             object.remove(key);
@@ -5381,6 +5411,7 @@ mod tests {
                 contributor_message: "shared for tests".to_string(),
                 github_id: Some("acking-you".to_string()),
                 frontend_page_url: None,
+                show_on_public_wall: true,
                 fingerprint: "fingerprint".to_string(),
                 client_ip: "198.51.100.11".to_string(),
                 ip_region: "unknown".to_string(),
@@ -5485,6 +5516,7 @@ mod tests {
                 contributor_message: "please import this account".to_string(),
                 github_id: Some("acking-you".to_string()),
                 frontend_page_url: None,
+                show_on_public_wall: true,
                 fingerprint: "fingerprint-account".to_string(),
                 client_ip: "198.51.100.22".to_string(),
                 ip_region: "unknown".to_string(),
@@ -5616,6 +5648,7 @@ mod tests {
                 contributor_message: "shared account".to_string(),
                 github_id: None,
                 frontend_page_url: None,
+                show_on_public_wall: true,
                 fingerprint: "fingerprint-account".to_string(),
                 client_ip: "198.51.100.31".to_string(),
                 ip_region: "unknown".to_string(),
@@ -5725,6 +5758,7 @@ mod tests {
         repo.patch_admin_codex_account(
             "codex-route",
             &llm_access_core::store::AdminCodexAccountPatch {
+                status: None,
                 map_gpt53_codex_to_spark: None,
                 proxy_mode: Some("fixed".to_string()),
                 proxy_config_id: Some(Some("proxy-codex-route".to_string())),
@@ -6492,6 +6526,7 @@ mod tests {
             contributor_message: "shared account".to_string(),
             github_id: None,
             frontend_page_url: None,
+            show_on_public_wall: true,
             fingerprint: format!("fingerprint-{request_id}"),
             client_ip: "198.51.100.31".to_string(),
             ip_region: "unknown".to_string(),

@@ -475,8 +475,10 @@ mod tests {
         Json, Router,
     };
     use llm_access_core::store::{
-        AdminReviewQueueAction, AdminReviewQueueStore, AuthenticatedKey, ControlStore,
-        NewPublicAccountContributionRequest, PublicSubmissionStore,
+        AdminCodexAccountStore, AdminKiroAccountStore, AdminReviewQueueAction,
+        AdminReviewQueueStore, AuthenticatedKey, CodexPublicAccountStatus, CodexRateLimitStatus,
+        ControlStore, NewAdminCodexAccount, NewAdminKiroAccount,
+        NewPublicAccountContributionRequest, PublicStatusStore, PublicSubmissionStore,
     };
     use serde_json::json;
     use tower::util::ServiceExt;
@@ -686,6 +688,7 @@ mod tests {
             contributor_message: "shared account".to_string(),
             github_id: None,
             frontend_page_url: None,
+            show_on_public_wall: true,
             fingerprint: format!("fingerprint-{request_id}"),
             client_ip: "198.51.100.31".to_string(),
             ip_region: "unknown".to_string(),
@@ -2082,6 +2085,203 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_patches_admin_llm_gateway_account_status_and_hides_disabled_route() {
+        let (router, root) = persistent_test_router("codex-account-disable").await;
+        let repo = llm_access_store::repository::SqliteControlRepository::open_path(
+            root.join("control/llm-access.sqlite3"),
+        )
+        .expect("open sqlite control repository");
+        repo.create_admin_codex_account(NewAdminCodexAccount {
+            name: "codex_primary".to_string(),
+            account_id: Some("acct-1".to_string()),
+            auth_json: serde_json::json!({
+                "id_token": "id",
+                "access_token": "access",
+                "refresh_token": "refresh",
+                "account_id": "acct-1",
+            })
+            .to_string(),
+            map_gpt53_codex_to_spark: false,
+            created_at_ms: 100,
+        })
+        .await
+        .expect("create codex account");
+        repo.save_codex_rate_limit_status(CodexRateLimitStatus {
+            status: "ready".to_string(),
+            refresh_interval_seconds: 300,
+            last_checked_at: Some(200),
+            last_success_at: Some(200),
+            source_url: "https://chatgpt.com/backend-api/wham/usage".to_string(),
+            error_message: None,
+            accounts: vec![CodexPublicAccountStatus {
+                name: "codex_primary".to_string(),
+                status: "active".to_string(),
+                plan_type: Some("Plus".to_string()),
+                primary_remaining_percent: Some(91.0),
+                secondary_remaining_percent: Some(95.0),
+                last_usage_checked_at: Some(200),
+                last_usage_success_at: Some(200),
+                usage_error_message: None,
+            }],
+            buckets: Vec::new(),
+        })
+        .await
+        .expect("seed cached codex status");
+
+        let disable_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/admin/llm-gateway/accounts/codex_primary")
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"status":"disabled"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("disable response");
+        assert_eq!(disable_response.status(), StatusCode::OK);
+        let disable_body = to_bytes(disable_response.into_body(), usize::MAX)
+            .await
+            .expect("disable body");
+        let disable_value: serde_json::Value =
+            serde_json::from_slice(&disable_body).expect("disable json");
+        assert_eq!(disable_value["status"], "disabled");
+
+        let list_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri("/admin/llm-gateway/accounts")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("accounts response");
+        assert_eq!(list_response.status(), StatusCode::OK);
+        let list_body = to_bytes(list_response.into_body(), usize::MAX)
+            .await
+            .expect("accounts body");
+        let list_value: serde_json::Value =
+            serde_json::from_slice(&list_body).expect("accounts json");
+        let account = list_value["accounts"]
+            .as_array()
+            .expect("accounts array")
+            .iter()
+            .find(|item| item["name"] == "codex_primary")
+            .expect("account present");
+        assert_eq!(account["status"], "disabled");
+        assert!(repo
+            .resolve_admin_codex_account_route("codex_primary")
+            .await
+            .expect("resolve disabled codex route")
+            .is_none());
+
+        let enable_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/admin/llm-gateway/accounts/codex_primary")
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"status":"active"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("enable response");
+        assert_eq!(enable_response.status(), StatusCode::OK);
+        assert!(repo
+            .resolve_admin_codex_account_route("codex_primary")
+            .await
+            .expect("resolve enabled codex route")
+            .is_some());
+
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
+    }
+
+    #[tokio::test]
+    async fn router_patches_admin_kiro_account_status_and_hides_disabled_route() {
+        let (router, root) = persistent_test_router("kiro-account-disable").await;
+        let repo = llm_access_store::repository::SqliteControlRepository::open_path(
+            root.join("control/llm-access.sqlite3"),
+        )
+        .expect("open sqlite control repository");
+        repo.create_admin_kiro_account(NewAdminKiroAccount {
+            name: "kiro_primary".to_string(),
+            auth_method: "social".to_string(),
+            account_id: Some("kiro-account".to_string()),
+            profile_arn: Some("arn:aws:iam::123456789012:role/KiroProfile".to_string()),
+            user_id: Some("kiro-user".to_string()),
+            status: "active".to_string(),
+            auth_json: serde_json::json!({
+                "accessToken": "kiro-access-token",
+                "refreshToken": "r".repeat(96),
+                "expiresAt": "2035-01-01T00:00:00Z",
+                "profileArn": "arn:aws:iam::123456789012:role/KiroProfile",
+                "apiRegion": "us-east-1",
+            })
+            .to_string(),
+            max_concurrency: Some(1),
+            min_start_interval_ms: Some(100),
+            proxy_config_id: None,
+            created_at_ms: 100,
+        })
+        .await
+        .expect("create kiro account");
+
+        let disable_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/admin/kiro-gateway/accounts/kiro_primary")
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"status":"disabled"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("disable response");
+        assert_eq!(disable_response.status(), StatusCode::OK);
+        let disable_body = to_bytes(disable_response.into_body(), usize::MAX)
+            .await
+            .expect("disable body");
+        let disable_value: serde_json::Value =
+            serde_json::from_slice(&disable_body).expect("disable json");
+        assert_eq!(disable_value["disabled"], true);
+        assert!(repo
+            .resolve_admin_kiro_account_route("kiro_primary")
+            .await
+            .expect("resolve disabled kiro route")
+            .is_none());
+
+        let enable_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("PATCH")
+                    .uri("/admin/kiro-gateway/accounts/kiro_primary")
+                    .header(header::HOST, "localhost")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .body(Body::from(r#"{"status":"active"}"#))
+                    .expect("request"),
+            )
+            .await
+            .expect("enable response");
+        assert_eq!(enable_response.status(), StatusCode::OK);
+        assert!(repo
+            .resolve_admin_kiro_account_route("kiro_primary")
+            .await
+            .expect("resolve enabled kiro route")
+            .is_some());
+
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
+    }
+
+    #[tokio::test]
     async fn router_creates_and_completes_codex_batch_import_job() {
         let (router, root) = persistent_test_router("codex-batch-import-success").await;
 
@@ -2389,6 +2589,131 @@ mod tests {
         assert!(value["results"][0]["request_id"]
             .as_str()
             .is_some_and(|value| value.starts_with("llmacct-")));
+    }
+
+    #[tokio::test]
+    async fn router_hides_batch_imported_account_contributions_from_public_wall() {
+        let (router, root) = persistent_test_router("public-account-contribution-visibility").await;
+
+        let single_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/llm-gateway/account-contribution-requests/submit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-real-ip", "198.51.100.21")
+                    .body(Body::from(
+                        r#"{
+                            "account_name": "visible_account",
+                            "refresh_token": "refresh-token-visible",
+                            "contributor_message": "visible contribution"
+                        }"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("single response");
+        assert_eq!(single_response.status(), StatusCode::OK);
+        let single_body = to_bytes(single_response.into_body(), usize::MAX)
+            .await
+            .expect("single body");
+        let single_value: serde_json::Value =
+            serde_json::from_slice(&single_body).expect("single json");
+        let single_request_id = single_value["request_id"]
+            .as_str()
+            .expect("single request id")
+            .to_string();
+
+        let batch_response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/llm-gateway/account-contribution-requests/batch-submit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-real-ip", "198.51.100.22")
+                    .body(Body::from(
+                        r#"{
+                            "contributor_message": "hidden contribution",
+                            "items": [{
+                                "account_name": "hidden_account",
+                                "tokens": {
+                                    "refresh_token": "refresh-token-hidden"
+                                }
+                            }]
+                        }"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("batch response");
+        assert_eq!(batch_response.status(), StatusCode::OK);
+        let batch_body = to_bytes(batch_response.into_body(), usize::MAX)
+            .await
+            .expect("batch body");
+        let batch_value: serde_json::Value =
+            serde_json::from_slice(&batch_body).expect("batch json");
+        let batch_request_id = batch_value["results"][0]["request_id"]
+            .as_str()
+            .expect("batch request id")
+            .to_string();
+
+        let repo = llm_access_store::repository::SqliteControlRepository::open_path(
+            root.join("control/llm-access.sqlite3"),
+        )
+        .expect("open sqlite control repository");
+        let updated_at_ms = 200;
+        repo.issue_admin_account_contribution_request(
+            &single_request_id,
+            None,
+            None,
+            None,
+            AdminReviewQueueAction {
+                admin_note: Some("issued".to_string()),
+                updated_at_ms,
+            },
+        )
+        .await
+        .expect("issue visible contribution")
+        .expect("visible contribution exists");
+        repo.issue_admin_account_contribution_request(
+            &batch_request_id,
+            None,
+            None,
+            None,
+            AdminReviewQueueAction {
+                admin_note: Some("issued".to_string()),
+                updated_at_ms: updated_at_ms + 1,
+            },
+        )
+        .await
+        .expect("issue hidden contribution")
+        .expect("hidden contribution exists");
+
+        let wall_response = router
+            .oneshot(
+                Request::builder()
+                    .uri("/api/llm-gateway/account-contributions")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("wall response");
+
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
+
+        assert_eq!(wall_response.status(), StatusCode::OK);
+        let wall_body = to_bytes(wall_response.into_body(), usize::MAX)
+            .await
+            .expect("wall body");
+        let wall_value: serde_json::Value = serde_json::from_slice(&wall_body).expect("wall json");
+        let contributions = wall_value["contributions"]
+            .as_array()
+            .expect("contributions array");
+        assert_eq!(contributions.len(), 1);
+        assert_eq!(contributions[0]["request_id"], single_request_id);
+        assert_eq!(contributions[0]["account_name"], "visible_account");
     }
 
     #[tokio::test]

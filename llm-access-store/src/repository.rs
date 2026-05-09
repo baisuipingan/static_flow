@@ -2042,26 +2042,32 @@ mod tests {
         conn.execute(
             "INSERT INTO llm_account_contribution_requests (
                 request_id, account_name, account_id, id_token, access_token, refresh_token,
-                requester_email, contributor_message, github_id, frontend_page_url, status,
-                fingerprint, client_ip, ip_region, admin_note, failure_reason,
-                imported_account_name, issued_key_id, issued_key_name, created_at_ms,
-                updated_at_ms, processed_at_ms
+                requester_email, contributor_message, github_id, frontend_page_url,
+                show_on_public_wall, status, fingerprint, client_ip, ip_region,
+                admin_note, failure_reason, imported_account_name, issued_key_id,
+                issued_key_name, created_at_ms, updated_at_ms, processed_at_ms
             ) VALUES
                 (
                     'contribution-pending', 'pending account', NULL, 'id', 'access', 'refresh',
-                    'pending@example.test', 'not visible', NULL, NULL, 'pending',
+                    'pending@example.test', 'not visible', NULL, NULL, 1, 'pending',
                     'fp-pending', '127.0.0.1', 'local', NULL, NULL, NULL, NULL, NULL,
                     100, 100, NULL
                 ),
                 (
                     'contribution-old', 'old account', NULL, 'id', 'access', 'refresh',
-                    'old@example.test', 'old message', 'old-gh', NULL, 'issued',
+                    'old@example.test', 'old message', 'old-gh', NULL, 1, 'issued',
                     'fp-old', '127.0.0.1', 'local', NULL, NULL, NULL, 'key-old', 'key old',
                     200, 300, 300
                 ),
                 (
+                    'contribution-hidden', 'batch account', NULL, 'id', 'access', 'refresh',
+                    'hidden@example.test', 'hidden message', 'hidden-gh', NULL, 0, 'issued',
+                    'fp-hidden', '127.0.0.1', 'local', NULL, NULL, 'hidden account',
+                    'key-hidden', 'key hidden', 350, 450, 450
+                ),
+                (
                     'contribution-new', 'raw account', NULL, 'id', 'access', 'refresh',
-                    'new@example.test', 'new message', 'new-gh', NULL, 'issued',
+                    'new@example.test', 'new message', 'new-gh', NULL, 1, 'issued',
                     'fp-new', '127.0.0.1', 'local', NULL, NULL, 'imported account',
                     'key-new', 'key new', 400, 500, 500
                 )",
@@ -2083,6 +2089,9 @@ mod tests {
         assert_eq!(contributions[0].processed_at_ms, Some(500));
         assert_eq!(contributions[1].request_id, "contribution-old");
         assert_eq!(contributions[1].account_name, "old account");
+        assert!(contributions
+            .iter()
+            .all(|item| item.request_id != "contribution-hidden"));
     }
 
     #[tokio::test]

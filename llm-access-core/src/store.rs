@@ -760,6 +760,8 @@ pub struct NewAdminCodexAccount {
 /// Patch for one Codex account.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct AdminCodexAccountPatch {
+    /// New runtime status.
+    pub status: Option<String>,
     /// New GPT-5.3 Codex Spark mapping toggle.
     pub map_gpt53_codex_to_spark: Option<bool>,
     /// New proxy selection mode.
@@ -1039,6 +1041,8 @@ pub struct NewAdminKiroAccount {
 /// Patch for mutable Kiro account routing/scheduler settings.
 #[derive(Debug, Clone, Default, PartialEq)]
 pub struct AdminKiroAccountPatch {
+    /// New runtime status.
+    pub status: Option<String>,
     /// New per-account request concurrency cap.
     pub max_concurrency: Option<u64>,
     /// New per-account request pacing interval.
@@ -1373,6 +1377,8 @@ pub struct NewPublicAccountContributionRequest {
     pub github_id: Option<String>,
     /// Optional frontend page URL.
     pub frontend_page_url: Option<String>,
+    /// Whether this contribution should be shown on the public thank-you wall.
+    pub show_on_public_wall: bool,
     /// Normalized client fingerprint.
     pub fingerprint: String,
     /// Normalized client IP.

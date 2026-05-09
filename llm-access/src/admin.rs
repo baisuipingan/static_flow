@@ -459,6 +459,8 @@ pub(crate) struct ListCodexImportJobsRequest {
 #[derive(Debug, Deserialize)]
 pub(crate) struct PatchLlmGatewayAccountRequest {
     #[serde(default)]
+    status: Option<String>,
+    #[serde(default)]
     proxy_mode: Option<String>,
     #[serde(default)]
     proxy_config_id: Option<String>,
@@ -529,6 +531,8 @@ pub(crate) struct CreateManualKiroAccountRequest {
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct PatchKiroAccountRequest {
+    #[serde(default)]
+    status: Option<String>,
     #[serde(default)]
     kiro_channel_max_concurrency: Option<u64>,
     #[serde(default)]
@@ -1213,7 +1217,6 @@ fn apply_codex_public_status_to_admin_account(
     status_account: core_store::CodexPublicAccountStatus,
     status_last_checked_at: Option<i64>,
 ) {
-    account.status = status_account.status;
     account.plan_type = status_account.plan_type;
     account.primary_remaining_percent = status_account.primary_remaining_percent;
     account.secondary_remaining_percent = status_account.secondary_remaining_percent;
@@ -1378,6 +1381,7 @@ pub(crate) async fn patch_llm_gateway_account(
         Ok(patch) => patch,
         Err(response) => return response.into_response(),
     };
+    let refresh_public_status = patch.status.is_some();
     if let Some(Some(proxy_id)) = patch.proxy_config_id.as_ref() {
         let proxy = match state
             .admin_proxy_store
@@ -1400,7 +1404,25 @@ pub(crate) async fn patch_llm_gateway_account(
         .patch_admin_codex_account(&name, patch)
         .await
     {
-        Ok(Some(account)) => Json(account).into_response(),
+        Ok(Some(account)) => {
+            if refresh_public_status {
+                if let Err(err) = codex_status::prime_single_codex_account_status(
+                    &state.admin_config_store,
+                    &state.admin_codex_account_store,
+                    &state.provider_state.route_store(),
+                    &state.public_status_store,
+                    &account.name,
+                )
+                .await
+                {
+                    tracing::warn!(
+                        account_name = %account.name,
+                        "failed to refresh Codex public status after account status update: {err:#}"
+                    );
+                }
+            }
+            Json(account).into_response()
+        },
         Ok(None) => not_found("LLM gateway account not found").into_response(),
         Err(_) => internal_error("Failed to update llm gateway account").into_response(),
     }
@@ -1827,6 +1849,7 @@ pub(crate) async fn patch_admin_kiro_account(
         Ok(patch) => patch,
         Err(response) => return response.into_response(),
     };
+    let sync_status_cache = patch.status.is_some();
     if let Some(Some(proxy_id)) = patch.proxy_config_id.as_ref() {
         let proxy = match state
             .admin_proxy_store
@@ -1849,7 +1872,12 @@ pub(crate) async fn patch_admin_kiro_account(
         .patch_admin_kiro_account(&name, patch)
         .await
     {
-        Ok(Some(account)) => Json(account).into_response(),
+        Ok(Some(account)) => {
+            if sync_status_cache {
+                sync_kiro_status_after_account_update(&state, &account).await;
+            }
+            Json(account).into_response()
+        },
         Ok(None) => not_found("Kiro account not found").into_response(),
         Err(_) => internal_error("Failed to update Kiro account").into_response(),
     }
@@ -4473,6 +4501,11 @@ fn normalize_proxy_config_patch(
 fn normalize_account_patch(
     request: PatchLlmGatewayAccountRequest,
 ) -> Result<AdminCodexAccountPatch, AdminHttpError> {
+    let status = request
+        .status
+        .as_deref()
+        .map(normalize_status)
+        .transpose()?;
     let proxy_mode = request
         .proxy_mode
         .as_deref()
@@ -4505,6 +4538,7 @@ fn normalize_account_patch(
         request_min_start_interval_ms.flatten(),
     )?;
     Ok(AdminCodexAccountPatch {
+        status,
         map_gpt53_codex_to_spark: request.map_gpt53_codex_to_spark,
         proxy_mode,
         proxy_config_id,
@@ -4594,23 +4628,60 @@ async fn create_or_replace_kiro_account(state: HttpState, auth: KiroAuthRecord) 
         .await
     {
         Ok(account) => {
-            prime_kiro_status_after_account_save(&state, &account.name).await;
+            sync_kiro_status_after_account_update(&state, &account).await;
             Json(account).into_response()
         },
         Err(_) => internal_error("Failed to save Kiro account").into_response(),
     }
 }
 
-async fn prime_kiro_status_after_account_save(state: &HttpState, account_name: &str) {
+async fn sync_kiro_status_after_account_update(
+    state: &HttpState,
+    account: &core_store::AdminKiroAccount,
+) {
+    if account.disabled {
+        let now = now_ms();
+        let refresh_interval_seconds = account.cache.refresh_interval_seconds;
+        let update = core_store::AdminKiroStatusCacheUpdate {
+            account_name: account.name.clone(),
+            balance: account.balance.clone(),
+            refreshed_at_ms: now,
+            expires_at_ms: now
+                .saturating_add((refresh_interval_seconds as i64).saturating_mul(1000)),
+            cache: core_store::AdminKiroCacheView {
+                status: KEY_STATUS_DISABLED.to_string(),
+                refresh_interval_seconds,
+                last_checked_at: Some(now),
+                last_success_at: account.cache.last_success_at,
+                error_message: None,
+            },
+            last_error: None,
+        };
+        if let Err(err) = state
+            .admin_kiro_account_store
+            .save_admin_kiro_status_cache(update)
+            .await
+        {
+            tracing::warn!(
+                account_name = %account.name,
+                "failed to persist disabled Kiro status after account update: {err:#}"
+            );
+        }
+        return;
+    }
+
     let route = match state
         .admin_kiro_account_store
-        .resolve_admin_kiro_account_route(account_name)
+        .resolve_admin_kiro_account_route(&account.name)
         .await
     {
         Ok(Some(route)) => route,
         Ok(None) => return,
         Err(err) => {
-            tracing::warn!(account_name = %account_name, "failed to load Kiro account route after save: {err:#}");
+            tracing::warn!(
+                account_name = %account.name,
+                "failed to resolve Kiro route after account update: {err:#}"
+            );
             return;
         },
     };
@@ -4618,13 +4689,21 @@ async fn prime_kiro_status_after_account_save(state: &HttpState, account_name: &
     if let Err(err) =
         kiro_status::refresh_and_persist_route_status(&route, route_store.as_ref(), false).await
     {
-        tracing::warn!(account_name = %account_name, "failed to prime cached Kiro status after account save: {err:#}");
+        tracing::warn!(
+            account_name = %account.name,
+            "failed to refresh cached Kiro status after account update: {err:#}"
+        );
     }
 }
 
 fn normalize_kiro_account_patch(
     request: PatchKiroAccountRequest,
 ) -> Result<core_store::AdminKiroAccountPatch, AdminHttpError> {
+    let status = request
+        .status
+        .as_deref()
+        .map(normalize_status)
+        .transpose()?;
     validate_kiro_channel_limit_inputs(
         request.kiro_channel_max_concurrency,
         request.kiro_channel_min_start_interval_ms,
@@ -4652,6 +4731,7 @@ fn normalize_kiro_account_patch(
         return Err(bad_request("fixed proxy_mode requires proxy_config_id"));
     }
     Ok(core_store::AdminKiroAccountPatch {
+        status,
         max_concurrency: request.kiro_channel_max_concurrency,
         min_start_interval_ms: request.kiro_channel_min_start_interval_ms,
         minimum_remaining_credits_before_block: request.minimum_remaining_credits_before_block,

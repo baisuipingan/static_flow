@@ -1146,6 +1146,7 @@ pub(crate) fn kiro_account_card(props: &KiroAccountCardProps) -> Html {
                     (Some("inherit".to_string()), None)
                 };
                 match patch_admin_kiro_account(&account_name, &PatchKiroAccountInput {
+                    status: None,
                     kiro_channel_max_concurrency: Some(parsed_max),
                     kiro_channel_min_start_interval_ms: Some(parsed_min),
                     minimum_remaining_credits_before_block: Some(
@@ -1169,6 +1170,58 @@ pub(crate) fn kiro_account_card(props: &KiroAccountCardProps) -> Html {
                             format!(
                                 "Failed to update account settings for `{account_name}`.\n{err}"
                             ),
+                            true,
+                        ));
+                    },
+                }
+                busy.set(false);
+            });
+        })
+    };
+
+    let on_toggle_disabled = {
+        let account_name = props.account.name.clone();
+        let currently_disabled = props.account.disabled;
+        let flash = props.flash.clone();
+        let notify = props.notify.clone();
+        let error = props.error.clone();
+        let feedback = feedback.clone();
+        let busy = busy.clone();
+        let on_reload = props.on_reload.clone();
+        Callback::from(move |_| {
+            let account_name = account_name.clone();
+            let flash = flash.clone();
+            let notify = notify.clone();
+            let error = error.clone();
+            let feedback = feedback.clone();
+            let busy = busy.clone();
+            let on_reload = on_reload.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                busy.set(true);
+                error.set(None);
+                let next_status = if currently_disabled { "active" } else { "disabled" };
+                match patch_admin_kiro_account(&account_name, &PatchKiroAccountInput {
+                    status: Some(next_status.to_string()),
+                    kiro_channel_max_concurrency: None,
+                    kiro_channel_min_start_interval_ms: None,
+                    minimum_remaining_credits_before_block: None,
+                    proxy_mode: None,
+                    proxy_config_id: None,
+                })
+                .await
+                {
+                    Ok(_) => {
+                        let action = if currently_disabled { "enabled" } else { "disabled" };
+                        feedback.set(Some(format!("Account {action}.")));
+                        let message = format!("Updated `{account_name}` to {next_status}.");
+                        flash.set(Some(message.clone()));
+                        notify.emit((message, false));
+                        on_reload.emit(());
+                    },
+                    Err(err) => {
+                        error.set(Some(err.clone()));
+                        notify.emit((
+                            format!("Failed to update `{account_name}` status.\n{err}"),
                             true,
                         ));
                     },
@@ -1262,6 +1315,9 @@ pub(crate) fn kiro_account_card(props: &KiroAccountCardProps) -> Html {
                 <div class={classes!("flex", "gap-2", "flex-wrap")}>
                     <button type="button" class={classes!("btn-terminal")} onclick={on_refresh_cache.clone()} disabled={*busy}>
                         { "Refresh Cache" }
+                    </button>
+                    <button type="button" class={classes!("btn-terminal")} onclick={on_toggle_disabled.clone()} disabled={*busy}>
+                        { if account.disabled { "Enable" } else { "Disable" } }
                     </button>
                     <button type="button" class={classes!("btn-terminal", "!text-red-600", "dark:!text-red-300")} onclick={on_delete_account.clone()} disabled={*busy}>
                         { "Delete" }

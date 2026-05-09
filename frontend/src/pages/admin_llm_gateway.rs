@@ -3763,7 +3763,55 @@ pub fn admin_llm_gateway_page() -> Html {
                 match patch_admin_llm_gateway_account(
                     &account_name,
                     &PatchAdminLlmGatewayAccountInput {
+                        status: None,
                         map_gpt53_codex_to_spark: Some(enabled),
+                        proxy_mode: None,
+                        proxy_config_id: None,
+                        request_max_concurrency: None,
+                        request_min_start_interval_ms: None,
+                        request_max_concurrency_unlimited: false,
+                        request_min_start_interval_ms_unlimited: false,
+                    },
+                )
+                .await
+                {
+                    Ok(updated) => {
+                        let mut items = (*accounts).clone();
+                        if let Some(item) = items.iter_mut().find(|item| item.name == updated.name)
+                        {
+                            *item = updated;
+                        }
+                        accounts.set(items);
+                        load_error.set(None);
+                    },
+                    Err(err) => load_error.set(Some(err)),
+                }
+
+                let mut inflight = (*account_action_inflight).clone();
+                inflight.remove(&account_name);
+                account_action_inflight.set(inflight);
+            });
+        })
+    };
+
+    let on_toggle_account_status = {
+        let account_action_inflight = account_action_inflight.clone();
+        let accounts = accounts.clone();
+        let load_error = load_error.clone();
+        Callback::from(move |(account_name, status): (String, String)| {
+            let account_action_inflight = account_action_inflight.clone();
+            let accounts = accounts.clone();
+            let load_error = load_error.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut inflight = (*account_action_inflight).clone();
+                inflight.insert(account_name.clone());
+                account_action_inflight.set(inflight);
+
+                match patch_admin_llm_gateway_account(
+                    &account_name,
+                    &PatchAdminLlmGatewayAccountInput {
+                        status: Some(status),
+                        map_gpt53_codex_to_spark: None,
                         proxy_mode: None,
                         proxy_config_id: None,
                         request_max_concurrency: None,
@@ -3860,6 +3908,7 @@ pub fn admin_llm_gateway_page() -> Html {
                 match patch_admin_llm_gateway_account(
                     &account_name,
                     &PatchAdminLlmGatewayAccountInput {
+                        status: None,
                         map_gpt53_codex_to_spark: None,
                         proxy_mode,
                         proxy_config_id,
@@ -6220,6 +6269,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         <div class={classes!("mt-4", "space-y-2")}>
                             { for accounts.iter().map(|acc| {
                                 let acc_name_for_toggle = acc.name.clone();
+                                let acc_name_for_status_toggle = acc.name.clone();
                                 let acc_name_for_delete = acc.name.clone();
                                 let acc_name_for_refresh = acc.name.clone();
                                 let acc_name_for_proxy_change = acc.name.clone();
@@ -6228,6 +6278,12 @@ pub fn admin_llm_gateway_page() -> Html {
                                 let acc_name_for_request_min_change = acc.name.clone();
                                 let acc_name = acc.name.clone();
                                 let acc_status = acc.status.clone();
+                                let account_disabled = acc_status == "disabled";
+                                let toggled_account_status = if account_disabled {
+                                    "active".to_string()
+                                } else {
+                                    "disabled".to_string()
+                                };
                                 let acc_plan_type = acc.plan_type.clone();
                                 let acc_account_id = acc.account_id.clone();
                                 let spark_mapping_enabled = acc.map_gpt53_codex_to_spark;
@@ -6280,6 +6336,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                     .unwrap_or_else(|| "-".to_string());
                                 let on_delete = on_delete_account.clone();
                                 let on_refresh_account = on_refresh_account.clone();
+                                let on_toggle_account_status = on_toggle_account_status.clone();
                                 let on_toggle_account_spark_mapping =
                                     on_toggle_account_spark_mapping.clone();
                                 let on_save_account_settings = on_save_account_settings.clone();
@@ -6408,6 +6465,26 @@ pub fn admin_llm_gateway_page() -> Html {
                                                     disabled={account_busy}
                                                 >
                                                     { if account_busy { "处理中..." } else { "刷新状态" } }
+                                                </button>
+                                                <button
+                                                    class={classes!("btn-terminal")}
+                                                    onclick={Callback::from(move |_| {
+                                                        on_toggle_account_status.emit((
+                                                            acc_name_for_status_toggle.clone(),
+                                                            toggled_account_status.clone(),
+                                                        ))
+                                                    })}
+                                                    disabled={account_busy}
+                                                >
+                                                    {
+                                                        if account_busy {
+                                                            "处理中..."
+                                                        } else if account_disabled {
+                                                            "启用"
+                                                        } else {
+                                                            "禁用"
+                                                        }
+                                                    }
                                                 </button>
                                             </div>
                                             if show_spark_toggle {

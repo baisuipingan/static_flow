@@ -49,6 +49,13 @@ const SQLITE_MIGRATIONS: &[SqlMigration] = &[
         name: "usage_journal_runtime_settings",
         sql: include_str!("../migrations/sqlite/0007_usage_journal_runtime_settings.sql"),
     },
+    SqlMigration {
+        version: 8,
+        name: "account_contribution_public_wall_visibility",
+        sql: include_str!(
+            "../migrations/sqlite/0008_account_contribution_public_wall_visibility.sql"
+        ),
+    },
 ];
 
 const DUCKDB_MIGRATIONS: &[SqlMigration] = &[
@@ -139,7 +146,7 @@ mod tests {
     fn sqlite_migrations_are_file_backed_and_versioned() {
         let migrations = super::sqlite_migrations();
 
-        assert_eq!(migrations.len(), 7);
+        assert_eq!(migrations.len(), 8);
         assert_eq!(migrations[0].version, 1);
         assert_eq!(migrations[0].name, "init");
         assert!(migrations[0]
@@ -173,6 +180,9 @@ mod tests {
         assert_eq!(migrations[6].name, "usage_journal_runtime_settings");
         assert!(migrations[6].sql.contains("usage_journal_enabled"));
         assert!(migrations[6].sql.contains("usage_query_base_url"));
+        assert_eq!(migrations[7].version, 8);
+        assert_eq!(migrations[7].name, "account_contribution_public_wall_visibility");
+        assert!(migrations[7].sql.contains("show_on_public_wall"));
     }
 
     #[test]
@@ -206,7 +216,7 @@ mod tests {
         let applied_count: i64 = conn
             .query_row("SELECT count(*) FROM llm_access_schema_migrations", [], |row| row.get(0))
             .expect("count migrations");
-        assert_eq!(applied_count, 7);
+        assert_eq!(applied_count, 8);
 
         let full_logging_column_count: i64 = conn
             .query_row(
@@ -257,14 +267,25 @@ mod tests {
             .expect("inspect runtime config journal columns");
         assert_eq!(runtime_journal_column_count, 12);
 
+        let contribution_public_wall_column_count: i64 = conn
+            .query_row(
+                "SELECT count(*)
+                 FROM pragma_table_info('llm_account_contribution_requests')
+                 WHERE name = 'show_on_public_wall'",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect account contribution visibility column");
+        assert_eq!(contribution_public_wall_column_count, 1);
+
         conn.execute(
             "INSERT INTO llm_account_contribution_requests (
                 request_id, account_name, id_token, access_token, refresh_token,
-                requester_email, contributor_message, status, fingerprint, client_ip,
-                ip_region, created_at_ms, updated_at_ms
+                requester_email, contributor_message, status, show_on_public_wall,
+                fingerprint, client_ip, ip_region, created_at_ms, updated_at_ms
             ) VALUES (
                 'llmacct-validated', 'acct-validated', '', 'access', 'refresh',
-                '', 'ok', 'validated', 'fp', '127.0.0.1', 'unknown', 1, 1
+                '', 'ok', 'validated', 0, 'fp', '127.0.0.1', 'unknown', 1, 1
             )",
             [],
         )

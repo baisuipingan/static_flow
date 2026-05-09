@@ -540,6 +540,7 @@ fn build_status_snapshot(
     let checked_at = now_ms();
     let mut accounts = Vec::new();
     let mut buckets = Vec::new();
+    let mut configured_count = 0_usize;
     let mut active_count = 0_usize;
     let mut success_count = 0_usize;
     let mut errors = Vec::new();
@@ -549,6 +550,10 @@ fn build_status_snapshot(
                 account,
                 buckets: account_buckets,
             } => {
+                configured_count += 1;
+                if account.status != KEY_STATUS_ACTIVE {
+                    continue;
+                }
                 active_count += 1;
                 success_count += 1;
                 buckets.extend(account_buckets);
@@ -557,6 +562,10 @@ fn build_status_snapshot(
             AccountStatusRefresh::Error {
                 account,
             } => {
+                configured_count += 1;
+                if account.status != KEY_STATUS_ACTIVE {
+                    continue;
+                }
                 if account.status == KEY_STATUS_ACTIVE {
                     active_count += 1;
                     if let Some(error) = account.usage_error_message.as_ref() {
@@ -567,7 +576,12 @@ fn build_status_snapshot(
             },
             AccountStatusRefresh::Skipped {
                 account,
-            } => accounts.push(account),
+            } => {
+                configured_count += 1;
+                if account.status == KEY_STATUS_ACTIVE {
+                    accounts.push(account);
+                }
+            },
         }
     }
 
@@ -581,7 +595,7 @@ fn build_status_snapshot(
     let error_message = if active_count == 0 {
         Some(format!(
             "no active codex accounts available out of {} configured account(s)",
-            accounts.len()
+            configured_count
         ))
     } else if errors.is_empty() {
         None

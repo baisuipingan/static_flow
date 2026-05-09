@@ -9073,6 +9073,7 @@ pub async fn delete_admin_llm_gateway_account(name: &str) -> Result<(), String> 
 
 #[derive(Debug, Serialize, Clone, PartialEq, Default)]
 pub struct PatchAdminLlmGatewayAccountInput {
+    pub status: Option<String>,
     pub map_gpt53_codex_to_spark: Option<bool>,
     pub proxy_mode: Option<String>,
     pub proxy_config_id: Option<String>,
@@ -9090,7 +9091,7 @@ pub async fn patch_admin_llm_gateway_account(
     {
         Ok(AccountSummaryView {
             name: name.to_string(),
-            status: "active".to_string(),
+            status: input.status.clone().unwrap_or_else(|| "active".to_string()),
             account_id: None,
             plan_type: Some("Pro".to_string()),
             primary_remaining_percent: Some(100.0),
@@ -9335,6 +9336,7 @@ pub struct CreateManualKiroAccountInput {
 
 #[derive(Debug, Serialize, Clone, PartialEq, Default)]
 pub struct PatchKiroAccountInput {
+    pub status: Option<String>,
     pub kiro_channel_max_concurrency: Option<u64>,
     pub kiro_channel_min_start_interval_ms: Option<u64>,
     pub minimum_remaining_credits_before_block: Option<f64>,
