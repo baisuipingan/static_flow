@@ -27,6 +27,7 @@ const PUBLIC_USAGE_LOOKUP_MAX_LIMIT: usize = 20;
 const PUBLIC_USAGE_LOOKUP_MAX_OFFSET: usize = 200;
 const PUBLIC_USAGE_LOOKUP_CHART_BUCKETS: usize = 24;
 const PUBLIC_USAGE_LOOKUP_BUCKET_MS: i64 = 60 * 60 * 1000;
+const PUBLIC_USAGE_WORKER_QUERY_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Serialize)]
 struct LlmGatewayAccessResponse {
@@ -522,7 +523,7 @@ where
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "public usage store error"))?;
     let url = format!("{}{}", config.usage_query_base_url.trim_end_matches('/'), path);
     let client = reqwest::Client::builder()
-        .timeout(Duration::from_secs(5))
+        .timeout(PUBLIC_USAGE_WORKER_QUERY_TIMEOUT)
         .build()
         .map_err(|_| json_error(StatusCode::INTERNAL_SERVER_ERROR, "public usage store error"))?;
     let response = client.get(&url).query(query).send().await.map_err(|err| {

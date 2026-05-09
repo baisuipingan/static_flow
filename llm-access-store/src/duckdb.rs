@@ -335,41 +335,154 @@ const COUNT_USAGE_EVENTS_SQL: &str = "SELECT count(*)
       AND (?4 IS NULL OR created_at_ms < ?4)";
 
 #[cfg(feature = "duckdb-runtime")]
-const LIST_USAGE_EVENT_SUMMARIES_SQL: &str = "SELECT event_id, created_at_ms,
-        provider_type, protocol_family, key_id, key_name, account_name,
-        account_group_id_at_event, route_strategy_at_event, request_method,
-        request_url, endpoint, model, mapped_model, status_code,
-        request_body_bytes, quota_failover_count, NULL AS routing_diagnostics_json,
-        input_uncached_tokens, input_cached_tokens, output_tokens,
-        billable_tokens, CAST(credit_usage AS VARCHAR), usage_missing,
-        credit_usage_missing, latency_ms, routing_wait_ms, upstream_headers_ms,
-        post_headers_body_ms, request_body_read_ms, request_json_parse_ms,
-        pre_handler_ms, first_sse_write_ms, stream_finish_ms,
-        stream_completed_cleanly, downstream_disconnect, final_event_type,
-        bytes_streamed, client_ip, ip_region, NULL AS last_message_content
+fn list_usage_event_summaries_sql(conn: &duckdb::Connection) -> anyhow::Result<String> {
+    let columns = usage_event_table_columns(conn)?;
+    let select = usage_event_summary_select_exprs(&columns).join(",\n        ");
+    Ok(format!(
+        "SELECT {select}
     FROM usage_events
     WHERE (?1 IS NULL OR key_id = ?1)
       AND (?2 IS NULL OR provider_type = ?2)
       AND (?3 IS NULL OR created_at_ms >= ?3)
       AND (?4 IS NULL OR created_at_ms < ?4)
-    LIMIT ?5 OFFSET ?6";
+    LIMIT ?5 OFFSET ?6"
+    ))
+}
 
 #[cfg(feature = "duckdb-runtime")]
-const GET_USAGE_EVENT_DETAIL_SQL: &str = "SELECT event_id, created_at_ms,
-        provider_type, protocol_family, key_id, key_name, account_name,
-        account_group_id_at_event, route_strategy_at_event, request_method,
-        request_url, endpoint, model, mapped_model, status_code,
-        request_body_bytes, quota_failover_count, routing_diagnostics_json,
-        input_uncached_tokens, input_cached_tokens, output_tokens,
-        billable_tokens, CAST(credit_usage AS VARCHAR), usage_missing,
-        credit_usage_missing, latency_ms, routing_wait_ms, upstream_headers_ms,
-        post_headers_body_ms, request_body_read_ms, request_json_parse_ms,
-        pre_handler_ms, first_sse_write_ms, stream_finish_ms,
-        stream_completed_cleanly, downstream_disconnect, final_event_type,
-        bytes_streamed, client_ip, ip_region, last_message_content, request_headers_json,
-        client_request_body_json, upstream_request_body_json, full_request_json
+fn get_usage_event_detail_sql(conn: &duckdb::Connection) -> anyhow::Result<String> {
+    let columns = usage_event_table_columns(conn)?;
+    let select = usage_event_detail_select_exprs(&columns).join(",\n        ");
+    Ok(format!(
+        "SELECT {select}
     FROM usage_events
-    WHERE event_id = ?1";
+    WHERE event_id = ?1"
+    ))
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn usage_event_table_columns(conn: &duckdb::Connection) -> anyhow::Result<HashSet<String>> {
+    let mut stmt = conn
+        .prepare("PRAGMA table_info('usage_events')")
+        .context("prepare usage_events schema lookup")?;
+    let rows = stmt
+        .query_map([], |row| row.get::<_, String>(1))
+        .context("query usage_events schema")?;
+    let mut columns = HashSet::new();
+    for row in rows {
+        columns.insert(row.context("read usage_events schema row")?);
+    }
+    Ok(columns)
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn usage_event_summary_select_exprs(columns: &HashSet<String>) -> Vec<String> {
+    let mut exprs = usage_event_base_select_exprs(columns, false);
+    exprs.push("CAST(NULL AS VARCHAR) AS last_message_content".to_string());
+    exprs
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn usage_event_detail_select_exprs(columns: &HashSet<String>) -> Vec<String> {
+    let mut exprs = usage_event_base_select_exprs(columns, true);
+    exprs.push(usage_event_column_expr(columns, "last_message_content", "CAST(NULL AS VARCHAR)"));
+    exprs.push(usage_event_column_expr(columns, "request_headers_json", "'{}'"));
+    exprs.push(usage_event_column_expr(
+        columns,
+        "client_request_body_json",
+        "CAST(NULL AS VARCHAR)",
+    ));
+    exprs.push(usage_event_column_expr(
+        columns,
+        "upstream_request_body_json",
+        "CAST(NULL AS VARCHAR)",
+    ));
+    exprs.push(usage_event_column_expr(columns, "full_request_json", "CAST(NULL AS VARCHAR)"));
+    exprs
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn usage_event_base_select_exprs(
+    columns: &HashSet<String>,
+    include_detail_payload: bool,
+) -> Vec<String> {
+    vec![
+        usage_event_required_expr("event_id"),
+        usage_event_required_expr("created_at_ms"),
+        usage_event_required_expr("provider_type"),
+        usage_event_required_expr("protocol_family"),
+        usage_event_required_expr("key_id"),
+        usage_event_column_expr(columns, "key_name", "key_id"),
+        usage_event_column_expr(columns, "account_name", "CAST(NULL AS VARCHAR)"),
+        usage_event_column_expr(columns, "account_group_id_at_event", "CAST(NULL AS VARCHAR)"),
+        usage_event_column_expr(columns, "route_strategy_at_event", "CAST(NULL AS VARCHAR)"),
+        usage_event_column_expr(columns, "request_method", "'POST'"),
+        usage_event_column_expr(columns, "request_url", "''"),
+        usage_event_required_expr("endpoint"),
+        usage_event_column_expr(columns, "model", "CAST(NULL AS VARCHAR)"),
+        usage_event_column_expr(columns, "mapped_model", "CAST(NULL AS VARCHAR)"),
+        usage_event_required_expr("status_code"),
+        usage_event_column_expr(columns, "request_body_bytes", "CAST(NULL AS BIGINT)"),
+        usage_event_column_expr(columns, "quota_failover_count", "CAST(0 AS BIGINT)"),
+        if include_detail_payload {
+            usage_event_column_expr(columns, "routing_diagnostics_json", "CAST(NULL AS VARCHAR)")
+        } else {
+            "CAST(NULL AS VARCHAR) AS routing_diagnostics_json".to_string()
+        },
+        usage_event_required_expr("input_uncached_tokens"),
+        usage_event_required_expr("input_cached_tokens"),
+        usage_event_required_expr("output_tokens"),
+        usage_event_required_expr("billable_tokens"),
+        usage_event_expr(
+            columns,
+            "credit_usage",
+            "CAST(credit_usage AS VARCHAR)",
+            "CAST(NULL AS VARCHAR)",
+        ),
+        usage_event_column_expr(columns, "usage_missing", "false"),
+        usage_event_column_expr(columns, "credit_usage_missing", "true"),
+        usage_event_column_expr(columns, "latency_ms", "CAST(NULL AS INTEGER)"),
+        usage_event_column_expr(columns, "routing_wait_ms", "CAST(NULL AS INTEGER)"),
+        usage_event_column_expr(columns, "upstream_headers_ms", "CAST(NULL AS INTEGER)"),
+        usage_event_column_expr(columns, "post_headers_body_ms", "CAST(NULL AS INTEGER)"),
+        usage_event_column_expr(columns, "request_body_read_ms", "CAST(NULL AS INTEGER)"),
+        usage_event_column_expr(columns, "request_json_parse_ms", "CAST(NULL AS INTEGER)"),
+        usage_event_column_expr(columns, "pre_handler_ms", "CAST(NULL AS INTEGER)"),
+        usage_event_column_expr(columns, "first_sse_write_ms", "CAST(NULL AS INTEGER)"),
+        usage_event_column_expr(columns, "stream_finish_ms", "CAST(NULL AS INTEGER)"),
+        usage_event_column_expr(columns, "stream_completed_cleanly", "CAST(NULL AS BOOLEAN)"),
+        usage_event_column_expr(columns, "downstream_disconnect", "CAST(NULL AS BOOLEAN)"),
+        usage_event_column_expr(columns, "final_event_type", "CAST(NULL AS VARCHAR)"),
+        usage_event_column_expr(columns, "bytes_streamed", "CAST(NULL AS BIGINT)"),
+        usage_event_column_expr(columns, "client_ip", "CAST(NULL AS VARCHAR)"),
+        usage_event_column_expr(columns, "ip_region", "CAST(NULL AS VARCHAR)"),
+    ]
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn usage_event_required_expr(column: &'static str) -> String {
+    format!("{column} AS {column}")
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn usage_event_column_expr(
+    columns: &HashSet<String>,
+    column: &'static str,
+    missing_sql: &'static str,
+) -> String {
+    usage_event_expr(columns, column, column, missing_sql)
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn usage_event_expr(
+    columns: &HashSet<String>,
+    column: &'static str,
+    present_sql: &'static str,
+    missing_sql: &'static str,
+) -> String {
+    let sql = if columns.contains(column) { present_sql } else { missing_sql };
+    format!("{sql} AS {column}")
+}
 
 /// DuckDB usage writer.
 #[cfg(feature = "duckdb-runtime")]
@@ -578,7 +691,6 @@ struct TieredDuckDbUsageState {
 #[cfg(feature = "duckdb-runtime")]
 #[derive(Debug, Clone)]
 struct ArchivedUsageSegment {
-    segment_id: String,
     archive_path: PathBuf,
     start_ms: Option<i64>,
     end_ms: Option<i64>,
@@ -1833,8 +1945,9 @@ fn fetch_usage_event_summaries_from_conn(
     limit: usize,
     offset: usize,
 ) -> anyhow::Result<Vec<UsageEvent>> {
+    let sql = list_usage_event_summaries_sql(conn)?;
     let mut stmt = conn
-        .prepare(LIST_USAGE_EVENT_SUMMARIES_SQL)
+        .prepare(&sql)
         .context("prepare duckdb usage event summary query")?;
     let rows = stmt
         .query_map(
@@ -1885,17 +1998,10 @@ fn list_usage_events_from_tiered(
     }
 
     if query.source.includes_archive() {
-        let segments = archived_segments_for_query(config, query)?;
-        for segment in segments {
-            let count = archived_segment_usage_count(config, query, &segment)?;
+        for partition in archived_usage_partitions_for_query(config, query)? {
+            let count = partition.count;
             total = total.saturating_add(count);
-            if count > 0 {
-                partitions.push(TieredUsagePartition {
-                    path: segment.archive_path,
-                    count,
-                    kind: TieredUsagePartitionKind::Archive,
-                });
-            }
+            partitions.push(partition);
         }
     }
 
@@ -1977,6 +2083,92 @@ where
 }
 
 #[cfg(feature = "duckdb-runtime")]
+fn archived_usage_partitions_for_query(
+    config: &TieredDuckDbUsageConfig,
+    query: &UsageEventQuery,
+) -> anyhow::Result<Vec<TieredUsagePartition>> {
+    let mut partitions = Vec::new();
+    for (segment, catalog_count) in archived_segments_with_catalog_counts(config, query)? {
+        let count = if segment_fully_inside(&segment, query) {
+            catalog_count
+        } else {
+            let conn = DuckDbUsageRepository::open_read_only_conn(&segment.archive_path)?;
+            count_usage_events_from_conn(&conn, query)?
+        };
+        if count > 0 {
+            partitions.push(TieredUsagePartition {
+                path: segment.archive_path,
+                count,
+                kind: TieredUsagePartitionKind::Archive,
+            });
+        }
+    }
+    Ok(partitions)
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn archived_segments_with_catalog_counts(
+    config: &TieredDuckDbUsageConfig,
+    query: &UsageEventQuery,
+) -> anyhow::Result<Vec<(ArchivedUsageSegment, usize)>> {
+    if query.key_id.is_none() && query.provider_type.is_none() {
+        return archived_segments_for_query(config, query).map(|segments| {
+            segments
+                .into_iter()
+                .map(|segment| {
+                    let count = segment.row_count;
+                    (segment, count)
+                })
+                .collect()
+        });
+    }
+    let catalog = rusqlite::Connection::open(tiered_catalog_path(config))
+        .context("failed to open tiered usage catalog for filtered segment lookup")?;
+    let mut stmt = catalog
+        .prepare(
+            "SELECT
+                s.archive_path,
+                s.start_ms,
+                s.end_ms,
+                s.row_count,
+                COALESCE(sum(r.row_count), 0) AS matching_row_count
+             FROM usage_segments s
+             JOIN usage_segment_key_rollups r ON r.segment_id = s.segment_id
+             WHERE s.state = 'archived'
+               AND (?1 IS NULL OR s.end_ms IS NULL OR s.end_ms >= ?1)
+               AND (?2 IS NULL OR s.start_ms IS NULL OR s.start_ms < ?2)
+               AND (?3 IS NULL OR r.key_id = ?3)
+               AND (?4 IS NULL OR r.provider_type = ?4)
+             GROUP BY s.segment_id, s.archive_path, s.start_ms, s.end_ms, s.row_count
+             HAVING matching_row_count > 0
+             ORDER BY COALESCE(s.end_ms, 0) DESC, s.segment_id DESC",
+        )
+        .context("prepare filtered archived segment lookup")?;
+    let rows = stmt
+        .query_map(
+            rusqlite::params![
+                query.start_ms,
+                query.end_ms,
+                query.key_id.as_deref(),
+                query.provider_type.as_deref()
+            ],
+            |row| {
+                let segment = ArchivedUsageSegment {
+                    archive_path: PathBuf::from(row.get::<_, String>(0)?),
+                    start_ms: row.get(1)?,
+                    end_ms: row.get(2)?,
+                    row_count: i64_to_usize(row.get(3)?),
+                };
+                let count = i64_to_usize(row.get(4)?);
+                Ok((segment, count))
+            },
+        )
+        .context("query filtered archived segments")?;
+    rows.collect::<Result<Vec<_>, _>>()
+        .context("collect filtered archived segments")
+}
+
+#[cfg(feature = "duckdb-runtime")]
 fn archived_segments_for_query(
     config: &TieredDuckDbUsageConfig,
     query: &UsageEventQuery,
@@ -1985,7 +2177,7 @@ fn archived_segments_for_query(
         .context("failed to open tiered usage catalog for segment lookup")?;
     let mut stmt = catalog
         .prepare(
-            "SELECT segment_id, archive_path, start_ms, end_ms, row_count
+            "SELECT archive_path, start_ms, end_ms, row_count
              FROM usage_segments
              WHERE state = 'archived'
                AND (?1 IS NULL OR end_ms IS NULL OR end_ms >= ?1)
@@ -1996,58 +2188,15 @@ fn archived_segments_for_query(
     let rows = stmt
         .query_map(rusqlite::params![query.start_ms, query.end_ms], |row| {
             Ok(ArchivedUsageSegment {
-                segment_id: row.get(0)?,
-                archive_path: PathBuf::from(row.get::<_, String>(1)?),
-                start_ms: row.get(2)?,
-                end_ms: row.get(3)?,
-                row_count: i64_to_usize(row.get(4)?),
+                archive_path: PathBuf::from(row.get::<_, String>(0)?),
+                start_ms: row.get(1)?,
+                end_ms: row.get(2)?,
+                row_count: i64_to_usize(row.get(3)?),
             })
         })
         .context("query archived segments")?;
     rows.collect::<Result<Vec<_>, _>>()
         .context("collect archived segments")
-}
-
-#[cfg(feature = "duckdb-runtime")]
-fn archived_segment_usage_count(
-    config: &TieredDuckDbUsageConfig,
-    query: &UsageEventQuery,
-    segment: &ArchivedUsageSegment,
-) -> anyhow::Result<usize> {
-    if query.start_ms.is_none() && query.end_ms.is_none() || segment_fully_inside(segment, query) {
-        return archived_segment_count_from_catalog(config, query, segment);
-    }
-    let conn = DuckDbUsageRepository::open_read_only_conn(&segment.archive_path)?;
-    count_usage_events_from_conn(&conn, query)
-}
-
-#[cfg(feature = "duckdb-runtime")]
-fn archived_segment_count_from_catalog(
-    config: &TieredDuckDbUsageConfig,
-    query: &UsageEventQuery,
-    segment: &ArchivedUsageSegment,
-) -> anyhow::Result<usize> {
-    if query.key_id.is_none() && query.provider_type.is_none() {
-        return Ok(segment.row_count);
-    }
-    let catalog = rusqlite::Connection::open(tiered_catalog_path(config))
-        .context("failed to open tiered catalog for segment count")?;
-    let total: i64 = catalog
-        .query_row(
-            "SELECT COALESCE(sum(row_count), 0)
-             FROM usage_segment_key_rollups
-             WHERE segment_id = ?1
-               AND (?2 IS NULL OR key_id = ?2)
-               AND (?3 IS NULL OR provider_type = ?3)",
-            rusqlite::params![
-                segment.segment_id,
-                query.key_id.as_deref(),
-                query.provider_type.as_deref()
-            ],
-            |row| row.get(0),
-        )
-        .context("query archived segment catalog count")?;
-    Ok(i64_to_usize(total))
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -2076,8 +2225,9 @@ fn get_usage_event_from_conn(
     conn: &duckdb::Connection,
     event_id: &str,
 ) -> anyhow::Result<Option<UsageEvent>> {
+    let sql = get_usage_event_detail_sql(conn)?;
     let mut stmt = conn
-        .prepare(GET_USAGE_EVENT_DETAIL_SQL)
+        .prepare(&sql)
         .context("prepare duckdb usage event detail query")?;
     match stmt.query_row(duckdb::params![event_id], decode_usage_event_detail_row) {
         Ok(event) => Ok(Some(event)),
@@ -2117,18 +2267,17 @@ fn locate_archived_segment(
         .context("failed to open tiered catalog for event locator")?;
     let row = catalog
         .query_row(
-            "SELECT s.segment_id, s.archive_path, s.start_ms, s.end_ms, s.row_count
+            "SELECT s.archive_path, s.start_ms, s.end_ms, s.row_count
              FROM usage_segment_events e
              JOIN usage_segments s ON s.segment_id = e.segment_id
              WHERE e.event_id = ?1 AND s.state = 'archived'",
             rusqlite::params![event_id],
             |row| {
                 Ok(ArchivedUsageSegment {
-                    segment_id: row.get(0)?,
-                    archive_path: PathBuf::from(row.get::<_, String>(1)?),
-                    start_ms: row.get(2)?,
-                    end_ms: row.get(3)?,
-                    row_count: i64_to_usize(row.get(4)?),
+                    archive_path: PathBuf::from(row.get::<_, String>(0)?),
+                    start_ms: row.get(1)?,
+                    end_ms: row.get(2)?,
+                    row_count: i64_to_usize(row.get(3)?),
                 })
             },
         )
@@ -2166,7 +2315,7 @@ fn usage_chart_points_from_tiered(
         limit: USAGE_EVENT_ONLINE_MAX_LIMIT,
         offset: 0,
     };
-    for segment in archived_segments_for_query(config, &query)? {
+    for (segment, _) in archived_segments_with_catalog_counts(config, &query)? {
         let conn = DuckDbUsageRepository::open_read_only_conn(&segment.archive_path)?;
         add_usage_chart_points_from_conn(&mut points, &conn, key_id, start_ms, bucket_ms)?;
     }
@@ -2460,6 +2609,93 @@ mod tests {
         expected_summary.upstream_request_body_json = None;
         expected_summary.full_request_json = None;
         assert_usage_event_round_trips(actual, &expected_summary);
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
+    fn create_legacy_usage_archive_without_stream_columns(path: &std::path::Path) {
+        let conn = duckdb::Connection::open(path).expect("open legacy archive");
+        conn.execute_batch(
+            r#"
+            CREATE TABLE usage_events (
+                source_seq BIGINT NOT NULL,
+                source_event_id VARCHAR NOT NULL,
+                event_id VARCHAR PRIMARY KEY,
+                created_at_ms BIGINT NOT NULL,
+                created_at TIMESTAMPTZ NOT NULL,
+                created_date DATE NOT NULL,
+                created_hour TIMESTAMP NOT NULL,
+                provider_type VARCHAR NOT NULL,
+                protocol_family VARCHAR NOT NULL,
+                key_id VARCHAR NOT NULL,
+                key_name VARCHAR NOT NULL,
+                key_status_at_event VARCHAR NOT NULL,
+                account_name VARCHAR,
+                account_group_id_at_event VARCHAR,
+                route_strategy_at_event VARCHAR,
+                request_method VARCHAR NOT NULL DEFAULT 'POST',
+                request_url VARCHAR NOT NULL DEFAULT '',
+                endpoint VARCHAR NOT NULL,
+                model VARCHAR,
+                mapped_model VARCHAR,
+                status_code INTEGER NOT NULL,
+                latency_ms INTEGER,
+                routing_wait_ms INTEGER,
+                upstream_headers_ms INTEGER,
+                post_headers_body_ms INTEGER,
+                request_body_read_ms INTEGER,
+                request_json_parse_ms INTEGER,
+                pre_handler_ms INTEGER,
+                first_sse_write_ms INTEGER,
+                stream_finish_ms INTEGER,
+                request_body_bytes BIGINT,
+                quota_failover_count BIGINT NOT NULL DEFAULT 0,
+                routing_diagnostics_json VARCHAR,
+                input_uncached_tokens BIGINT NOT NULL,
+                input_cached_tokens BIGINT NOT NULL,
+                output_tokens BIGINT NOT NULL,
+                billable_tokens BIGINT NOT NULL,
+                credit_usage DECIMAL(24, 12),
+                usage_missing BOOLEAN NOT NULL,
+                credit_usage_missing BOOLEAN NOT NULL,
+                client_ip VARCHAR,
+                ip_region VARCHAR,
+                request_headers_json VARCHAR NOT NULL DEFAULT '{}',
+                last_message_content VARCHAR,
+                client_request_body_json VARCHAR,
+                upstream_request_body_json VARCHAR,
+                full_request_json VARCHAR
+            );
+            INSERT INTO usage_events (
+                source_seq, source_event_id, event_id, created_at_ms, created_at,
+                created_date, created_hour, provider_type, protocol_family, key_id,
+                key_name, key_status_at_event, account_name, account_group_id_at_event,
+                route_strategy_at_event, request_method, request_url, endpoint, model,
+                mapped_model, status_code, latency_ms, routing_wait_ms,
+                upstream_headers_ms, post_headers_body_ms, request_body_read_ms,
+                request_json_parse_ms, pre_handler_ms, first_sse_write_ms,
+                stream_finish_ms, request_body_bytes, quota_failover_count,
+                routing_diagnostics_json, input_uncached_tokens, input_cached_tokens,
+                output_tokens, billable_tokens, credit_usage, usage_missing,
+                credit_usage_missing, client_ip, ip_region, request_headers_json,
+                last_message_content, client_request_body_json, upstream_request_body_json,
+                full_request_json
+            ) VALUES (
+                0, 'legacy-source-event', 'legacy-archive-event', 1700000000000,
+                to_timestamp(1700000000), CAST(to_timestamp(1700000000) AS DATE),
+                date_trunc('hour', to_timestamp(1700000000)), 'kiro', 'anthropic',
+                'key-duckdb', 'DuckDB Key', 'active', 'kiro-account', 'group-duckdb',
+                'auto', 'POST', 'https://example.test/api/kiro-gateway/cc/v1/messages',
+                '/cc/v1/messages', 'claude-sonnet-4-5', 'claude-sonnet-4-5',
+                200, 55, 5, 11, 22, 3, 4, 7, 33, 44, 1234, 2,
+                '{"route":"legacy"}', 10, 20, 30, 40, 0.5, false, false,
+                '127.0.0.1', 'local', '{"host":["example.test"]}', 'hello',
+                '{"model":"claude-sonnet-4-5"}', '{"conversationState":{}}',
+                '{"model":"claude-sonnet-4-5"}'
+            );
+            CHECKPOINT;
+            "#,
+        )
+        .expect("create legacy archive schema");
     }
 
     #[test]
@@ -2939,6 +3175,157 @@ mod tests {
         assert_usage_event_round_trips(&archived_detail, &first);
 
         std::fs::remove_dir_all(&root).expect("cleanup tiered duckdb test directory");
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
+    #[tokio::test]
+    async fn duckdb_tiered_repository_reads_legacy_archives_without_stream_columns() {
+        let root = std::env::temp_dir()
+            .join(format!("llm-access-duckdb-test-{}-legacy-archive-schema", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("archive")).expect("create archive dir");
+        let config = super::TieredDuckDbUsageConfig {
+            active_dir: root.join("active"),
+            archive_dir: root.join("archive"),
+            catalog_dir: root.join("catalog"),
+            rollover_bytes: 1,
+        };
+        std::fs::create_dir_all(&config.active_dir).expect("create active dir");
+        super::initialize_tiered_catalog(&config).expect("initialize tiered catalog");
+        let archive_path = config
+            .archive_dir
+            .join("usage-legacy-archive-000001.duckdb");
+        create_legacy_usage_archive_without_stream_columns(&archive_path);
+        let stats = super::collect_segment_stats(&archive_path).expect("collect legacy stats");
+        let size_bytes = std::fs::metadata(&archive_path)
+            .expect("legacy archive metadata")
+            .len();
+        super::publish_segment_catalog(
+            &config,
+            "usage-legacy-archive-000001",
+            &archive_path,
+            &stats,
+            size_bytes,
+        )
+        .expect("publish legacy catalog");
+
+        let repo =
+            super::DuckDbUsageRepository::open_tiered(config).expect("open tiered duckdb usage db");
+        let page = repo
+            .list_usage_events(UsageEventQuery {
+                key_id: Some("key-duckdb".to_string()),
+                provider_type: None,
+                source: UsageEventSource::All,
+                start_ms: None,
+                end_ms: None,
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("list legacy archive usage events");
+
+        assert_eq!(page.total, 1);
+        assert_eq!(page.events[0].event_id, "legacy-archive-event");
+        assert_eq!(page.events[0].stream.stream_completed_cleanly, None);
+        assert_eq!(page.events[0].stream.downstream_disconnect, None);
+        assert_eq!(page.events[0].stream.final_event_type, None);
+        assert_eq!(page.events[0].stream.bytes_streamed, None);
+
+        let detail = repo
+            .get_usage_event("legacy-archive-event")
+            .await
+            .expect("get legacy archive detail")
+            .expect("legacy archive event exists");
+        assert_eq!(detail.stream.stream_completed_cleanly, None);
+        assert_eq!(detail.stream.downstream_disconnect, None);
+        assert_eq!(detail.stream.final_event_type, None);
+        assert_eq!(detail.stream.bytes_streamed, None);
+
+        std::fs::remove_dir_all(&root).expect("cleanup legacy archive test directory");
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
+    #[tokio::test]
+    async fn duckdb_tiered_repository_skips_nonmatching_archives_before_partial_time_counts() {
+        let root = std::env::temp_dir().join(format!(
+            "llm-access-duckdb-test-{}-skip-nonmatching-archives",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(root.join("archive")).expect("create archive dir");
+        let config = super::TieredDuckDbUsageConfig {
+            active_dir: root.join("active"),
+            archive_dir: root.join("archive"),
+            catalog_dir: root.join("catalog"),
+            rollover_bytes: 1,
+        };
+        std::fs::create_dir_all(&config.active_dir).expect("create active dir");
+        super::initialize_tiered_catalog(&config).expect("initialize tiered catalog");
+        let catalog = rusqlite::Connection::open(super::tiered_catalog_path(&config))
+            .expect("open tiered catalog");
+        catalog
+            .execute(
+                "INSERT INTO usage_segments (
+                    segment_id, archive_path, state, start_ms, end_ms, row_count,
+                    size_bytes, sealed_at_ms
+                 ) VALUES (?1, ?2, 'archived', ?3, ?4, ?5, ?6, ?7)",
+                rusqlite::params![
+                    "usage-nonmatching-000001",
+                    config
+                        .archive_dir
+                        .join("missing-nonmatching.duckdb")
+                        .to_string_lossy()
+                        .as_ref(),
+                    1_700_000_000_000_i64,
+                    1_700_000_100_000_i64,
+                    1_i64,
+                    1_i64,
+                    1_700_000_100_000_i64,
+                ],
+            )
+            .expect("insert segment catalog row");
+        catalog
+            .execute(
+                "INSERT INTO usage_segment_key_rollups (
+                    segment_id, key_id, provider_type, row_count, input_uncached_tokens,
+                    input_cached_tokens, output_tokens, billable_tokens, credit_total,
+                    credit_missing_events, last_used_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+                rusqlite::params![
+                    "usage-nonmatching-000001",
+                    "other-key",
+                    "kiro",
+                    1_i64,
+                    1_i64,
+                    0_i64,
+                    1_i64,
+                    2_i64,
+                    "0",
+                    0_i64,
+                    1_700_000_050_000_i64,
+                ],
+            )
+            .expect("insert segment rollup");
+
+        let repo =
+            super::DuckDbUsageRepository::open_tiered(config).expect("open tiered duckdb usage db");
+        let page = repo
+            .list_usage_events(UsageEventQuery {
+                key_id: Some("key-duckdb".to_string()),
+                provider_type: Some("kiro".to_string()),
+                source: UsageEventSource::Archive,
+                start_ms: Some(1_700_000_010_000),
+                end_ms: Some(1_700_000_020_000),
+                limit: 10,
+                offset: 0,
+            })
+            .await
+            .expect("list should skip nonmatching archive");
+
+        assert_eq!(page.total, 0);
+        assert!(page.events.is_empty());
+
+        std::fs::remove_dir_all(&root).expect("cleanup skip nonmatching archive test directory");
     }
 
     #[cfg(feature = "duckdb-runtime")]
