@@ -1592,13 +1592,15 @@ fn account_group_editor_card(props: &AccountGroupEditorCardProps) -> Html {
                                     />
                                     <div class={classes!("min-w-0", "flex-1")}>
                                         <div class={classes!("font-semibold", "text-[var(--text)]")}>{ account.name.clone() }</div>
-                                        <div class={classes!("mt-1", "font-mono", "text-[11px]", "text-[var(--muted)]")}>
-                                            { format!(
-                                                "5h {} / wk {}",
-                                                account.primary_remaining_percent.map(|value| format!("{value:.0}%")).unwrap_or_else(|| "-".to_string()),
-                                                account.secondary_remaining_percent.map(|value| format!("{value:.0}%")).unwrap_or_else(|| "-".to_string())
-                                            ) }
-                                        </div>
+                                        if account.status != "disabled" {
+                                            <div class={classes!("mt-1", "font-mono", "text-[11px]", "text-[var(--muted)]")}>
+                                                { format!(
+                                                    "5h {} / wk {}",
+                                                    account.primary_remaining_percent.map(|value| format!("{value:.0}%")).unwrap_or_else(|| "-".to_string()),
+                                                    account.secondary_remaining_percent.map(|value| format!("{value:.0}%")).unwrap_or_else(|| "-".to_string())
+                                                ) }
+                                            </div>
+                                        }
                                     </div>
                                 </label>
                             }
@@ -5793,13 +5795,15 @@ pub fn admin_llm_gateway_page() -> Html {
                                                         />
                                                         <div class={classes!("min-w-0", "flex-1")}>
                                                             <div class={classes!("font-semibold", "text-[var(--text)]")}>{ account.name.clone() }</div>
-                                                            <div class={classes!("mt-1", "font-mono", "text-[11px]", "text-[var(--muted)]")}>
-                                                                { format!(
-                                                                    "5h {} / wk {}",
-                                                                    account.primary_remaining_percent.map(|value| format!("{value:.0}%")).unwrap_or_else(|| "-".to_string()),
-                                                                    account.secondary_remaining_percent.map(|value| format!("{value:.0}%")).unwrap_or_else(|| "-".to_string())
-                                                                ) }
-                                                            </div>
+                                                            if account.status != "disabled" {
+                                                                <div class={classes!("mt-1", "font-mono", "text-[11px]", "text-[var(--muted)]")}>
+                                                                    { format!(
+                                                                        "5h {} / wk {}",
+                                                                        account.primary_remaining_percent.map(|value| format!("{value:.0}%")).unwrap_or_else(|| "-".to_string()),
+                                                                        account.secondary_remaining_percent.map(|value| format!("{value:.0}%")).unwrap_or_else(|| "-".to_string())
+                                                                    ) }
+                                                                </div>
+                                                            }
                                                         </div>
                                                     </label>
                                                 }
@@ -6391,9 +6395,11 @@ pub fn admin_llm_gateway_page() -> Html {
                                             </div>
                                         </div>
                                         <div class={classes!("flex", "items-center", "gap-3", "flex-wrap", "justify-end")}>
-                                            <span class={classes!("text-xs", "text-[var(--muted)]")}>
-                                                { format!("5h {} / wk {}", primary_pct, secondary_pct) }
-                                            </span>
+                                            if acc_status != "disabled" {
+                                                <span class={classes!("text-xs", "text-[var(--muted)]")}>
+                                                    { format!("5h {} / wk {}", primary_pct, secondary_pct) }
+                                                </span>
+                                            }
                                             <div class={classes!("flex", "items-center", "gap-2", "flex-wrap")}>
                                                 <input
                                                     type="number"

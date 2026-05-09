@@ -1325,14 +1325,16 @@ pub(crate) fn kiro_account_card(props: &KiroAccountCardProps) -> Html {
                 </div>
             </div>
 
-            <div class={classes!("mt-4", "rounded-xl", "border", "border-[var(--border)]", "bg-[var(--surface-alt)]", "p-4")}>
-                <div class={classes!("text-xs", "uppercase", "tracking-[0.16em]", "text-[var(--muted)]")}>{ "Quota Snapshot" }</div>
-                if let Some(balance) = account.balance.clone() {
-                    { quota_progress_bar(&balance, account.subscription_title.clone()) }
-                } else {
-                    <p class={classes!("mt-3", "mb-0", "text-sm", "text-[var(--muted)]")}>{ "Balance not loaded yet." }</p>
-                }
-            </div>
+            if !account.disabled {
+                <div class={classes!("mt-4", "rounded-xl", "border", "border-[var(--border)]", "bg-[var(--surface-alt)]", "p-4")}>
+                    <div class={classes!("text-xs", "uppercase", "tracking-[0.16em]", "text-[var(--muted)]")}>{ "Quota Snapshot" }</div>
+                    if let Some(balance) = account.balance.clone() {
+                        { quota_progress_bar(&balance, account.subscription_title.clone()) }
+                    } else {
+                        <p class={classes!("mt-3", "mb-0", "text-sm", "text-[var(--muted)]")}>{ "Balance not loaded yet." }</p>
+                    }
+                </div>
+            }
 
             <button
                 type="button"

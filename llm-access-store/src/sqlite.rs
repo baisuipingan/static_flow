@@ -2461,6 +2461,7 @@ impl SqliteControlStore {
         let disabled_reason =
             optional_json_string_any(&auth, &["disabledReason", "disabled_reason"])
                 .or_else(|| record.last_error.clone());
+        let balance = if disabled { None } else { balance };
         let subscription_title = balance
             .as_ref()
             .and_then(|value| value.subscription_title.clone())
@@ -6287,6 +6288,63 @@ mod tests {
         assert_eq!(account.balance.as_ref().map(|balance| balance.remaining), Some(88.0));
         assert_eq!(account.upstream_user_id.as_deref(), Some("upstream-user"));
         assert_eq!(account.subscription_title.as_deref(), Some("Pro"));
+    }
+
+    #[test]
+    fn disabled_kiro_accounts_hide_cached_balance_from_admin_view() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlStore::new(conn);
+
+        repo.upsert_kiro_account(&super::KiroAccountRecord {
+            account_name: "kiro-disabled".to_string(),
+            auth_method: "idc".to_string(),
+            account_id: Some("kiro-account".to_string()),
+            profile_arn: Some("arn:aws:kiro:test".to_string()),
+            user_id: Some("user-1".to_string()),
+            status: "disabled".to_string(),
+            auth_json: r#"{"accessToken":"a","disabled":true}"#.to_string(),
+            max_concurrency: Some(2),
+            min_start_interval_ms: Some(100),
+            proxy_config_id: None,
+            last_refresh_at_ms: Some(200),
+            last_error: None,
+            created_at_ms: 30,
+            updated_at_ms: 40,
+        })
+        .expect("upsert disabled kiro account");
+        repo.save_admin_kiro_status_cache(&llm_access_core::store::AdminKiroStatusCacheUpdate {
+            account_name: "kiro-disabled".to_string(),
+            balance: Some(llm_access_core::store::AdminKiroBalanceView {
+                current_usage: 12.0,
+                usage_limit: 100.0,
+                remaining: 88.0,
+                next_reset_at: Some(1_777_000_000_000),
+                subscription_title: Some("Pro".to_string()),
+                user_id: Some("upstream-user".to_string()),
+            }),
+            cache: llm_access_core::store::AdminKiroCacheView {
+                status: "disabled".to_string(),
+                refresh_interval_seconds: 300,
+                last_checked_at: Some(1_776_000_000_000),
+                last_success_at: Some(1_776_000_000_000),
+                error_message: None,
+            },
+            refreshed_at_ms: 1_776_000_000_000,
+            expires_at_ms: 1_776_000_300_000,
+            last_error: None,
+        })
+        .expect("save disabled status cache");
+
+        let accounts = repo
+            .list_admin_kiro_accounts()
+            .expect("list admin kiro accounts");
+
+        assert_eq!(accounts.len(), 1);
+        let account = &accounts[0];
+        assert!(account.disabled);
+        assert_eq!(account.balance, None);
+        assert_eq!(account.subscription_title, None);
     }
 
     #[test]

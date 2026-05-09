@@ -1217,6 +1217,15 @@ fn apply_codex_public_status_to_admin_account(
     status_account: core_store::CodexPublicAccountStatus,
     status_last_checked_at: Option<i64>,
 ) {
+    if account.status != KEY_STATUS_ACTIVE || status_account.status != KEY_STATUS_ACTIVE {
+        account.plan_type = None;
+        account.primary_remaining_percent = None;
+        account.secondary_remaining_percent = None;
+        account.last_usage_checked_at = None;
+        account.last_usage_success_at = None;
+        account.usage_error_message = None;
+        return;
+    }
     account.plan_type = status_account.plan_type;
     account.primary_remaining_percent = status_account.primary_remaining_percent;
     account.secondary_remaining_percent = status_account.secondary_remaining_percent;
@@ -4644,7 +4653,7 @@ async fn sync_kiro_status_after_account_update(
         let refresh_interval_seconds = account.cache.refresh_interval_seconds;
         let update = core_store::AdminKiroStatusCacheUpdate {
             account_name: account.name.clone(),
-            balance: account.balance.clone(),
+            balance: None,
             refreshed_at_ms: now,
             expires_at_ms: now
                 .saturating_add((refresh_interval_seconds as i64).saturating_mul(1000)),
@@ -5421,6 +5430,56 @@ mod tests {
         assert_eq!(accounts[0].last_usage_checked_at, Some(1200));
         assert_eq!(accounts[0].last_usage_success_at, Some(1100));
         assert_eq!(accounts[0].usage_error_message.as_deref(), Some("upstream 503"));
+    }
+
+    #[test]
+    fn disabled_admin_codex_accounts_do_not_keep_cached_rate_limits() {
+        let accounts = vec![core_store::AdminCodexAccount {
+            name: "alpha".to_string(),
+            status: "disabled".to_string(),
+            account_id: Some("acct-alpha".to_string()),
+            plan_type: None,
+            primary_remaining_percent: None,
+            secondary_remaining_percent: None,
+            map_gpt53_codex_to_spark: false,
+            request_max_concurrency: Some(3),
+            request_min_start_interval_ms: Some(1000),
+            proxy_mode: "inherit".to_string(),
+            proxy_config_id: None,
+            effective_proxy_source: "binding".to_string(),
+            effective_proxy_url: Some("http://127.0.0.1:11118".to_string()),
+            effective_proxy_config_name: Some("us-home1".to_string()),
+            last_refresh: Some(900),
+            last_usage_checked_at: None,
+            last_usage_success_at: None,
+            usage_error_message: None,
+        }];
+        let status = core_store::CodexRateLimitStatus {
+            status: "ready".to_string(),
+            refresh_interval_seconds: 300,
+            last_checked_at: Some(1200),
+            last_success_at: Some(1100),
+            source_url: "https://chatgpt.com/backend-api/wham/usage".to_string(),
+            error_message: None,
+            accounts: vec![core_store::CodexPublicAccountStatus {
+                name: "alpha".to_string(),
+                status: "active".to_string(),
+                plan_type: Some("Pro".to_string()),
+                primary_remaining_percent: Some(62.0),
+                secondary_remaining_percent: Some(39.0),
+                last_usage_checked_at: Some(1200),
+                last_usage_success_at: Some(1100),
+                usage_error_message: None,
+            }],
+            buckets: Vec::new(),
+        };
+
+        let accounts = apply_cached_codex_status_to_admin_accounts(accounts, Some(status));
+
+        assert_eq!(accounts[0].status, "disabled");
+        assert_eq!(accounts[0].plan_type, None);
+        assert_eq!(accounts[0].primary_remaining_percent, None);
+        assert_eq!(accounts[0].secondary_remaining_percent, None);
     }
 
     #[test]
