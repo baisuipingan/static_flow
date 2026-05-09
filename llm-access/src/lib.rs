@@ -330,6 +330,10 @@ pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
             post(submission::submit_public_account_contribution_request),
         )
         .route(
+            "/api/llm-gateway/account-contribution-requests/batch-submit",
+            post(submission::submit_public_account_contribution_batch_request),
+        )
+        .route(
             "/api/llm-gateway/sponsor-requests/submit",
             post(submission::submit_public_sponsor_request),
         )
@@ -2097,6 +2101,107 @@ mod tests {
         let body = String::from_utf8(body.to_vec()).expect("utf8 body");
         assert!(body.contains(r#""request_id":"llmacct-"#));
         assert!(body.contains(r#""status":"pending""#));
+    }
+
+    #[tokio::test]
+    async fn router_accepts_llm_gateway_account_contribution_batch_without_provider_key() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/llm-gateway/account-contribution-requests/batch-submit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-real-ip", "198.51.100.15")
+                    .body(Body::from(
+                        r#"{
+                            "requester_email": "user@example.com",
+                            "contributor_message": "shared for testing",
+                            "github_id": "acking-you",
+                            "frontend_page_url": "https://example.test/llm-access",
+                            "items": [
+                                {
+                                    "account_name": "contributed_account_a",
+                                    "auth_json": {
+                                        "account_id": "acct-1",
+                                        "id_token": "id-token-a",
+                                        "access_token": "access-token-a",
+                                        "refresh_token": "refresh-token-a"
+                                    }
+                                },
+                                {
+                                    "account_name": "contributed_account_b",
+                                    "tokens": {
+                                        "refresh_token": "refresh-token-b"
+                                    }
+                                }
+                            ]
+                        }"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["total"], 2);
+        assert_eq!(value["created_count"], 2);
+        assert_eq!(value["invalid_count"], 0);
+        assert_eq!(value["conflict_count"], 0);
+        assert_eq!(value["results"][0]["status"], "pending");
+        assert_eq!(value["results"][1]["status"], "pending");
+        assert!(value["results"][0]["request_id"]
+            .as_str()
+            .is_some_and(|value| value.starts_with("llmacct-")));
+    }
+
+    #[tokio::test]
+    async fn router_reports_duplicate_names_in_public_account_contribution_batch() {
+        let response = test_router()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/api/llm-gateway/account-contribution-requests/batch-submit")
+                    .header(header::CONTENT_TYPE, "application/json")
+                    .header("x-real-ip", "198.51.100.16")
+                    .body(Body::from(
+                        r#"{
+                            "contributor_message": "shared for testing",
+                            "items": [
+                                {
+                                    "account_name": "duplicate_account",
+                                    "tokens": {
+                                        "refresh_token": "refresh-token-a"
+                                    }
+                                },
+                                {
+                                    "account_name": "duplicate_account",
+                                    "tokens": {
+                                        "refresh_token": "refresh-token-b"
+                                    }
+                                }
+                            ]
+                        }"#,
+                    ))
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
+        assert_eq!(value["total"], 2);
+        assert_eq!(value["created_count"], 1);
+        assert_eq!(value["invalid_count"], 0);
+        assert_eq!(value["conflict_count"], 1);
+        assert_eq!(value["results"][0]["status"], "pending");
+        assert_eq!(value["results"][1]["status"], "conflict");
     }
 
     #[tokio::test]

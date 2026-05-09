@@ -1,7 +1,7 @@
 //! Public unauthenticated submission endpoints.
 
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     sync::{Arc, RwLock},
 };
 
@@ -17,6 +17,7 @@ use llm_access_core::store::{
     PUBLIC_TOKEN_REQUEST_STATUS_PENDING,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use sha2::{Digest, Sha256};
 use url::Url;
 
@@ -29,6 +30,7 @@ use crate::{
 const MAX_PUBLIC_TOKEN_WISH_REASON_CHARS: usize = 4000;
 const MAX_PUBLIC_TOKEN_WISH_QUOTA: u64 = 100_000_000_000;
 const MAX_PUBLIC_ACCOUNT_CONTRIBUTION_MESSAGE_CHARS: usize = 4000;
+const MAX_PUBLIC_ACCOUNT_CONTRIBUTION_BATCH_ITEMS: usize = 200;
 const MAX_PUBLIC_ACCOUNT_CONTRIBUTION_GITHUB_ID_CHARS: usize = 39;
 const MAX_PUBLIC_SPONSOR_MESSAGE_CHARS: usize = 4000;
 const MAX_PUBLIC_SPONSOR_DISPLAY_NAME_CHARS: usize = 80;
@@ -79,6 +81,65 @@ pub(crate) struct SubmitLlmGatewayAccountContributionRequest {
 struct SubmitLlmGatewayAccountContributionRequestResponse {
     request_id: String,
     status: &'static str,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SubmitLlmGatewayAccountContributionBatchRequest {
+    #[serde(default)]
+    requester_email: Option<String>,
+    contributor_message: String,
+    #[serde(default)]
+    github_id: Option<String>,
+    #[serde(default)]
+    frontend_page_url: Option<String>,
+    items: Vec<SubmitLlmGatewayAccountContributionBatchItem>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SubmitLlmGatewayAccountContributionBatchItem {
+    account_name: String,
+    #[serde(default)]
+    requester_email: Option<String>,
+    #[serde(default)]
+    contributor_message: Option<String>,
+    #[serde(default)]
+    github_id: Option<String>,
+    #[serde(default)]
+    frontend_page_url: Option<String>,
+    #[serde(default)]
+    auth_json: Option<Value>,
+    #[serde(default)]
+    tokens: Option<SubmitLlmGatewayAccountContributionTokens>,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct SubmitLlmGatewayAccountContributionTokens {
+    #[serde(default)]
+    account_id: Option<String>,
+    #[serde(default)]
+    id_token: Option<String>,
+    #[serde(default)]
+    access_token: Option<String>,
+    #[serde(default)]
+    refresh_token: Option<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitLlmGatewayAccountContributionBatchResponse {
+    total: usize,
+    created_count: usize,
+    invalid_count: usize,
+    conflict_count: usize,
+    results: Vec<SubmitLlmGatewayAccountContributionBatchItemResponse>,
+}
+
+#[derive(Debug, Serialize)]
+struct SubmitLlmGatewayAccountContributionBatchItemResponse {
+    item_index: usize,
+    account_name: String,
+    status: &'static str,
+    request_id: Option<String>,
+    error_message: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -174,6 +235,244 @@ pub(crate) async fn submit_public_account_contribution_request(
         .into_response(),
         Err(_) => internal_error("public submission store error").into_response(),
     }
+}
+
+pub(crate) async fn submit_public_account_contribution_batch_request(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Json(request): Json<SubmitLlmGatewayAccountContributionBatchRequest>,
+) -> Response {
+    if request.items.is_empty() {
+        return bad_request("items must not be empty").into_response();
+    }
+    if request.items.len() > MAX_PUBLIC_ACCOUNT_CONTRIBUTION_BATCH_ITEMS {
+        return bad_request("items is too large").into_response();
+    }
+
+    let default_requester_email = match normalize_requester_email_input(request.requester_email) {
+        Ok(value) => value.unwrap_or_default(),
+        Err(err) => return bad_request(&format!("invalid requester_email: {err}")).into_response(),
+    };
+    let default_contributor_message =
+        match normalize_contributor_message_input(Some(request.contributor_message)) {
+            Ok(Some(value)) => value,
+            Ok(None) => return bad_request("contributor_message is required").into_response(),
+            Err(err) => {
+                return bad_request(&format!("invalid contributor_message: {err}")).into_response()
+            },
+        };
+    let default_github_id = match normalize_optional_github_id_input(request.github_id) {
+        Ok(value) => value,
+        Err(err) => return bad_request(&format!("invalid github_id: {err}")).into_response(),
+    };
+    let default_frontend_page_url =
+        match normalize_frontend_page_url_input(request.frontend_page_url) {
+            Ok(value) => value,
+            Err(err) => {
+                return bad_request(&format!("invalid frontend_page_url: {err}")).into_response()
+            },
+        };
+    let submit_context =
+        match submit_context(&headers, &state.public_submit_guard, &state.geoip).await {
+            Ok(context) => context,
+            Err(err) => return err.into_response(),
+        };
+
+    let mut seen_names = HashSet::new();
+    let mut results = Vec::with_capacity(request.items.len());
+    let mut created_count = 0;
+    let mut invalid_count = 0;
+    let mut conflict_count = 0;
+
+    for (item_index, item) in request.items.into_iter().enumerate() {
+        let account_name = match validate_account_name(&item.account_name) {
+            Ok(value) => value,
+            Err(err) => {
+                invalid_count += 1;
+                results.push(SubmitLlmGatewayAccountContributionBatchItemResponse {
+                    item_index,
+                    account_name: item.account_name,
+                    status: "invalid",
+                    request_id: None,
+                    error_message: Some(err),
+                });
+                continue;
+            },
+        };
+
+        let auth = match normalize_batch_account_contribution_auth(item.auth_json, item.tokens) {
+            Ok(value) => value,
+            Err(err) => {
+                invalid_count += 1;
+                results.push(SubmitLlmGatewayAccountContributionBatchItemResponse {
+                    item_index,
+                    account_name,
+                    status: "invalid",
+                    request_id: None,
+                    error_message: Some(err),
+                });
+                continue;
+            },
+        };
+
+        let requester_email = match item.requester_email {
+            Some(value) => match normalize_requester_email_input(Some(value)) {
+                Ok(value) => value.unwrap_or_default(),
+                Err(err) => {
+                    invalid_count += 1;
+                    results.push(SubmitLlmGatewayAccountContributionBatchItemResponse {
+                        item_index,
+                        account_name,
+                        status: "invalid",
+                        request_id: None,
+                        error_message: Some(format!("invalid requester_email: {err}")),
+                    });
+                    continue;
+                },
+            },
+            None => default_requester_email.clone(),
+        };
+        let contributor_message = match item.contributor_message {
+            Some(value) => match normalize_contributor_message_input(Some(value)) {
+                Ok(Some(value)) => value,
+                Ok(None) => {
+                    invalid_count += 1;
+                    results.push(SubmitLlmGatewayAccountContributionBatchItemResponse {
+                        item_index,
+                        account_name,
+                        status: "invalid",
+                        request_id: None,
+                        error_message: Some("contributor_message is required".to_string()),
+                    });
+                    continue;
+                },
+                Err(err) => {
+                    invalid_count += 1;
+                    results.push(SubmitLlmGatewayAccountContributionBatchItemResponse {
+                        item_index,
+                        account_name,
+                        status: "invalid",
+                        request_id: None,
+                        error_message: Some(format!("invalid contributor_message: {err}")),
+                    });
+                    continue;
+                },
+            },
+            None => default_contributor_message.clone(),
+        };
+        let github_id = match item.github_id {
+            Some(value) => match normalize_optional_github_id_input(Some(value)) {
+                Ok(value) => value,
+                Err(err) => {
+                    invalid_count += 1;
+                    results.push(SubmitLlmGatewayAccountContributionBatchItemResponse {
+                        item_index,
+                        account_name,
+                        status: "invalid",
+                        request_id: None,
+                        error_message: Some(format!("invalid github_id: {err}")),
+                    });
+                    continue;
+                },
+            },
+            None => default_github_id.clone(),
+        };
+        let frontend_page_url = match item.frontend_page_url {
+            Some(value) => match normalize_frontend_page_url_input(Some(value)) {
+                Ok(value) => value,
+                Err(err) => {
+                    invalid_count += 1;
+                    results.push(SubmitLlmGatewayAccountContributionBatchItemResponse {
+                        item_index,
+                        account_name,
+                        status: "invalid",
+                        request_id: None,
+                        error_message: Some(format!("invalid frontend_page_url: {err}")),
+                    });
+                    continue;
+                },
+            },
+            None => default_frontend_page_url.clone(),
+        };
+
+        if !seen_names.insert(account_name.clone()) {
+            conflict_count += 1;
+            results.push(SubmitLlmGatewayAccountContributionBatchItemResponse {
+                item_index,
+                account_name,
+                status: "conflict",
+                request_id: None,
+                error_message: Some("account_name is duplicated within the batch".to_string()),
+            });
+            continue;
+        }
+
+        match state
+            .public_submission_store
+            .public_account_contribution_name_exists(&account_name)
+            .await
+        {
+            Ok(false) => {},
+            Ok(true) => {
+                conflict_count += 1;
+                results.push(SubmitLlmGatewayAccountContributionBatchItemResponse {
+                    item_index,
+                    account_name,
+                    status: "conflict",
+                    request_id: None,
+                    error_message: Some(
+                        "account_name already exists or is already pending review".to_string(),
+                    ),
+                });
+                continue;
+            },
+            Err(_) => return internal_error("public submission store error").into_response(),
+        }
+
+        let request = NewPublicAccountContributionRequest {
+            request_id: generate_task_id("llmacct"),
+            account_name: account_name.clone(),
+            account_id: auth.account_id,
+            id_token: auth.id_token,
+            access_token: auth.access_token,
+            refresh_token: auth.refresh_token,
+            requester_email,
+            contributor_message,
+            github_id,
+            frontend_page_url,
+            fingerprint: submit_context.fingerprint.clone(),
+            client_ip: submit_context.client_ip.clone(),
+            ip_region: submit_context.ip_region.clone(),
+            created_at_ms: submit_context.now_ms,
+        };
+        let request_id = request.request_id.clone();
+        match state
+            .public_submission_store
+            .create_public_account_contribution_request(request)
+            .await
+        {
+            Ok(()) => {
+                created_count += 1;
+                results.push(SubmitLlmGatewayAccountContributionBatchItemResponse {
+                    item_index,
+                    account_name,
+                    status: "pending",
+                    request_id: Some(request_id),
+                    error_message: None,
+                });
+            },
+            Err(_) => return internal_error("public submission store error").into_response(),
+        }
+    }
+
+    Json(SubmitLlmGatewayAccountContributionBatchResponse {
+        total: results.len(),
+        created_count,
+        invalid_count,
+        conflict_count,
+        results,
+    })
+    .into_response()
 }
 
 pub(crate) async fn submit_public_sponsor_request(
@@ -301,23 +600,20 @@ async fn normalize_account_contribution_request(
 ) -> Result<NewPublicAccountContributionRequest, SubmitError> {
     let account_name =
         validate_account_name(&request.account_name).map_err(|err| bad_request(&err))?;
-    let account_id = normalize_optional_string(request.account_id);
-    let id_token = normalize_optional_string(request.id_token).unwrap_or_default();
-    let access_token = normalize_optional_string(request.access_token).unwrap_or_default();
-    let refresh_token = normalize_optional_string(request.refresh_token).unwrap_or_default();
-    if refresh_token.is_empty() {
-        return Err(bad_request("refresh_token is required"));
-    }
+    let auth = normalize_account_contribution_auth_from_fields(
+        request.account_id,
+        request.id_token,
+        request.access_token,
+        request.refresh_token,
+    )
+    .map_err(|err| bad_request(&err))?;
     let requester_email = normalize_requester_email_input(request.requester_email)
         .map_err(|err| bad_request(&format!("invalid requester_email: {err}")))?
         .unwrap_or_default();
-    let contributor_message = request.contributor_message.trim();
-    if contributor_message.is_empty() {
-        return Err(bad_request("contributor_message is required"));
-    }
-    if contributor_message.chars().count() > MAX_PUBLIC_ACCOUNT_CONTRIBUTION_MESSAGE_CHARS {
-        return Err(bad_request("contributor_message is too long"));
-    }
+    let contributor_message =
+        normalize_contributor_message_input(Some(request.contributor_message))
+            .map_err(|err| bad_request(&format!("invalid contributor_message: {err}")))?
+            .ok_or_else(|| bad_request("contributor_message is required"))?;
     let github_id = normalize_optional_github_id_input(request.github_id)
         .map_err(|err| bad_request(&format!("invalid github_id: {err}")))?;
     let frontend_page_url = normalize_frontend_page_url_input(request.frontend_page_url)
@@ -327,12 +623,12 @@ async fn normalize_account_contribution_request(
     Ok(NewPublicAccountContributionRequest {
         request_id: generate_task_id("llmacct"),
         account_name,
-        account_id,
-        id_token,
-        access_token,
-        refresh_token,
+        account_id: auth.account_id,
+        id_token: auth.id_token,
+        access_token: auth.access_token,
+        refresh_token: auth.refresh_token,
         requester_email,
-        contributor_message: contributor_message.to_string(),
+        contributor_message,
         github_id,
         frontend_page_url,
         fingerprint: submit_context.fingerprint,
@@ -424,6 +720,18 @@ fn normalize_requester_email_input(value: Option<String>) -> anyhow::Result<Opti
     }
 }
 
+fn normalize_contributor_message_input(value: Option<String>) -> anyhow::Result<Option<String>> {
+    match normalize_optional_string(value) {
+        Some(raw) => {
+            if raw.chars().count() > MAX_PUBLIC_ACCOUNT_CONTRIBUTION_MESSAGE_CHARS {
+                anyhow::bail!("contributor_message is too long");
+            }
+            Ok(Some(raw))
+        },
+        None => Ok(None),
+    }
+}
+
 fn normalize_frontend_page_url_input(value: Option<String>) -> anyhow::Result<Option<String>> {
     match normalize_optional_string(value) {
         Some(raw) => {
@@ -496,6 +804,78 @@ fn validate_account_name(name: &str) -> Result<String, String> {
             .to_string());
     }
     Ok(trimmed.to_string())
+}
+
+#[derive(Debug, Clone)]
+struct NormalizedAccountContributionAuth {
+    account_id: Option<String>,
+    id_token: String,
+    access_token: String,
+    refresh_token: String,
+}
+
+fn normalize_account_contribution_auth_from_fields(
+    account_id: Option<String>,
+    id_token: Option<String>,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+) -> Result<NormalizedAccountContributionAuth, String> {
+    let refresh_token = normalize_optional_string(refresh_token)
+        .ok_or_else(|| "refresh_token is required".to_string())?;
+    Ok(NormalizedAccountContributionAuth {
+        account_id: normalize_optional_string(account_id),
+        id_token: normalize_optional_string(id_token).unwrap_or_default(),
+        access_token: normalize_optional_string(access_token).unwrap_or_default(),
+        refresh_token,
+    })
+}
+
+fn normalize_account_contribution_auth_from_json(
+    value: Value,
+) -> Result<NormalizedAccountContributionAuth, String> {
+    if !value.is_object() {
+        return Err("auth_json must be a JSON object".to_string());
+    }
+    normalize_account_contribution_auth_from_fields(
+        optional_auth_json_string(&value, &["account_id", "accountId"]),
+        optional_auth_json_string(&value, &["id_token", "idToken"]),
+        optional_auth_json_string(&value, &["access_token", "accessToken"]),
+        optional_auth_json_string(&value, &["refresh_token", "refreshToken"]),
+    )
+}
+
+fn normalize_batch_account_contribution_auth(
+    auth_json: Option<Value>,
+    tokens: Option<SubmitLlmGatewayAccountContributionTokens>,
+) -> Result<NormalizedAccountContributionAuth, String> {
+    if let Some(auth_json) = auth_json {
+        return normalize_account_contribution_auth_from_json(auth_json);
+    }
+    let Some(tokens) = tokens else {
+        return Err("auth_json or tokens is required".to_string());
+    };
+    normalize_account_contribution_auth_from_fields(
+        tokens.account_id,
+        tokens.id_token,
+        tokens.access_token,
+        tokens.refresh_token,
+    )
+}
+
+fn optional_auth_json_string(value: &Value, fields: &[&str]) -> Option<String> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(Value::as_str))
+        .or_else(|| {
+            value.get("tokens").and_then(|tokens| {
+                fields
+                    .iter()
+                    .find_map(|field| tokens.get(*field).and_then(Value::as_str))
+            })
+        })
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 fn build_client_fingerprint(headers: &HeaderMap) -> String {
@@ -693,6 +1073,8 @@ fn internal_error(message: &str) -> SubmitError {
 
 #[cfg(test)]
 mod tests {
+    use serde_json::json;
+
     use super::*;
 
     #[tokio::test]
@@ -742,5 +1124,26 @@ mod tests {
         assert_eq!(request.access_token, "");
         assert_eq!(request.refresh_token, "refresh-token");
         assert_eq!(request.requester_email, "");
+    }
+
+    #[test]
+    fn batch_account_contribution_auth_accepts_nested_tokens() {
+        let auth = normalize_batch_account_contribution_auth(
+            Some(json!({
+                "tokens": {
+                    "accountId": "acct-1",
+                    "idToken": "id-token",
+                    "accessToken": "access-token",
+                    "refreshToken": "refresh-token"
+                }
+            })),
+            None,
+        )
+        .expect("normalize auth");
+
+        assert_eq!(auth.account_id.as_deref(), Some("acct-1"));
+        assert_eq!(auth.id_token, "id-token");
+        assert_eq!(auth.access_token, "access-token");
+        assert_eq!(auth.refresh_token, "refresh-token");
     }
 }
