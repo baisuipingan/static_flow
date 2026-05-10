@@ -631,6 +631,31 @@ fn validate_responses_request(path: &str, root: &Map<String, Value>) -> CodexGat
     Ok(())
 }
 
+fn normalize_codex_input_message_roles(root: &mut Map<String, Value>) {
+    let Some(input) = root.get_mut("input") else {
+        return;
+    };
+    normalize_codex_input_message_roles_value(input);
+}
+
+fn normalize_codex_input_message_roles_value(value: &mut Value) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                normalize_codex_input_message_roles_value(item);
+            }
+        },
+        Value::Object(obj) => {
+            if obj.get("type").and_then(Value::as_str) == Some("message")
+                && obj.get("role").and_then(Value::as_str) == Some("system")
+            {
+                obj.insert("role".to_string(), Value::String("developer".to_string()));
+            }
+        },
+        _ => {},
+    }
+}
+
 fn validate_json_object_input_messages(root: &Map<String, Value>) -> CodexGatewayResult<()> {
     let format_type = root
         .get("text")
@@ -767,7 +792,7 @@ fn validate_tool_call_history(root: &Map<String, Value>) -> CodexGatewayResult<(
 /// Map OpenAI chat roles into the role set accepted by the responses API.
 fn normalize_openai_role_for_responses(role: &str) -> Option<&'static str> {
     match role {
-        "system" | "developer" => Some("system"),
+        "system" | "developer" => Some("developer"),
         "user" => Some("user"),
         "assistant" => Some("assistant"),
         "tool" => Some("tool"),
@@ -1271,7 +1296,7 @@ fn adapt_openai_chat_completions_request(
             return Err(chat_message_bad_request(index, format!("has unsupported role `{role}`")));
         };
         match normalized_role {
-            "system" => {
+            "developer" => {
                 let Some(content) = message_obj.get("content") else {
                     return Err(chat_message_bad_request(index, "is missing content"));
                 };
@@ -1288,7 +1313,7 @@ fn adapt_openai_chat_completions_request(
                 }
                 input_items.push(json!({
                     "type": "message",
-                    "role": "system",
+                    "role": "developer",
                     "content": [{
                         "type": "input_text",
                         "text": trimmed,
@@ -1594,6 +1619,8 @@ pub fn normalize_responses_request(
     root: &mut serde_json::Map<String, Value>,
     thread_anchor: Option<&str>,
 ) {
+    normalize_codex_input_message_roles(root);
+
     if root
         .get("instructions")
         .and_then(Value::as_str)
@@ -1997,7 +2024,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_gateway_request_chat_keeps_system_message_in_input_for_json_object() {
+    async fn prepare_gateway_request_chat_maps_system_message_to_developer_for_json_object() {
         let headers = axum::http::HeaderMap::new();
         let body = Body::from(
             r#"{
@@ -2026,10 +2053,41 @@ mod tests {
 
         assert_eq!(upstream["text"]["format"]["type"], "json_object");
         assert_eq!(upstream["input"][0]["type"], "message");
-        assert_eq!(upstream["input"][0]["role"], "system");
+        assert_eq!(upstream["input"][0]["role"], "developer");
         assert_eq!(upstream["input"][0]["content"][0]["type"], "input_text");
         assert_eq!(upstream["input"][0]["content"][0]["text"], "Return valid JSON only.");
         assert_eq!(upstream["instructions"].as_str(), Some(codex_default_instructions()));
+    }
+
+    #[tokio::test]
+    async fn prepare_gateway_request_responses_maps_system_message_to_developer() {
+        let headers = axum::http::HeaderMap::new();
+        let body = Body::from(
+            r#"{
+                "model":"gpt-5.3-codex",
+                "input":[
+                    {"type":"message","role":"system","content":[{"type":"input_text","text":"Reply with exactly PONG."}]},
+                    {"type":"message","role":"user","content":[{"type":"input_text","text":"ping"}]}
+                ]
+            }"#,
+        );
+
+        let prepared = prepare_gateway_request(
+            "/v1/responses",
+            "",
+            axum::http::Method::POST,
+            &headers,
+            body,
+            1024 * 1024,
+        )
+        .await
+        .expect("responses request with system message should normalize");
+
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&prepared.request_body).expect("upstream body json");
+
+        assert_eq!(upstream["input"][0]["role"], "developer");
+        assert_eq!(upstream["input"][1]["role"], "user");
     }
 
     #[tokio::test]
