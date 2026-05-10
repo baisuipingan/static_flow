@@ -1,6 +1,6 @@
 ---
 name: keria-plus-pickup
-description: Use when redeem-code pickup from plus.keria.cc.cd needs to be automated into a downloaded ZIP and an unpacked local directory, especially for plus_json bundles.
+description: Use when redeem-code pickup from plus.keria.cc.cd needs to be automated into a downloaded ZIP and an unpacked local directory, with an explicit choice between plus_json and sub2api output bundles.
 ---
 
 # Keria Plus Pickup
@@ -17,6 +17,15 @@ basic pickup flow.
 - You want a local ZIP plus an unpacked directory.
 - The target site is `plus.keria.cc.cd` or a compatible deployment.
 
+## Required Operator Confirmation
+
+Before any real pickup, confirm these two inputs with the user:
+
+1. Which local directory should receive the ZIP and unpacked files.
+2. Which bundle format is required:
+   - `plus_json`
+   - `sub2api`
+
 ## Request Shape
 
 Required form fields:
@@ -25,9 +34,10 @@ Required form fields:
 - `output_format`
 - `progress_id`
 
-For Plus JSON pickup, use:
+Supported output formats:
 
-- `output_format=plus_json`
+- `plus_json`
+- `sub2api`
 
 ## Helper Script
 
@@ -42,7 +52,8 @@ Typical use:
 ```bash
 bash skills/keria-plus-pickup/scripts/fetch_pickup_bundle.sh \
   --codes-file /path/to/codes.txt \
-  --output-dir /path/to/output
+  --output-dir /path/to/output \
+  --output-format plus_json
 ```
 
 With explicit base URL:
@@ -51,7 +62,8 @@ With explicit base URL:
 bash skills/keria-plus-pickup/scripts/fetch_pickup_bundle.sh \
   --base-url https://plus.keria.cc.cd \
   --codes-file /path/to/codes.txt \
-  --output-dir /path/to/output
+  --output-dir /path/to/output \
+  --output-format sub2api
 ```
 
 Dry run:
@@ -60,6 +72,7 @@ Dry run:
 bash skills/keria-plus-pickup/scripts/fetch_pickup_bundle.sh \
   --codes-file /path/to/codes.txt \
   --output-dir /path/to/output \
+  --output-format plus_json \
   --dry-run
 ```
 
@@ -67,7 +80,7 @@ bash skills/keria-plus-pickup/scripts/fetch_pickup_bundle.sh \
 
 The script writes:
 
-- `pickup-plus-json.zip`
+- `pickup-<format>.zip`
 - `pickup.headers.txt`
 - `unpacked/`
 
@@ -78,4 +91,4 @@ failure counts.
 
 - The script sends browser-like `Origin`, `Referer`, and `User-Agent` headers.
 - One line per code is preferred.
-- Default output format is `plus_json`.
+- Do not assume the format; pass `--output-format` explicitly.

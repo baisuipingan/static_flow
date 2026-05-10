@@ -9,10 +9,10 @@ Usage:
 Required:
   --codes-file FILE        Text file with one pickup code per line
   --output-dir DIR         Directory to store ZIP, headers, and unpacked files
+  --output-format FORMAT   One of: plus_json, sub2api
 
 Options:
   --base-url URL           Default: https://plus.keria.cc.cd
-  --output-format FORMAT   Default: plus_json
   --progress-id ID         Default: UTC timestamp
   --dry-run                Print the request plan without calling curl
   --help                   Show this help
@@ -29,7 +29,7 @@ require_cmd() {
 base_url="https://plus.keria.cc.cd"
 codes_file=""
 output_dir=""
-output_format="plus_json"
+output_format=""
 progress_id="$(date -u +%Y%m%dT%H%M%SZ)"
 dry_run=false
 
@@ -75,7 +75,7 @@ require_cmd curl
 require_cmd unzip
 require_cmd python3
 
-if [[ -z "$codes_file" || -z "$output_dir" ]]; then
+if [[ -z "$codes_file" || -z "$output_dir" || -z "$output_format" ]]; then
   usage >&2
   exit 1
 fi
@@ -84,6 +84,15 @@ if [[ ! -f "$codes_file" ]]; then
   echo "codes file not found: $codes_file" >&2
   exit 1
 fi
+
+case "$output_format" in
+  plus_json|sub2api)
+    ;;
+  *)
+    echo "output-format must be one of: plus_json, sub2api" >&2
+    exit 1
+    ;;
+esac
 
 mkdir -p "$output_dir"
 headers_file="$output_dir/pickup.headers.txt"
