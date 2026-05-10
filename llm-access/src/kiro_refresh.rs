@@ -27,11 +27,26 @@ use crate::kiro_headers;
 
 const REFRESH_EARLY_MINUTES: i64 = 10;
 const KIRO_USAGE_AWS_SDK_VERSION: &str = "1.0.0";
+const KIRO_PROFILES_AWS_SDK_VERSION: &str = "1.0.0";
 const KIRO_IDC_AWS_SDK_VERSION: &str = "3.980.0";
 const KIRO_IDC_AMZ_SDK_REQUEST: &str = "attempt=1; max=4";
 const KIRO_UPSTREAM_BASE_URL_ENV: &str = "KIRO_UPSTREAM_BASE_URL";
 const KIRO_RUNTIME_UPSTREAM_BASE_URL_ENV: &str = "KIRO_RUNTIME_UPSTREAM_BASE_URL";
 const KIRO_MANAGEMENT_UPSTREAM_BASE_URL_ENV: &str = "KIRO_MANAGEMENT_UPSTREAM_BASE_URL";
+const KIRO_SOCIAL_SIGN_IN_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK";
+const KIRO_BUILDER_ID_PROFILE_ARN: &str =
+    "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX";
+const KIRO_STANDARD_PROFILE_REGIONS: &[&str] = &[
+    "us-east-1",
+    "eu-central-1",
+    "us-gov-east-1",
+    "us-gov-west-1",
+    "us-iso-east-1",
+    "us-isob-east-1",
+    "us-isof-south-1",
+    "us-isof-east-1",
+];
 
 static REFRESH_LOCKS: LazyLock<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -61,8 +76,40 @@ pub(crate) async fn ensure_context_for_route(
     store: &dyn ProviderRouteStore,
     force_refresh: bool,
 ) -> anyhow::Result<KiroCallContext> {
+    ensure_context_for_route_with_profile_requirement(
+        route,
+        store,
+        force_refresh,
+        ProfileArnRequirement::Optional,
+    )
+    .await
+}
+
+pub(crate) async fn ensure_context_for_route_requiring_profile(
+    route: &ProviderKiroRoute,
+    store: &dyn ProviderRouteStore,
+    force_refresh: bool,
+) -> anyhow::Result<KiroCallContext> {
+    ensure_context_for_route_with_profile_requirement(
+        route,
+        store,
+        force_refresh,
+        ProfileArnRequirement::Required,
+    )
+    .await
+}
+
+async fn ensure_context_for_route_with_profile_requirement(
+    route: &ProviderKiroRoute,
+    store: &dyn ProviderRouteStore,
+    force_refresh: bool,
+    profile_requirement: ProfileArnRequirement,
+) -> anyhow::Result<KiroCallContext> {
     let auth = parse_route_auth(route)?;
-    if !force_refresh && !needs_refresh(&auth) {
+    if !force_refresh
+        && !needs_refresh(&auth)
+        && !profile_resolution_needed(&auth, profile_requirement)
+    {
         let access_token = non_empty_access_token(&auth)?;
         return Ok(KiroCallContext {
             auth,
@@ -74,9 +121,14 @@ pub(crate) async fn ensure_context_for_route(
     let _guard = refresh_lock.lock().await;
     let latest = parse_route_auth(route)?;
     if !force_refresh && !needs_refresh(&latest) {
-        let access_token = non_empty_access_token(&latest)?;
+        let (resolved, changed) =
+            resolve_profile_arn_for_auth(route, &latest, profile_requirement).await?;
+        if changed {
+            persist_active_kiro_auth_update(route, store, &resolved).await?;
+        }
+        let access_token = non_empty_access_token(&resolved)?;
         return Ok(KiroCallContext {
-            auth: latest,
+            auth: resolved,
             access_token,
         });
     }
@@ -106,25 +158,298 @@ pub(crate) async fn ensure_context_for_route(
             return Err(err);
         },
     };
+    let (refreshed, _changed) =
+        resolve_profile_arn_for_auth(route, &refreshed, profile_requirement).await?;
     let access_token = non_empty_access_token(&refreshed)?;
+    persist_active_kiro_auth_update(route, store, &refreshed).await?;
+    Ok(KiroCallContext {
+        auth: refreshed,
+        access_token,
+    })
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ProfileArnRequirement {
+    Optional,
+    Required,
+}
+
+fn profile_resolution_needed(auth: &KiroAuthRecord, requirement: ProfileArnRequirement) -> bool {
+    current_profile_arn(auth).is_none()
+        && (matches!(requirement, ProfileArnRequirement::Required) || supports_profiles(auth))
+}
+
+fn current_profile_arn(auth: &KiroAuthRecord) -> Option<&str> {
+    auth.profile_arn
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+}
+
+async fn resolve_profile_arn_for_auth(
+    route: &ProviderKiroRoute,
+    auth: &KiroAuthRecord,
+    requirement: ProfileArnRequirement,
+) -> anyhow::Result<(KiroAuthRecord, bool)> {
+    if current_profile_arn(auth).is_some() {
+        return Ok((auth.clone(), false));
+    }
+    if !supports_profiles(auth) {
+        if matches!(requirement, ProfileArnRequirement::Required) {
+            bail!("profileArn is required but could not be resolved");
+        }
+        return Ok((auth.clone(), false));
+    }
+
+    if let Some(profile_arn) = fixed_profile_arn(auth) {
+        let mut resolved = auth.clone();
+        resolved.profile_arn = Some(profile_arn.to_string());
+        return Ok((resolved, true));
+    }
+
+    let fetched = match fetch_profile_arn_from_backend(route, auth).await {
+        Ok(profile_arn) => profile_arn,
+        Err(err) => {
+            if matches!(requirement, ProfileArnRequirement::Optional) {
+                return Ok((auth.clone(), false));
+            }
+            return Err(err.context("profileArn is required but could not be resolved"));
+        },
+    };
+
+    let Some(profile_arn) = fetched else {
+        if matches!(requirement, ProfileArnRequirement::Required) {
+            bail!("profileArn is required but could not be resolved");
+        }
+        return Ok((auth.clone(), false));
+    };
+
+    let mut resolved = auth.clone();
+    resolved.profile_arn = Some(profile_arn);
+    Ok((resolved, true))
+}
+
+fn supports_profiles(auth: &KiroAuthRecord) -> bool {
+    let provider = normalized_token_provider(auth);
+    let is_idc_provider =
+        matches!(provider.as_deref(), Some("Enterprise" | "Internal" | "BuilderId"));
+    let is_external_idp =
+        auth.auth_method() == "external_idp" || matches!(provider.as_deref(), Some("ExternalIdp"));
+    let is_social = auth.auth_method() == "social";
+    is_idc_provider || is_external_idp || is_social
+}
+
+fn fixed_profile_arn(auth: &KiroAuthRecord) -> Option<&'static str> {
+    match normalized_token_provider(auth).as_deref() {
+        Some("BuilderId") => Some(KIRO_BUILDER_ID_PROFILE_ARN),
+        Some("Github" | "Google") => Some(KIRO_SOCIAL_SIGN_IN_PROFILE_ARN),
+        _ => None,
+    }
+}
+
+fn normalized_token_provider(auth: &KiroAuthRecord) -> Option<String> {
+    let provider = auth
+        .provider
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let normalized = if provider.eq_ignore_ascii_case("github") {
+        "Github"
+    } else if provider.eq_ignore_ascii_case("google") {
+        "Google"
+    } else if provider.eq_ignore_ascii_case("builderid")
+        || provider.eq_ignore_ascii_case("builder-id")
+        || provider.eq_ignore_ascii_case("aws")
+    {
+        "BuilderId"
+    } else if provider.eq_ignore_ascii_case("enterprise") {
+        "Enterprise"
+    } else if provider.eq_ignore_ascii_case("internal") {
+        "Internal"
+    } else if provider.eq_ignore_ascii_case("externalidp")
+        || provider.eq_ignore_ascii_case("external_idp")
+    {
+        "ExternalIdp"
+    } else {
+        provider
+    };
+    Some(normalized.to_string())
+}
+
+async fn fetch_profile_arn_from_backend(
+    route: &ProviderKiroRoute,
+    auth: &KiroAuthRecord,
+) -> anyhow::Result<Option<String>> {
+    let client = provider_client(route.proxy.as_ref())?;
+    let access_token = non_empty_access_token(auth)?;
+    let mut profiles = Vec::new();
+    for region in profile_regions_to_query(auth) {
+        let region_profiles =
+            match fetch_profile_candidates_for_region(&client, auth, &access_token, region).await {
+                Ok(region_profiles) => region_profiles,
+                Err(_) => continue,
+            };
+        profiles.extend(region_profiles);
+    }
+    Ok(profiles
+        .into_iter()
+        .filter_map(|profile| profile.arn.map(|arn| arn.trim().to_string()))
+        .find(|arn| !arn.is_empty()))
+}
+
+async fn fetch_profile_candidates_for_region(
+    client: &reqwest::Client,
+    auth: &KiroAuthRecord,
+    access_token: &str,
+    region: &str,
+) -> anyhow::Result<Vec<ListAvailableProfile>> {
+    let upstream_base = codewhisperer_profiles_base_url(region)?;
+    let upstream_url = format!("{upstream_base}/ListAvailableProfiles");
+    let host = upstream_host_header(&upstream_url)?;
+    let mut next_token: Option<String> = None;
+    let mut profiles = Vec::new();
+    loop {
+        let request_body = serde_json::to_vec(&ListAvailableProfilesRequest {
+            next_token: next_token.clone(),
+        })
+        .context("encode ListAvailableProfiles request")?;
+        let response = kiro_headers::add_kiro_headers(
+            client.post(&upstream_url),
+            auth,
+            kiro_headers::KiroHeaderConfig {
+                upstream_host: &host,
+                access_token,
+                service: kiro_headers::KiroAwsService::Runtime,
+                client_version: KIRO_PROFILES_AWS_SDK_VERSION,
+                sdk_request: "attempt=1; max=1",
+                content_type: Some("application/json"),
+                accept: Some("application/json"),
+                connection_close: true,
+                agent_mode: None,
+                include_opt_out: false,
+            },
+        )?
+        .body(request_body)
+        .send()
+        .await
+        .with_context(|| format!("request kiro ListAvailableProfiles for region {region}"))?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            bail!("kiro ListAvailableProfiles failed for {region}: {status} {body}");
+        }
+        let payload: ListAvailableProfilesResponse = response
+            .json()
+            .await
+            .with_context(|| format!("parse kiro ListAvailableProfiles response for {region}"))?;
+        profiles.extend(payload.profiles.into_iter());
+        if let Some(token) = payload
+            .next_token
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            next_token = Some(token.to_string());
+            continue;
+        }
+        return Ok(profiles);
+    }
+}
+
+fn profile_regions_to_query(auth: &KiroAuthRecord) -> Vec<&'static str> {
+    if auth.auth_method() == "external_idp" {
+        return KIRO_STANDARD_PROFILE_REGIONS.to_vec();
+    }
+    let idc_region = auth.effective_auth_region();
+    let idc_partition = aws_partition_for_region(idc_region);
+    let filtered: Vec<&'static str> = KIRO_STANDARD_PROFILE_REGIONS
+        .iter()
+        .copied()
+        .filter(|region| aws_partition_for_region(region) == idc_partition)
+        .collect();
+    if filtered.is_empty() {
+        vec!["us-east-1", "eu-central-1"]
+    } else {
+        filtered
+    }
+}
+
+fn aws_partition_for_region(region: &str) -> &'static str {
+    if region.starts_with("cn-") {
+        "aws-cn"
+    } else if region.starts_with("us-gov-") {
+        "aws-us-gov"
+    } else if region.starts_with("us-isof-") {
+        "aws-iso-f"
+    } else if region.starts_with("us-isob-") {
+        "aws-iso-b"
+    } else if region.starts_with("us-iso-") {
+        "aws-iso"
+    } else {
+        "aws"
+    }
+}
+
+fn codewhisperer_profiles_base_url(region: &str) -> anyhow::Result<String> {
+    if let Some(overridden) = read_upstream_env(KIRO_UPSTREAM_BASE_URL_ENV) {
+        return Ok(overridden);
+    }
+    let url = match region {
+        "us-east-1" => "https://q.us-east-1.amazonaws.com",
+        "eu-central-1" => "https://q.eu-central-1.amazonaws.com",
+        "us-gov-east-1" => "https://q-fips.us-gov-east-1.amazonaws.com",
+        "us-gov-west-1" => "https://q-fips.us-gov-west-1.amazonaws.com",
+        "us-iso-east-1" => "https://q.us-iso-east-1.c2s.ic.gov",
+        "us-isob-east-1" => "https://q.us-isob-east-1.sc2s.sgov.gov",
+        "us-isof-south-1" => "https://q.us-isof-south-1.csp.hci.ic.gov",
+        "us-isof-east-1" => "https://q.us-isof-east-1.csp.hci.ic.gov",
+        _ => bail!("unsupported CodeWhisperer profile region: {region}"),
+    };
+    Ok(url.to_string())
+}
+
+async fn persist_active_kiro_auth_update(
+    route: &ProviderKiroRoute,
+    store: &dyn ProviderRouteStore,
+    auth: &KiroAuthRecord,
+) -> anyhow::Result<()> {
     store
         .save_kiro_auth_update(ProviderKiroAuthUpdate {
             account_name: route.account_name.clone(),
-            auth_json: refreshed_auth_json(&route.auth_json, &refreshed)
+            auth_json: refreshed_auth_json(&route.auth_json, auth)
                 .context("serialize refreshed kiro auth")?,
-            auth_method: refreshed.auth_method().to_string(),
+            auth_method: auth.auth_method().to_string(),
             account_id: account_id_from_auth_json(&route.auth_json),
-            profile_arn: refreshed.profile_arn.clone(),
+            profile_arn: auth.profile_arn.clone(),
             user_id: user_id_from_auth_json(&route.auth_json),
             status: KEY_STATUS_ACTIVE.to_string(),
             last_error: None,
             refreshed_at_ms: now_ms(),
         })
-        .await?;
-    Ok(KiroCallContext {
-        auth: refreshed,
-        access_token,
-    })
+        .await
+}
+
+#[derive(Debug, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAvailableProfilesRequest {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    next_token: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAvailableProfilesResponse {
+    #[serde(default)]
+    profiles: Vec<ListAvailableProfile>,
+    #[serde(default)]
+    next_token: Option<String>,
+}
+
+#[derive(Debug, serde::Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListAvailableProfile {
+    #[serde(default)]
+    arn: Option<String>,
 }
 
 pub(crate) async fn fetch_usage_limits_for_route(
@@ -132,7 +457,7 @@ pub(crate) async fn fetch_usage_limits_for_route(
     store: &dyn ProviderRouteStore,
     force_refresh: bool,
 ) -> anyhow::Result<UsageLimitsResponse> {
-    let ctx = ensure_context_for_route(route, store, force_refresh).await?;
+    let ctx = ensure_context_for_route_requiring_profile(route, store, force_refresh).await?;
     let region = ctx.auth.effective_api_region().to_string();
     let upstream_base = management_upstream_base_url(&region);
     let mut url =
@@ -521,6 +846,162 @@ fn now_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
+    use axum::{
+        extract::{Query, State},
+        response::IntoResponse,
+        routing::{get, post},
+        Json, Router,
+    };
+    use llm_access_core::store::{
+        EmptyProviderRouteStore, ProviderKiroAuthUpdate, ProviderKiroRoute,
+    };
+    use serde_json::json;
+
+    #[derive(Default)]
+    struct CaptureStore {
+        updates: Mutex<Vec<ProviderKiroAuthUpdate>>,
+    }
+
+    #[async_trait::async_trait]
+    impl llm_access_core::store::ProviderRouteStore for CaptureStore {
+        async fn resolve_codex_route(
+            &self,
+            _key: &llm_access_core::store::AuthenticatedKey,
+        ) -> anyhow::Result<Option<llm_access_core::store::ProviderCodexRoute>> {
+            Ok(None)
+        }
+
+        async fn resolve_codex_account_route(
+            &self,
+            _account_name: &str,
+        ) -> anyhow::Result<Option<llm_access_core::store::ProviderCodexRoute>> {
+            Ok(None)
+        }
+
+        async fn resolve_kiro_route(
+            &self,
+            _key: &llm_access_core::store::AuthenticatedKey,
+        ) -> anyhow::Result<Option<ProviderKiroRoute>> {
+            Ok(None)
+        }
+
+        async fn save_kiro_auth_update(
+            &self,
+            update: ProviderKiroAuthUpdate,
+        ) -> anyhow::Result<()> {
+            self.updates.lock().expect("updates").push(update);
+            Ok(())
+        }
+
+        async fn save_codex_auth_update(
+            &self,
+            _update: llm_access_core::store::ProviderCodexAuthUpdate,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Default)]
+    struct CapturedProfileFallback {
+        usage_queries: Mutex<Vec<Option<String>>>,
+        list_profile_calls: Mutex<usize>,
+    }
+
+    fn static_kiro_route_with_auth_json(auth_json: &str) -> ProviderKiroRoute {
+        ProviderKiroRoute {
+            account_name: "kiro-a".to_string(),
+            account_group_id_at_event: None,
+            route_strategy_at_event: llm_access_core::provider::RouteStrategy::Auto,
+            auth_json: auth_json.to_string(),
+            profile_arn: None,
+            api_region: "us-east-1".to_string(),
+            request_validation_enabled: true,
+            cache_estimation_enabled: true,
+            zero_cache_debug_enabled: false,
+            full_request_logging_enabled: false,
+            model_name_map_json: "{}".to_string(),
+            cache_kmodels_json: llm_access_core::store::default_kiro_cache_kmodels_json(),
+            cache_policy_json: llm_access_core::store::default_kiro_cache_policy_json(),
+            prefix_cache_mode: llm_access_core::store::DEFAULT_KIRO_PREFIX_CACHE_MODE.to_string(),
+            prefix_cache_max_tokens: llm_access_core::store::DEFAULT_KIRO_PREFIX_CACHE_MAX_TOKENS,
+            prefix_cache_entry_ttl_seconds:
+                llm_access_core::store::DEFAULT_KIRO_PREFIX_CACHE_ENTRY_TTL_SECONDS,
+            conversation_anchor_max_entries:
+                llm_access_core::store::DEFAULT_KIRO_CONVERSATION_ANCHOR_MAX_ENTRIES,
+            conversation_anchor_ttl_seconds:
+                llm_access_core::store::DEFAULT_KIRO_CONVERSATION_ANCHOR_TTL_SECONDS,
+            billable_model_multipliers_json:
+                llm_access_core::store::default_kiro_billable_model_multipliers_json(),
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+            account_request_max_concurrency: None,
+            account_request_min_start_interval_ms: None,
+            proxy: None,
+            routing_identity: "kiro-a".to_string(),
+            cached_status: None,
+            cached_remaining_credits: None,
+            cached_balance: None,
+            cached_cache: None,
+            status_refresh_interval_seconds: 300,
+            minimum_remaining_credits_before_block: 0.0,
+        }
+    }
+
+    async fn fake_usage_limits(
+        State(captured): State<Arc<CapturedProfileFallback>>,
+        Query(query): Query<std::collections::HashMap<String, String>>,
+    ) -> impl IntoResponse {
+        captured
+            .usage_queries
+            .lock()
+            .expect("usage queries")
+            .push(query.get("profileArn").cloned());
+        Json(json!({
+            "subscriptionInfo": {"subscriptionTitle": "Pro"},
+            "usageBreakdownList": [{
+                "currentUsageWithPrecision": 1.0,
+                "usageLimitWithPrecision": 100.0,
+                "bonuses": [],
+                "nextDateReset": 900.0
+            }],
+            "userInfo": {"userId": "user-1"}
+        }))
+    }
+
+    async fn fake_list_available_profiles(
+        State(captured): State<Arc<CapturedProfileFallback>>,
+    ) -> impl IntoResponse {
+        *captured
+            .list_profile_calls
+            .lock()
+            .expect("list profile calls") += 1;
+        Json(json!({
+            "profiles": [{
+                "arn": "arn:aws:codewhisperer:us-east-1:123456789012:profile/PROFILE1",
+                "name": "Default"
+            }]
+        }))
+    }
+
+    async fn spawn_profile_fallback_upstream(captured: Arc<CapturedProfileFallback>) -> String {
+        let app = Router::new()
+            .route("/getUsageLimits", get(fake_usage_limits))
+            .route("/ListAvailableProfiles", post(fake_list_available_profiles))
+            .with_state(captured);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind profile fallback upstream");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve profile fallback upstream");
+        });
+        format!("http://{}", addr)
+    }
+
     fn clear_kiro_upstream_envs() {
         std::env::remove_var("KIRO_RUNTIME_UPSTREAM_BASE_URL");
         std::env::remove_var("KIRO_MANAGEMENT_UPSTREAM_BASE_URL");
@@ -594,6 +1075,85 @@ mod tests {
             "127.0.0.1:19091"
         );
 
+        clear_kiro_upstream_envs();
+    }
+
+    #[tokio::test]
+    async fn usage_refresh_uses_fixed_builder_id_profile_arn_and_persists_it() {
+        let _guard = crate::KIRO_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("kiro upstream env lock");
+        clear_kiro_upstream_envs();
+        let captured = Arc::new(CapturedProfileFallback::default());
+        let upstream_base = spawn_profile_fallback_upstream(captured.clone()).await;
+        std::env::set_var("KIRO_UPSTREAM_BASE_URL", &upstream_base);
+
+        let route = static_kiro_route_with_auth_json(
+            r#"{
+                "accessToken":"kiro-upstream-token",
+                "machineId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "authMethod":"idc",
+                "provider":"aws"
+            }"#,
+        );
+        let store = Arc::new(CaptureStore::default());
+
+        let _ = super::fetch_usage_limits_for_route(&route, store.as_ref(), false)
+            .await
+            .expect("usage refresh should succeed");
+
+        let usage_queries = captured.usage_queries.lock().expect("usage queries");
+        assert_eq!(usage_queries.as_slice(), &[Some(
+            "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX".to_string()
+        )]);
+        drop(usage_queries);
+
+        let updates = store.updates.lock().expect("updates");
+        assert_eq!(updates.len(), 1);
+        assert_eq!(
+            updates[0].profile_arn.as_deref(),
+            Some("arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX")
+        );
+        assert!(updates[0].auth_json.contains("AAAACCCCXXXX"));
+        drop(updates);
+        clear_kiro_upstream_envs();
+    }
+
+    #[tokio::test]
+    async fn usage_refresh_fetches_profile_from_list_available_profiles_for_external_idp() {
+        let _guard = crate::KIRO_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("kiro upstream env lock");
+        clear_kiro_upstream_envs();
+        let captured = Arc::new(CapturedProfileFallback::default());
+        let upstream_base = spawn_profile_fallback_upstream(captured.clone()).await;
+        std::env::set_var("KIRO_UPSTREAM_BASE_URL", &upstream_base);
+
+        let route = static_kiro_route_with_auth_json(
+            r#"{
+                "accessToken":"kiro-upstream-token",
+                "machineId":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "authMethod":"external_idp",
+                "provider":"Internal"
+            }"#,
+        );
+
+        let _ = super::fetch_usage_limits_for_route(&route, &EmptyProviderRouteStore, false)
+            .await
+            .expect("usage refresh should succeed");
+
+        assert_eq!(
+            *captured
+                .list_profile_calls
+                .lock()
+                .expect("list profile calls"),
+            super::KIRO_STANDARD_PROFILE_REGIONS.len()
+        );
+        let usage_queries = captured.usage_queries.lock().expect("usage queries");
+        assert_eq!(usage_queries.as_slice(), &[Some(
+            "arn:aws:codewhisperer:us-east-1:123456789012:profile/PROFILE1".to_string()
+        )]);
+        drop(usage_queries);
         clear_kiro_upstream_envs();
     }
 }

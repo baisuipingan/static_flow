@@ -7,6 +7,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use anyhow::{bail, Context};
 use async_stream::stream;
 use async_trait::async_trait;
 use axum::{
@@ -3040,17 +3041,22 @@ async fn call_kiro_mcp_for_route(
     let mut attempt = 0usize;
     let response = loop {
         attempt += 1;
-        let call_ctx =
-            match kiro_refresh::ensure_context_for_route(route, route_store, force_refresh).await {
-                Ok(ctx) => ctx,
-                Err(err) => {
-                    break Err(KiroRouteFailure::synthetic(
-                        StatusCode::BAD_GATEWAY,
-                        format!("kiro mcp auth refresh failed for {}: {err}", route.account_name),
-                        KiroRouteFailureKind::RetryNext,
-                    ));
-                },
-            };
+        let call_ctx = match kiro_refresh::ensure_context_for_route_requiring_profile(
+            route,
+            route_store,
+            force_refresh,
+        )
+        .await
+        {
+            Ok(ctx) => ctx,
+            Err(err) => {
+                break Err(KiroRouteFailure::synthetic(
+                    StatusCode::BAD_GATEWAY,
+                    format!("kiro mcp auth refresh failed for {}: {err}", route.account_name),
+                    KiroRouteFailureKind::RetryNext,
+                ));
+            },
+        };
         let response = match send_kiro_mcp_request(
             route,
             &call_ctx,
@@ -3154,6 +3160,8 @@ async fn send_kiro_generate_request(
     request_body: Vec<u8>,
 ) -> anyhow::Result<reqwest::Response> {
     let client = provider_client(route.proxy.as_ref())?;
+    let request_body =
+        kiro_request_body_with_profile_arn(request_body, call_ctx.auth.profile_arn.as_deref())?;
     Ok(add_kiro_upstream_headers(
         client.post(&upstream_url),
         &upstream_url,
@@ -3175,13 +3183,30 @@ async fn send_kiro_mcp_request(
     Ok(add_kiro_mcp_headers(
         client.post(&upstream_url),
         &upstream_url,
-        route,
+        call_ctx.auth.profile_arn.as_deref(),
         &call_ctx.access_token,
         Some(&call_ctx.auth),
     )?
     .body(request_body)
     .send()
     .await?)
+}
+
+fn kiro_request_body_with_profile_arn(
+    request_body: Vec<u8>,
+    profile_arn: Option<&str>,
+) -> anyhow::Result<Vec<u8>> {
+    let mut value: serde_json::Value =
+        serde_json::from_slice(&request_body).context("parse kiro request body json")?;
+    let Some(object) = value.as_object_mut() else {
+        bail!("kiro request body must be a json object");
+    };
+    if let Some(profile_arn) = profile_arn.map(str::trim).filter(|value| !value.is_empty()) {
+        object.insert("profileArn".to_string(), serde_json::Value::String(profile_arn.to_string()));
+    } else {
+        object.remove("profileArn");
+    }
+    serde_json::to_vec(&value).context("serialize kiro request body json")
 }
 
 fn has_remaining_kiro_candidate(
@@ -3750,7 +3775,7 @@ fn add_kiro_upstream_headers(
 fn add_kiro_mcp_headers(
     mut upstream: reqwest::RequestBuilder,
     upstream_url: &str,
-    route: &ProviderKiroRoute,
+    profile_arn: Option<&str>,
     access_token: &str,
     auth_record: Option<&KiroAuthRecord>,
 ) -> anyhow::Result<reqwest::RequestBuilder> {
@@ -3768,11 +3793,7 @@ fn add_kiro_mcp_headers(
         agent_mode: None,
         include_opt_out: false,
     })?;
-    if let Some(profile_arn) = route
-        .profile_arn
-        .as_deref()
-        .filter(|value| !value.trim().is_empty())
-    {
+    if let Some(profile_arn) = profile_arn.map(str::trim).filter(|value| !value.is_empty()) {
         upstream = upstream.header("x-amzn-kiro-profile-arn", profile_arn);
     }
     Ok(upstream)
@@ -7540,6 +7561,66 @@ mod tests {
         assert_eq!(requests[0].path, "/generateAssistantResponse");
         assert_eq!(requests[0].authorization.as_deref(), Some("Bearer kiro-upstream-token"));
         assert_eq!(requests[0].body["profileArn"], "arn:aws:kiro:test");
+    }
+
+    #[tokio::test]
+    async fn kiro_generate_uses_fixed_social_profile_arn_when_route_is_missing_it() {
+        let _guard = crate::KIRO_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("kiro upstream env lock");
+        let captured = Arc::new(CapturedKiroUpstream::default());
+        let upstream_base = spawn_fake_kiro_upstream(captured.clone()).await;
+        std::env::set_var("KIRO_UPSTREAM_BASE_URL", upstream_base);
+
+        let mut route = static_kiro_route_with_auth_method_and_provider("social", "github");
+        route.profile_arn = None;
+        let state = super::ProviderState::new(
+            Arc::new(TestStore),
+            Arc::new(StaticRouteStore {
+                codex_route: ProviderCodexRoute {
+                    account_name: "codex-a".to_string(),
+                    account_group_id_at_event: None,
+                    route_strategy_at_event: RouteStrategy::Auto,
+                    auth_json: r#"{"access_token":"upstream-token"}"#.to_string(),
+                    map_gpt53_codex_to_spark: true,
+                    request_max_concurrency: None,
+                    request_min_start_interval_ms: None,
+                    account_request_max_concurrency: None,
+                    account_request_min_start_interval_ms: None,
+                    proxy: None,
+                },
+                kiro_route: route,
+            }),
+        );
+
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/api/kiro-gateway/v1/messages")
+                .header("x-api-key", "valid-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model": "claude-sonnet-4-6",
+                        "max_tokens": 128,
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": false
+                    }"#,
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        std::env::remove_var("KIRO_UPSTREAM_BASE_URL");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = captured.requests.lock().expect("captured requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(
+            requests[0].body["profileArn"],
+            "arn:aws:codewhisperer:us-east-1:699475941385:profile/EHGA3GRVQMUK"
+        );
     }
 
     #[tokio::test]
