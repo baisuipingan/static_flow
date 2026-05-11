@@ -615,7 +615,6 @@ fn filter_responses_request_fields(path: &str, root: &mut Map<String, Value>) {
             key.as_str(),
             "model"
                 | "instructions"
-                | "previous_response_id"
                 | "input"
                 | "tools"
                 | "tool_choice"
@@ -754,7 +753,6 @@ fn validate_tool_call_history(root: &Map<String, Value>) -> CodexGatewayResult<(
         Value::Object(_) => vec![input],
         _ => return Ok(()),
     };
-    let allow_orphan_outputs = extract_non_empty_string(root.get("previous_response_id")).is_some();
     let mut seen_calls = BTreeSet::new();
     let mut pending_calls = BTreeSet::new();
     let mut seen_outputs = BTreeSet::new();
@@ -795,12 +793,9 @@ fn validate_tool_call_history(root: &Map<String, Value>) -> CodexGatewayResult<(
                 if pending_calls.remove(call_id) {
                     continue;
                 }
-                if !allow_orphan_outputs {
-                    return Err(bad_request(&format!(
-                        "responses input contains tool output for unknown function call \
-                         `{call_id}`"
-                    )));
-                }
+                return Err(bad_request(&format!(
+                    "responses input contains tool output for unknown function call `{call_id}`"
+                )));
             },
             _ => {},
         }
@@ -2044,7 +2039,6 @@ mod tests {
                 "max_output_tokens":64,
                 "max_completion_tokens":32,
                 "max_tokens":16,
-                "previous_response_id":"resp-1",
                 "verbosity":"high"
             }"#,
         );
@@ -2066,7 +2060,7 @@ mod tests {
         assert_eq!(upstream["tool_choice"], "auto");
         assert_eq!(upstream["service_tier"], "flex");
         assert_eq!(upstream["client_metadata"], json!({"source":"test"}));
-        assert_eq!(upstream["previous_response_id"], "resp-1");
+        assert!(upstream.get("previous_response_id").is_none());
         assert!(
             upstream.get("max_output_tokens").is_none(),
             "responses requests should drop unsupported output limit parameters",
@@ -2283,12 +2277,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_gateway_request_allows_orphan_tool_output_when_previous_response_id_exists() {
+    async fn prepare_gateway_request_rejects_orphan_tool_output_without_continuation_support() {
         let headers = axum::http::HeaderMap::new();
         let body = Body::from(
             r#"{
                 "model":"gpt-5.3-codex",
-                "previous_response_id":"resp-1",
                 "input":[
                     {"type":"function_call_output","call_id":"callauto12","output":"{\"ok\":true}"}
                 ]
@@ -2304,14 +2297,10 @@ mod tests {
             1024 * 1024,
         )
         .await
-        .expect("incremental tool output should normalize");
+        .expect_err("orphan tool output should be rejected");
 
-        let upstream: serde_json::Value =
-            serde_json::from_slice(&prepared.request_body).expect("upstream body json");
-
-        assert_eq!(upstream["previous_response_id"], "resp-1");
-        assert_eq!(upstream["input"][0]["type"], "function_call_output");
-        assert_eq!(upstream["input"][0]["call_id"], "callauto12");
+        assert_eq!(prepared.status, StatusCode::BAD_REQUEST);
+        assert!(prepared.message.contains("unknown function call"));
     }
 
     #[tokio::test]

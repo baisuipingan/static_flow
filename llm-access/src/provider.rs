@@ -24,11 +24,6 @@ use llm_access_codex::{
         convert_json_response_to_anthropic_message, convert_response_event_to_anthropic_sse_chunks,
         AnthropicStreamMetadata,
     },
-    continuation::{
-        expand_local_previous_response_id, rewrite_completed_response_for_local_continuation,
-        rewrite_response_value_ids, stored_response_anchor_from_rewritten_response,
-        ResponsesContinuationMetadata,
-    },
     request::{
         apply_gpt53_codex_spark_mapping, external_origin, extract_client_ip_from_headers,
         extract_last_message_content as extract_codex_last_message_content,
@@ -38,9 +33,8 @@ use llm_access_codex::{
     response::{
         adapt_completed_response_json, apply_upstream_response_headers,
         convert_json_response_to_chat_completion, convert_response_event_to_chat_chunk,
-        encode_json_sse_chunk, encode_sse_event, encode_sse_event_with_model_alias,
-        extract_usage_from_bytes, rewrite_json_response_model_alias,
-        rewrite_json_value_model_alias, SseUsageCollector,
+        encode_json_sse_chunk, encode_sse_event_with_model_alias, extract_usage_from_bytes,
+        rewrite_json_response_model_alias, rewrite_json_value_model_alias, SseUsageCollector,
     },
     types::{ChatStreamMetadata, GatewayResponseAdapter, PreparedGatewayRequest, UsageBreakdown},
 };
@@ -88,8 +82,8 @@ use llm_access_kiro::{
 use serde_json::{json, Value};
 
 use crate::{
-    activity::RequestActivityTracker, codex_anchor::CodexResponseAnchors, codex_refresh,
-    geoip::GeoIpResolver, kiro_headers, kiro_refresh,
+    activity::RequestActivityTracker, codex_refresh, geoip::GeoIpResolver, kiro_headers,
+    kiro_refresh,
 };
 
 const MAX_PROVIDER_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -319,7 +313,6 @@ pub struct ProviderState {
     admin_config_store: Arc<dyn AdminConfigStore>,
     dispatcher: Arc<dyn ProviderDispatcher>,
     kiro_cache_simulator: Arc<KiroCacheSimulator>,
-    codex_response_anchors: Arc<CodexResponseAnchors>,
     request_limiter: Arc<RequestLimiter>,
     codex_account_cooldowns: Arc<CodexAccountCooldowns>,
     kiro_request_scheduler: Arc<KiroRequestScheduler>,
@@ -335,7 +328,6 @@ pub struct ProviderDispatchDeps {
     geoip: GeoIpResolver,
     admin_config_store: Arc<dyn AdminConfigStore>,
     kiro_cache_simulator: Arc<KiroCacheSimulator>,
-    codex_response_anchors: Arc<CodexResponseAnchors>,
     request_limiter: Arc<RequestLimiter>,
     codex_account_cooldowns: Arc<CodexAccountCooldowns>,
     kiro_request_scheduler: Arc<KiroRequestScheduler>,
@@ -361,7 +353,6 @@ impl ProviderState {
             control_store,
             route_store,
             admin_config_store,
-            Arc::new(CodexResponseAnchors::default()),
             Arc::new(RequestActivityTracker::new()),
             GeoIpResolver::disabled(),
         )
@@ -371,7 +362,6 @@ impl ProviderState {
         control_store: Arc<dyn ControlStore>,
         route_store: Arc<dyn ProviderRouteStore>,
         admin_config_store: Arc<dyn AdminConfigStore>,
-        codex_response_anchors: Arc<CodexResponseAnchors>,
         request_activity: Arc<RequestActivityTracker>,
         geoip: GeoIpResolver,
     ) -> Self {
@@ -380,7 +370,6 @@ impl ProviderState {
             route_store,
             admin_config_store,
             Arc::new(DefaultProviderDispatcher),
-            codex_response_anchors,
             request_activity,
             geoip,
         )
@@ -397,7 +386,6 @@ impl ProviderState {
             route_store,
             Arc::new(EmptyAdminConfigStore),
             dispatcher,
-            Arc::new(CodexResponseAnchors::default()),
             Arc::new(RequestActivityTracker::new()),
             GeoIpResolver::disabled(),
         )
@@ -408,7 +396,6 @@ impl ProviderState {
         route_store: Arc<dyn ProviderRouteStore>,
         admin_config_store: Arc<dyn AdminConfigStore>,
         dispatcher: Arc<dyn ProviderDispatcher>,
-        codex_response_anchors: Arc<CodexResponseAnchors>,
         request_activity: Arc<RequestActivityTracker>,
         geoip: GeoIpResolver,
     ) -> Self {
@@ -419,7 +406,6 @@ impl ProviderState {
             admin_config_store,
             dispatcher,
             kiro_cache_simulator: Arc::new(KiroCacheSimulator::default()),
-            codex_response_anchors,
             request_limiter: Arc::new(RequestLimiter::default()),
             codex_account_cooldowns: Arc::new(CodexAccountCooldowns::default()),
             kiro_request_scheduler: KiroRequestScheduler::new(),
@@ -446,7 +432,6 @@ impl ProviderState {
             geoip: self.geoip.clone(),
             admin_config_store: Arc::clone(&self.admin_config_store),
             kiro_cache_simulator: Arc::clone(&self.kiro_cache_simulator),
-            codex_response_anchors: Arc::clone(&self.codex_response_anchors),
             request_limiter: Arc::clone(&self.request_limiter),
             codex_account_cooldowns: Arc::clone(&self.codex_account_cooldowns),
             kiro_request_scheduler: Arc::clone(&self.kiro_request_scheduler),
@@ -903,7 +888,6 @@ async fn dispatch_codex_proxy(
         control_store,
         geoip,
         admin_config_store,
-        codex_response_anchors,
         request_limiter,
         codex_account_cooldowns,
         ..
@@ -983,11 +967,6 @@ async fn dispatch_codex_proxy(
     };
     usage_meta =
         usage_meta.with_request_body(&body, clamp_duration_ms(body_read_started.elapsed()));
-    let body = maybe_expand_local_codex_previous_response_id(
-        &gateway_path,
-        body,
-        codex_response_anchors.as_ref(),
-    );
     let parse_started = Instant::now();
     let prepared = match prepare_gateway_request_from_bytes(
         &gateway_path,
@@ -1227,7 +1206,6 @@ async fn dispatch_codex_proxy(
                     key,
                     route,
                     control_store,
-                    codex_response_anchors,
                     permits,
                     usage_meta,
                 },
@@ -1246,7 +1224,6 @@ async fn dispatch_codex_proxy(
                 key,
                 route,
                 control_store,
-                codex_response_anchors,
                 permits,
                 usage_meta,
             })
@@ -1297,7 +1274,6 @@ async fn dispatch_codex_proxy(
                 key,
                 route,
                 control_store,
-                codex_response_anchors,
                 permits,
                 usage_meta,
             },
@@ -1311,7 +1287,6 @@ struct CodexUpstreamResponseContext {
     key: AuthenticatedKey,
     route: ProviderCodexRoute,
     control_store: Arc<dyn ControlStore>,
-    codex_response_anchors: Arc<CodexResponseAnchors>,
     permits: Vec<LimitPermit>,
     usage_meta: ProviderUsageMetadata,
 }
@@ -1325,7 +1300,6 @@ async fn adapt_codex_upstream_response(
         key,
         route,
         control_store,
-        codex_response_anchors,
         permits,
         mut usage_meta,
     } = ctx;
@@ -1384,25 +1358,11 @@ async fn adapt_codex_upstream_response(
                 );
             },
         };
-        let mut completed_response = rewrite_json_value_model_alias(
+        let completed_response = rewrite_json_value_model_alias(
             completed.response,
             prepared.model.as_deref(),
             prepared.client_visible_model.as_deref(),
         );
-        if prepared.response_adapter == GatewayResponseAdapter::Responses
-            && prepared.original_path.starts_with("/v1/responses")
-        {
-            rewrite_response_value_ids(
-                &mut completed_response,
-                &mut ResponsesContinuationMetadata::default(),
-            );
-            if let Ok(anchor) = stored_response_anchor_from_rewritten_response(
-                &prepared.request_body,
-                &completed_response,
-            ) {
-                codex_response_anchors.insert(anchor, Instant::now());
-            }
-        }
         let adapted = adapt_completed_response_json(
             completed_response,
             prepared.response_adapter,
@@ -1454,7 +1414,6 @@ async fn adapt_codex_upstream_response(
                 key,
                 route,
                 control_store,
-                codex_response_anchors,
                 permits,
                 usage_meta,
             },
@@ -1479,7 +1438,6 @@ async fn adapt_codex_upstream_response(
             key,
             route,
             control_store,
-            codex_response_anchors,
             permits,
             usage_meta,
         },
@@ -1499,7 +1457,6 @@ struct CodexCompletedResponseContext {
     key: AuthenticatedKey,
     route: ProviderCodexRoute,
     control_store: Arc<dyn ControlStore>,
-    codex_response_anchors: Arc<CodexResponseAnchors>,
     permits: Vec<LimitPermit>,
     usage_meta: ProviderUsageMetadata,
 }
@@ -1519,25 +1476,12 @@ async fn adapt_codex_upstream_response_from_parts(
         key,
         route,
         control_store,
-        codex_response_anchors,
         permits: _permits,
         mut usage_meta,
     } = ctx;
     usage_meta.mark_post_headers_body();
     usage_meta.mark_stream_finish();
-    let rewritten_responses_bytes = if status.is_success()
-        && prepared.response_adapter == GatewayResponseAdapter::Responses
-        && prepared.original_path.starts_with("/v1/responses")
-    {
-        maybe_rewrite_and_record_codex_response_anchor(
-            &prepared,
-            &bytes,
-            codex_response_anchors.as_ref(),
-        )
-    } else {
-        None
-    };
-    let effective_success_bytes = rewritten_responses_bytes.as_ref().unwrap_or(&bytes);
+    let effective_success_bytes = &bytes;
     let usage = if status.is_success() {
         extract_usage_from_bytes(effective_success_bytes).unwrap_or_else(missing_codex_usage)
     } else {
@@ -1592,8 +1536,6 @@ async fn adapt_codex_upstream_response_from_parts(
                     prepared.client_visible_model.as_deref(),
                 ) {
                     Body::from(body)
-                } else if let Some(body) = rewritten_responses_bytes {
-                    Body::from(body)
                 } else {
                     Body::from(bytes)
                 }
@@ -1639,45 +1581,6 @@ async fn adapt_codex_upstream_response_from_parts(
         .unwrap_or_else(|_| {
             (StatusCode::BAD_GATEWAY, "codex upstream response build failed").into_response()
         })
-}
-
-fn maybe_rewrite_and_record_codex_response_anchor(
-    prepared: &PreparedGatewayRequest,
-    bytes: &Bytes,
-    anchors: &CodexResponseAnchors,
-) -> Option<Bytes> {
-    let mut response = serde_json::from_slice::<Value>(bytes).ok()?;
-    let anchor =
-        rewrite_completed_response_for_local_continuation(&prepared.request_body, &mut response)
-            .ok()?;
-    let body = serde_json::to_vec(&response).ok()?;
-    anchors.insert(anchor, Instant::now());
-    Some(Bytes::from(body))
-}
-
-fn rewrite_codex_responses_sse_event(
-    event: &eventsource_stream::Event,
-    metadata: &mut ResponsesContinuationMetadata,
-    model_from: Option<&str>,
-    model_to: Option<&str>,
-) -> Bytes {
-    let payload = event.data.trim();
-    if payload.is_empty() || payload == "[DONE]" {
-        return encode_sse_event(event);
-    }
-    let Ok(value) = serde_json::from_str::<Value>(payload) else {
-        return encode_sse_event_with_model_alias(event, model_from, model_to);
-    };
-    let mut value = rewrite_json_value_model_alias(value, model_from, model_to);
-    rewrite_response_value_ids(&mut value, metadata);
-    let data = serde_json::to_string(&value).unwrap_or_else(|_| event.data.clone());
-    let rewritten_event = eventsource_stream::Event {
-        event: event.event.clone(),
-        data,
-        id: event.id.clone(),
-        retry: event.retry,
-    };
-    encode_sse_event(&rewritten_event)
 }
 
 fn codex_quota_exhaustion_cooldown(status: StatusCode, bytes: &Bytes) -> Option<Duration> {
@@ -1769,7 +1672,6 @@ struct CodexStreamContext {
     key: AuthenticatedKey,
     route: ProviderCodexRoute,
     control_store: Arc<dyn ControlStore>,
-    codex_response_anchors: Arc<CodexResponseAnchors>,
     permits: Vec<LimitPermit>,
     usage_meta: ProviderUsageMetadata,
 }
@@ -1788,7 +1690,6 @@ fn stream_codex_upstream_response(
             key,
             route,
             control_store,
-            codex_response_anchors,
             permits,
             usage_meta,
         } = ctx;
@@ -1799,7 +1700,6 @@ fn stream_codex_upstream_response(
             .eventsource();
         let mut chat_metadata = ChatStreamMetadata::default();
         let mut anthropic_metadata = AnthropicStreamMetadata::default();
-        let mut responses_metadata = ResponsesContinuationMetadata::default();
         let mut guard = CodexStreamRecordGuard {
             prepared,
             key,
@@ -1817,9 +1717,8 @@ fn stream_codex_upstream_response(
                     guard.usage_collector.observe_event(&event);
                     match response_adapter {
                         GatewayResponseAdapter::Responses => {
-                            let bytes = rewrite_codex_responses_sse_event(
+                            let bytes = encode_sse_event_with_model_alias(
                                 &event,
-                                &mut responses_metadata,
                                 guard.prepared.model.as_deref(),
                                 guard.prepared.client_visible_model.as_deref(),
                             );
@@ -1866,25 +1765,6 @@ fn stream_codex_upstream_response(
             let bytes = Bytes::from_static(b"data: [DONE]\n\n");
             guard.observe_chunk(&bytes, Some("done"));
             yield Ok::<Bytes, std::io::Error>(bytes);
-        }
-        if response_adapter == GatewayResponseAdapter::Responses
-            && guard.prepared.original_path.starts_with("/v1/responses")
-        {
-            if let Some(mut completed) = guard.usage_collector.completed_response.clone() {
-                completed = rewrite_json_value_model_alias(
-                    completed,
-                    guard.prepared.model.as_deref(),
-                    guard.prepared.client_visible_model.as_deref(),
-                );
-                rewrite_response_value_ids(&mut completed, &mut responses_metadata);
-                if let Ok(anchor) = stored_response_anchor_from_rewritten_response(
-                    &guard.prepared.request_body,
-                    &completed,
-                ) {
-                    codex_response_anchors.insert(anchor, Instant::now());
-                }
-                guard.usage_collector.completed_response = Some(completed);
-            }
         }
         guard.finish_success().await;
     };
@@ -5418,37 +5298,6 @@ async fn load_codex_dispatch_runtime_config(
 
 fn codex_user_agent(client_version: &str) -> String {
     format!("{DEFAULT_WIRE_ORIGINATOR}/{client_version}")
-}
-
-fn maybe_expand_local_codex_previous_response_id(
-    gateway_path: &str,
-    body: Bytes,
-    anchors: &CodexResponseAnchors,
-) -> Bytes {
-    if !matches!(gateway_path, "/v1/responses" | "/v1/responses/compact") {
-        return body;
-    }
-    let Ok(mut value) = serde_json::from_slice::<Value>(&body) else {
-        return body;
-    };
-    let Some(root) = value.as_object_mut() else {
-        return body;
-    };
-    let previous_response_id = root
-        .get("previous_response_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToString::to_string);
-    if previous_response_id.is_none() {
-        return body;
-    }
-    let anchor_items = previous_response_id
-        .as_deref()
-        .and_then(|response_id| anchors.get(response_id, Instant::now()))
-        .map(|anchor| anchor.history_items);
-    expand_local_previous_response_id(root, anchor_items.as_deref());
-    serde_json::to_vec(&value).map(Bytes::from).unwrap_or(body)
 }
 
 fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
@@ -9241,7 +9090,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_responses_round_trip_uses_local_previous_response_anchor() {
+    async fn codex_responses_passes_through_upstream_response_ids_without_local_anchor() {
         let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
             .expect("codex upstream env lock");
@@ -9287,13 +9136,9 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&first_body).expect("first json response");
         let previous_response_id = first_body["id"]
             .as_str()
-            .expect("local response id")
+            .expect("upstream response id")
             .to_string();
-        assert!(previous_response_id.starts_with("resp_"));
-        assert!(first_body["output"][0]["id"]
-            .as_str()
-            .expect("local message id")
-            .starts_with("msg_"));
+        assert_eq!(previous_response_id, "resp_1");
 
         let second = super::provider_entry(
             state,
@@ -9324,22 +9169,16 @@ mod tests {
         assert_eq!(second.status(), StatusCode::OK);
         let requests = captured.requests.lock().expect("captured requests");
         assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[1].body.get("previous_response_id"),
-            None,
-            "local anchor expansion should strip upstream previous_response_id"
-        );
+        assert_eq!(requests[1].body.get("previous_response_id"), None);
         let input = requests[1].body["input"]
             .as_array()
             .expect("upstream input array");
-        assert_eq!(input.len(), 3);
+        assert_eq!(input.len(), 1);
         assert_eq!(input[0]["role"], json!("user"));
-        assert_eq!(input[1]["role"], json!("assistant"));
-        assert_eq!(input[2]["role"], json!("user"));
     }
 
     #[tokio::test]
-    async fn codex_compact_round_trip_uses_local_previous_response_anchor() {
+    async fn codex_compact_drops_previous_response_id_without_local_anchor() {
         let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
             .expect("codex upstream env lock");
@@ -9385,9 +9224,9 @@ mod tests {
             serde_json::from_slice::<serde_json::Value>(&first_body).expect("first json response");
         let previous_response_id = first_body["id"]
             .as_str()
-            .expect("local response id")
+            .expect("upstream response id")
             .to_string();
-        assert!(previous_response_id.starts_with("resp_"));
+        assert_eq!(previous_response_id, "rs_compact_1");
 
         let second = super::provider_entry(
             state,
@@ -9413,18 +9252,12 @@ mod tests {
         assert_eq!(second.status(), StatusCode::OK);
         let requests = captured.requests.lock().expect("captured requests");
         assert_eq!(requests.len(), 2);
-        assert_eq!(
-            requests[1].body.get("previous_response_id"),
-            None,
-            "compact local anchor expansion should strip upstream previous_response_id"
-        );
+        assert_eq!(requests[1].body.get("previous_response_id"), None);
         let input = requests[1].body["input"]
             .as_array()
             .expect("upstream input array");
-        assert_eq!(input.len(), 3);
+        assert_eq!(input.len(), 1);
         assert_eq!(input[0]["role"], json!("user"));
-        assert_eq!(input[1]["role"], json!("assistant"));
-        assert_eq!(input[2]["role"], json!("user"));
     }
 
 

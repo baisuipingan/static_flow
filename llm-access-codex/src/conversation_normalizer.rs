@@ -14,11 +14,6 @@ struct PendingCall {
 
 /// Repair responses-style input items in place before final validation.
 pub fn repair_responses_request(root: &mut Map<String, Value>) -> CodexGatewayResult<()> {
-    let allow_orphan_outputs = root
-        .get("previous_response_id")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .is_some_and(|value| !value.is_empty());
     let Some(input) = root.get_mut("input") else {
         return Ok(());
     };
@@ -26,6 +21,7 @@ pub fn repair_responses_request(root: &mut Map<String, Value>) -> CodexGatewayRe
         return Ok(());
     };
 
+    let original_items = std::mem::take(items);
     let mut repaired = Vec::with_capacity(items.len());
     let mut pending_by_normalized = BTreeMap::<String, PendingCall>::new();
     let mut pending_order_by_original = BTreeMap::<String, VecDeque<String>>::new();
@@ -33,19 +29,24 @@ pub fn repair_responses_request(root: &mut Map<String, Value>) -> CodexGatewayRe
     let mut paired_call_indices = BTreeSet::<usize>::new();
     let mut next_message_id = 0usize;
 
-    for item in items.iter() {
-        let Some(obj) = item.as_object() else {
+    for item in original_items {
+        let Value::Object(obj) = item else {
+            repaired.push(item);
             continue;
         };
-        let item_type = obj.get("type").and_then(Value::as_str).unwrap_or_default();
-        match item_type {
+        let item_type = obj
+            .get("type")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string();
+        match item_type.as_str() {
             "message" => {
                 if let Some(message) = repair_message_item(obj, &mut next_message_id) {
                     repaired.push(Value::Object(message));
                 }
             },
             "function_call" | "custom_tool_call" => {
-                let Some(mut call) = repair_function_call_item(obj, item_type) else {
+                let Some(mut call) = repair_function_call_item(obj, item_type.as_str()) else {
                     continue;
                 };
                 let Some(original_call_id) =
@@ -72,7 +73,8 @@ pub fn repair_responses_request(root: &mut Map<String, Value>) -> CodexGatewayRe
                     .push_back(normalized_call_id);
             },
             "function_call_output" | "custom_tool_call_output" => {
-                let Some(mut output) = repair_function_call_output_item(obj, item_type) else {
+                let Some(mut output) = repair_function_call_output_item(obj, item_type.as_str())
+                else {
                     continue;
                 };
                 let Some(raw_call_id) =
@@ -85,16 +87,14 @@ pub fn repair_responses_request(root: &mut Map<String, Value>) -> CodexGatewayRe
                     &mut pending_by_normalized,
                     &mut pending_order_by_original,
                 ) else {
-                    if allow_orphan_outputs {
-                        repaired.push(Value::Object(output));
-                    }
+                    repaired.push(Value::Object(output));
                     continue;
                 };
                 output.insert("call_id".to_string(), Value::String(normalized_call_id));
                 repaired.push(Value::Object(output));
                 paired_call_indices.insert(retained_index);
             },
-            _ => repaired.push(item.clone()),
+            _ => repaired.push(Value::Object(obj)),
         }
     }
 
@@ -117,27 +117,26 @@ pub fn repair_responses_request(root: &mut Map<String, Value>) -> CodexGatewayRe
 }
 
 fn repair_message_item(
-    obj: &Map<String, Value>,
+    mut obj: Map<String, Value>,
     next_message_id: &mut usize,
 ) -> Option<Map<String, Value>> {
-    let role = obj.get("role").and_then(Value::as_str)?.trim();
+    let role = obj.get("role").and_then(Value::as_str)?.trim().to_string();
     if role.is_empty() {
         return None;
     }
-    let mut out = obj.clone();
-    let repaired_content = repair_message_content(out.get("content"), role)?;
-    out.insert("content".to_string(), Value::Array(repaired_content));
+    let content = obj.remove("content")?;
+    let repaired_content = repair_message_content(content, role.as_str())?;
+    obj.insert("content".to_string(), Value::Array(repaired_content));
 
-    if let Some(raw_id) = extract_non_empty_string(out.get("id")) {
+    if let Some(raw_id) = extract_non_empty_string(obj.get("id")) {
         if !raw_id.starts_with("msg_") {
-            out.insert("id".to_string(), Value::String(next_message_id_value(next_message_id)));
+            obj.insert("id".to_string(), Value::String(next_message_id_value(next_message_id)));
         }
     }
-    Some(out)
+    Some(obj)
 }
 
-fn repair_message_content(content: Option<&Value>, role: &str) -> Option<Vec<Value>> {
-    let content = content?;
+fn repair_message_content(content: Value, role: &str) -> Option<Vec<Value>> {
     let role_part_type = if role == "assistant" { "output_text" } else { "input_text" };
     let mut repaired = Vec::new();
     match content {
@@ -177,8 +176,8 @@ fn repair_message_content(content: Option<&Value>, role: &str) -> Option<Vec<Val
     (!repaired.is_empty()).then_some(repaired)
 }
 
-fn repair_message_content_part(item: &Value, role_part_type: &str, role: &str) -> Option<Value> {
-    if let Some(text) = item.as_str() {
+fn repair_message_content_part(item: Value, role_part_type: &str, role: &str) -> Option<Value> {
+    if let Value::String(text) = item {
         let trimmed = text.trim();
         return (!trimmed.is_empty()).then(|| {
             json!({
@@ -187,7 +186,9 @@ fn repair_message_content_part(item: &Value, role_part_type: &str, role: &str) -
             })
         });
     }
-    let obj = item.as_object()?;
+    let Value::Object(obj) = item else {
+        return None;
+    };
     let item_type = obj.get("type").and_then(Value::as_str).unwrap_or_default();
     match item_type {
         "text" | "input_text" | "output_text" => obj
@@ -201,13 +202,13 @@ fn repair_message_content_part(item: &Value, role_part_type: &str, role: &str) -
                     "text": text,
                 })
             }),
-        "input_image" | "image_url" if role != "assistant" => Some(item.clone()),
+        "input_image" | "image_url" if role != "assistant" => Some(Value::Object(obj)),
         _ => None,
     }
 }
 
 fn repair_function_call_item(
-    obj: &Map<String, Value>,
+    mut obj: Map<String, Value>,
     item_type: &str,
 ) -> Option<Map<String, Value>> {
     let call_id = extract_non_empty_string(obj.get("call_id").or_else(|| obj.get("id")))?;
@@ -219,17 +220,15 @@ fn repair_function_call_item(
     match item_type {
         "custom_tool_call" => {
             let input = obj
-                .get("input")
-                .cloned()
-                .or_else(|| obj.get("arguments").cloned())
+                .remove("input")
+                .or_else(|| obj.remove("arguments"))
                 .unwrap_or_else(|| Value::String(String::new()));
             out.insert("input".to_string(), normalize_custom_tool_input(input));
         },
         _ => {
             let arguments = obj
-                .get("arguments")
-                .cloned()
-                .or_else(|| obj.get("input").cloned())
+                .remove("arguments")
+                .or_else(|| obj.remove("input"))
                 .unwrap_or_else(|| Value::String("{}".to_string()));
             out.insert("arguments".to_string(), normalize_arguments(arguments));
         },
@@ -238,7 +237,7 @@ fn repair_function_call_item(
 }
 
 fn repair_function_call_output_item(
-    obj: &Map<String, Value>,
+    mut obj: Map<String, Value>,
     item_type: &str,
 ) -> Option<Map<String, Value>> {
     let call_id = extract_non_empty_string(obj.get("call_id"))?;
@@ -247,8 +246,7 @@ fn repair_function_call_output_item(
     out.insert("call_id".to_string(), Value::String(call_id.to_string()));
     out.insert(
         "output".to_string(),
-        obj.get("output")
-            .cloned()
+        obj.remove("output")
             .unwrap_or_else(|| Value::String(String::new())),
     );
     Some(out)

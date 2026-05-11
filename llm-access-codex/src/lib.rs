@@ -1,7 +1,6 @@
 //! Codex/OpenAI-compatible request and response behavior for LLM access.
 
 pub mod anthropic_messages;
-pub mod continuation;
 pub mod conversation_normalizer;
 pub mod error;
 pub mod instructions;

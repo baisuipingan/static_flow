@@ -87,6 +87,21 @@ Key rules:
   to `localhost:3000/api` and breaks public users.
 - Agents may inherit local proxy env vars; unset them for direct-public checks.
 - `/_caddy_health` only proves Caddy is alive, not the full pb-mapper data path.
+- Live GCP `llm-access.service` and `llm-access-usage-worker.service` run as
+  `ts_user`, not `llm-access`; do not change the systemd templates back to a
+  non-existent service user unless you also provision that user on the host.
+- Cloud `llm-access` API and usage worker releases must stay independently
+  deployable. Use `scripts/release_llm_access_cloud_api_only.sh` when only the
+  API binary/unit changed, and `scripts/release_llm_access_cloud_worker_only.sh`
+  when only the worker changed. Do not restart the other service just because
+  you are shipping one side.
+- For GCP `llm-access` memory changes, remember that
+  `/etc/systemd/system/llm-access.service.d/resource-guard.conf` can override
+  the base unit. Raising the limit in the template alone is not sufficient if a
+  later drop-in still pins the old ceiling.
+- Keep `/admin/kiro-gateway` Overview lightweight. Do not eagerly fetch full
+  `accounts`/`keys`/`groups` inventory on first paint when the tab only needs
+  summary/config/cache preview data.
 
 For full GCP/Valkey/JuiceFS/systemd details and emergency recovery, see
 `docs/ops-runbook.md`.

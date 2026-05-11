@@ -2,7 +2,6 @@
 
 mod activity;
 mod admin;
-mod codex_anchor;
 mod codex_refresh;
 mod codex_status;
 /// Command-line and environment configuration.
@@ -140,7 +139,6 @@ pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
         runtime.control_store(),
         runtime.provider_route_store(),
         runtime.admin_config_store(),
-        runtime.codex_response_anchors(),
         Arc::clone(&request_activity),
         geoip.clone(),
     );
