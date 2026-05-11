@@ -822,20 +822,6 @@ fn parse_responses_tool_input_value(item_obj: &Map<String, Value>, item_type: &s
     }
 }
 
-fn responses_tool_input_string(item_obj: &Map<String, Value>, item_type: &str) -> String {
-    let value = match item_type {
-        "custom_tool_call" => item_obj.get("input"),
-        _ => item_obj.get("arguments"),
-    };
-    value.map_or_else(String::new, |raw| {
-        if let Some(text) = raw.as_str() {
-            text.to_string()
-        } else {
-            serde_json::to_string(raw).unwrap_or_else(|_| String::new())
-        }
-    })
-}
-
 fn tool_input_delta_text(value: &Value) -> &str {
     value
         .get("delta")
@@ -843,6 +829,98 @@ fn tool_input_delta_text(value: &Value) -> &str {
         .or_else(|| value.get("arguments"))
         .and_then(Value::as_str)
         .unwrap_or("")
+}
+
+fn anthropic_client_tool_block(
+    item_obj: &Map<String, Value>,
+    name: String,
+    input: Value,
+) -> Option<Value> {
+    let call_id = item_obj
+        .get("call_id")
+        .or_else(|| item_obj.get("id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(json!({
+        "type": "tool_use",
+        "id": call_id,
+        "name": name,
+        "input": input,
+    }))
+}
+
+fn anthropic_server_tool_block(
+    item_obj: &Map<String, Value>,
+    name: &str,
+    input: Value,
+) -> Option<Value> {
+    let tool_id = item_obj
+        .get("id")
+        .or_else(|| item_obj.get("call_id"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    Some(json!({
+        "type": "server_tool_use",
+        "id": tool_id,
+        "name": name,
+        "input": input,
+    }))
+}
+
+fn anthropic_tool_block_from_responses_item(
+    item_obj: &Map<String, Value>,
+    item_type: &str,
+    tool_name_restore_map: Option<&BTreeMap<String, String>>,
+) -> Option<Value> {
+    match item_type {
+        "function_call" | "custom_tool_call" => {
+            let name = item_obj
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| restore_tool_name(name, tool_name_restore_map))
+                .unwrap_or_else(|| "tool".to_string());
+            anthropic_client_tool_block(
+                item_obj,
+                name,
+                parse_responses_tool_input_value(item_obj, item_type),
+            )
+        },
+        "local_shell_call" => anthropic_client_tool_block(
+            item_obj,
+            "local_shell".to_string(),
+            item_obj.get("action").cloned().unwrap_or_else(|| json!({})),
+        ),
+        "web_search_call" => anthropic_server_tool_block(
+            item_obj,
+            "web_search",
+            item_obj.get("action").cloned().unwrap_or_else(|| json!({})),
+        ),
+        "image_generation_call" => {
+            let mut input = Map::new();
+            if let Some(status) = item_obj.get("status") {
+                input.insert("status".to_string(), status.clone());
+            }
+            if let Some(revised_prompt) = item_obj.get("revised_prompt") {
+                input.insert("revised_prompt".to_string(), revised_prompt.clone());
+            }
+            if let Some(result) = item_obj.get("result") {
+                input.insert("result".to_string(), result.clone());
+            }
+            anthropic_server_tool_block(item_obj, "image_generation", Value::Object(input))
+        },
+        _ => None,
+    }
+}
+
+fn anthropic_block_input_string(block: &Value) -> String {
+    let input = block.get("input").cloned().unwrap_or_else(|| json!({}));
+    if let Some(text) = input.as_str() {
+        text.to_string()
+    } else {
+        serde_json::to_string(&input).unwrap_or_else(|_| String::new())
+    }
 }
 
 fn anthropic_usage_from_response(source: &Value) -> Value {
@@ -885,7 +963,9 @@ fn stop_reason(source: &Value) -> &'static str {
             items.iter().any(|item| {
                 item.get("type")
                     .and_then(Value::as_str)
-                    .is_some_and(|kind| matches!(kind, "function_call" | "custom_tool_call"))
+                    .is_some_and(|kind| {
+                        matches!(kind, "function_call" | "custom_tool_call" | "local_shell_call")
+                    })
             })
         })
     {
@@ -936,27 +1016,18 @@ pub fn map_response_to_anthropic_message(
                         }
                     }
                 },
-                "function_call" | "custom_tool_call" => {
-                    let Some(call_id) = item_obj
-                        .get("call_id")
-                        .or_else(|| item_obj.get("id"))
-                        .and_then(Value::as_str)
-                        .map(str::trim)
-                        .filter(|value| !value.is_empty())
-                    else {
-                        continue;
-                    };
-                    let name = item_obj
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(|name| restore_tool_name(name, tool_name_restore_map))
-                        .unwrap_or_else(|| "tool".to_string());
-                    content.push(json!({
-                        "type": "tool_use",
-                        "id": call_id,
-                        "name": name,
-                        "input": parse_responses_tool_input_value(item_obj, item_type),
-                    }));
+                "function_call"
+                | "custom_tool_call"
+                | "local_shell_call"
+                | "web_search_call"
+                | "image_generation_call" => {
+                    if let Some(block) = anthropic_tool_block_from_responses_item(
+                        item_obj,
+                        item_type,
+                        tool_name_restore_map,
+                    ) {
+                        content.push(block);
+                    }
                 },
                 _ => {},
             }
@@ -1163,7 +1234,7 @@ fn emit_full_response_as_anthropic_stream(
                         }),
                     ));
                 },
-                Some("tool_use") => {
+                Some("tool_use") | Some("server_tool_use") => {
                     let lookup_key = item
                         .get("id")
                         .and_then(Value::as_str)
@@ -1253,34 +1324,41 @@ pub fn convert_response_event_to_anthropic_sse_chunks(
                 return Vec::new();
             };
             let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-            if !matches!(item_type, "function_call" | "custom_tool_call") {
+            if !matches!(
+                item_type,
+                "function_call"
+                    | "custom_tool_call"
+                    | "local_shell_call"
+                    | "web_search_call"
+                    | "image_generation_call"
+            ) {
                 return Vec::new();
             }
-            let Some((lookup_key, call_id)) = stream_tool_call_identity_from_item(item) else {
+            let Some((lookup_key, _tool_id)) = stream_tool_call_identity_from_item(item) else {
                 return Vec::new();
             };
             push_message_start(&mut chunks, &value, metadata);
-            let payload = item
-                .as_object()
-                .map(|obj| responses_tool_input_string(obj, item_type))
-                .unwrap_or_default();
+            let Some(block) = item.as_object().and_then(|obj| {
+                anthropic_tool_block_from_responses_item(obj, item_type, tool_name_restore_map)
+            }) else {
+                return Vec::new();
+            };
+            let payload = anthropic_block_input_string(&block);
             let has_payload = !payload.is_empty() && payload != "{}";
             let existing = metadata.tool_block_state(&lookup_key).cloned();
             let index = metadata.mark_tool_block_started(&lookup_key, has_payload);
-            let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
-            let name = restore_tool_name(name, tool_name_restore_map);
             if existing.is_none() {
                 chunks.push(encode_named_json_sse_chunk(
                     "content_block_start",
                     &json!({
                         "type": "content_block_start",
                         "index": index,
-                        "content_block": {
-                            "type": "tool_use",
-                            "id": call_id,
-                            "name": name,
-                            "input": {},
-                        }
+                        "content_block": json!({
+                            "type": block.get("type").cloned().unwrap_or_else(|| json!("tool_use")),
+                            "id": block.get("id").cloned().unwrap_or(Value::Null),
+                            "name": block.get("name").cloned().unwrap_or_else(|| json!("tool")),
+                            "input": {}
+                        })
                     }),
                 ));
             }
@@ -1415,7 +1493,10 @@ mod tests {
     use eventsource_stream::Event as SseEvent;
     use serde_json::{json, Value};
 
-    use super::{convert_response_event_to_anthropic_sse_chunks, AnthropicStreamMetadata};
+    use super::{
+        convert_response_event_to_anthropic_sse_chunks, map_response_to_anthropic_message,
+        AnthropicStreamMetadata,
+    };
 
     fn sse_event(value: Value) -> SseEvent {
         SseEvent {
@@ -1507,5 +1588,68 @@ mod tests {
         assert_eq!(deltas.len(), 1);
         assert_eq!(stops.len(), 1);
         assert_eq!(deltas[0]["delta"]["partial_json"], json!("*** Begin Patch"));
+    }
+
+    #[test]
+    fn completed_anthropic_message_maps_client_and_server_side_tools() {
+        let value = json!({
+            "id": "resp_1",
+            "model": "gpt-5.3-codex",
+            "output": [
+                {
+                    "type": "local_shell_call",
+                    "call_id": "callshell1",
+                    "status": "completed",
+                    "action": {"type":"exec","command":["pwd"]}
+                },
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"type":"search","query":"weather seattle"}
+                },
+                {
+                    "type": "image_generation_call",
+                    "id": "ig_1",
+                    "status": "completed",
+                    "revised_prompt": "blue square",
+                    "result": "Zm9v"
+                }
+            ]
+        });
+
+        let mapped = map_response_to_anthropic_message(&value, None);
+        assert_eq!(mapped["content"][0]["type"], json!("tool_use"));
+        assert_eq!(mapped["content"][0]["name"], json!("local_shell"));
+        assert_eq!(mapped["content"][1]["type"], json!("server_tool_use"));
+        assert_eq!(mapped["content"][1]["name"], json!("web_search"));
+        assert_eq!(mapped["content"][2]["type"], json!("server_tool_use"));
+        assert_eq!(mapped["content"][2]["name"], json!("image_generation"));
+        assert_eq!(mapped["stop_reason"], json!("tool_use"));
+    }
+
+    #[test]
+    fn streamed_web_search_call_maps_to_server_tool_use_block() {
+        let mut metadata = AnthropicStreamMetadata::default();
+        let done = sse_event(json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {"type":"search","query":"weather seattle"}
+            }
+        }));
+
+        let chunks =
+            convert_response_event_to_anthropic_sse_chunks(&done, None, &mut metadata, None, None);
+
+        let starts = parse_named_sse_json(&chunks, "content_block_start");
+        let deltas = parse_named_sse_json(&chunks, "content_block_delta");
+        assert_eq!(starts.len(), 1);
+        assert_eq!(starts[0]["content_block"]["type"], json!("server_tool_use"));
+        assert_eq!(starts[0]["content_block"]["name"], json!("web_search"));
+        assert_eq!(deltas.len(), 1);
+        assert_eq!(deltas[0]["delta"]["type"], json!("input_json_delta"));
     }
 }

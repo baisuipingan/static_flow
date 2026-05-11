@@ -108,6 +108,75 @@ fn responses_tool_call_event_delta_text(value: &Value) -> &str {
         .unwrap_or("")
 }
 
+fn serialize_json_string(value: &Value, default: &str) -> String {
+    if let Some(text) = value.as_str() {
+        return text.to_string();
+    }
+    serde_json::to_string(value).unwrap_or_else(|_| default.to_string())
+}
+
+fn chat_tool_call_from_responses_item(
+    item_obj: &Map<String, Value>,
+    item_type: &str,
+    tool_name_restore_map: Option<&BTreeMap<String, String>>,
+) -> Option<Value> {
+    match item_type {
+        "function_call" | "custom_tool_call" => {
+            let call_id = item_obj
+                .get("call_id")
+                .or_else(|| item_obj.get("id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let name = item_obj
+                .get("name")
+                .and_then(Value::as_str)
+                .map(|name| restore_openai_tool_name(name, tool_name_restore_map))
+                .unwrap_or_else(|| "tool".to_string());
+            let arguments = responses_tool_call_arguments_string(item_obj, item_type);
+            Some(json!({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": name,
+                    "arguments": arguments
+                }
+            }))
+        },
+        "local_shell_call" => {
+            let call_id = item_obj
+                .get("call_id")
+                .or_else(|| item_obj.get("id"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|value| !value.is_empty())?;
+            let arguments = item_obj
+                .get("action")
+                .map(|action| serialize_json_string(action, "{}"))
+                .unwrap_or_else(|| "{}".to_string());
+            Some(json!({
+                "id": call_id,
+                "type": "function",
+                "function": {
+                    "name": "local_shell",
+                    "arguments": arguments
+                }
+            }))
+        },
+        _ => None,
+    }
+}
+
+fn chat_extension_item_from_responses_item(
+    item_obj: &Map<String, Value>,
+    item_type: &str,
+) -> Option<Value> {
+    match item_type {
+        "web_search_call" | "image_generation_call" => Some(Value::Object(item_obj.clone())),
+        _ => None,
+    }
+}
+
 /// Adapt a completed responses payload into the classic chat/completions
 /// schema.
 fn map_response_to_chat_completion(
@@ -132,6 +201,7 @@ fn map_response_to_chat_completion(
 
     let mut assistant_text = String::new();
     let mut tool_calls = Vec::<Value>::new();
+    let mut codex_output_items = Vec::<Value>::new();
     if let Some(output_items) = source.get("output").and_then(Value::as_array) {
         for item in output_items {
             let Some(item_obj) = item.as_object() else {
@@ -147,33 +217,25 @@ fn map_response_to_chat_completion(
                         map_response_content_text(content, &mut assistant_text);
                     }
                 },
-                "function_call" | "custom_tool_call" => {
-                    let Some(call_id) = item_obj
-                        .get("call_id")
-                        .or_else(|| item_obj.get("id"))
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                    else {
-                        continue;
-                    };
-                    let name = item_obj
-                        .get("name")
-                        .and_then(Value::as_str)
-                        .map(|name| restore_openai_tool_name(name, tool_name_restore_map))
-                        .unwrap_or_else(|| "tool".to_string());
-                    let arguments = responses_tool_call_arguments_string(item_obj, item_type);
-                    tool_calls.push(json!({
-                        "id": call_id,
-                        "type": "function",
-                        "function": {
-                            "name": name,
-                            "arguments": arguments
-                        }
-                    }));
+                "function_call" | "custom_tool_call" | "local_shell_call" => {
+                    if let Some(tool_call) = chat_tool_call_from_responses_item(
+                        item_obj,
+                        item_type,
+                        tool_name_restore_map,
+                    ) {
+                        tool_calls.push(tool_call);
+                    }
                 },
                 "function_call_output" | "custom_tool_call_output" => {
                     if let Some(output) = item_obj.get("output") {
                         map_response_content_text(output, &mut assistant_text);
+                    }
+                },
+                "web_search_call" | "image_generation_call" => {
+                    if let Some(extension) =
+                        chat_extension_item_from_responses_item(item_obj, item_type)
+                    {
+                        codex_output_items.push(extension);
                     }
                 },
                 _ => {},
@@ -189,6 +251,9 @@ fn map_response_to_chat_completion(
     );
     if !tool_calls.is_empty() {
         message.insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    if !codex_output_items.is_empty() {
+        message.insert("codex_output_items".to_string(), Value::Array(codex_output_items));
     }
 
     let mut out = Map::new();
@@ -207,7 +272,9 @@ fn map_response_to_chat_completion(
                 .is_some_and(|items| items.iter().any(|item| {
                     item.get("type")
                         .and_then(Value::as_str)
-                        .is_some_and(|kind| matches!(kind, "function_call" | "custom_tool_call"))
+                        .is_some_and(|kind| {
+                            matches!(kind, "function_call" | "custom_tool_call" | "local_shell_call")
+                        })
                 })) {
                 "tool_calls"
             } else {
@@ -448,15 +515,17 @@ fn convert_response_value_to_chat_chunk(
         "response.output_item.added" | "response.output_item.done" => {
             let item = value.get("item").or_else(|| value.get("output_item"))?;
             let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-            if matches!(item_type, "function_call" | "custom_tool_call") {
+            if matches!(item_type, "function_call" | "custom_tool_call" | "local_shell_call") {
                 let (lookup_key, call_id) = stream_tool_call_identity_from_item(item)?;
                 let tool_call_index = metadata.tool_call_index(&lookup_key);
-                let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
-                let name = restore_openai_tool_name(name, tool_name_restore_map);
-                let arguments = item
-                    .as_object()
-                    .map(|obj| responses_tool_call_arguments_string(obj, item_type))
-                    .unwrap_or_else(|| "{}".to_string());
+                let tool_call = item.as_object().and_then(|obj| {
+                    chat_tool_call_from_responses_item(obj, item_type, tool_name_restore_map)
+                })?;
+                let name = tool_call["function"]["name"].as_str().unwrap_or("tool");
+                let arguments = tool_call["function"]["arguments"]
+                    .as_str()
+                    .unwrap_or("{}")
+                    .to_string();
                 let has_payload = !arguments.is_empty() && arguments != "{}";
                 let should_emit = if chunk_type == "response.output_item.added" {
                     metadata.mark_tool_call_started(&lookup_key, has_payload)
@@ -492,6 +561,25 @@ fn convert_response_value_to_chat_chunk(
                         "finish_reason": Value::Null
                     }]
                 }));
+            }
+            if let Some(item_obj) = item.as_object() {
+                if let Some(extension) =
+                    chat_extension_item_from_responses_item(item_obj, item_type)
+                {
+                    return Some(json!({
+                        "id": stream_event_response_id(value),
+                        "object": "chat.completion.chunk",
+                        "created": stream_event_created(value),
+                        "model": stream_event_model(value),
+                        "choices": [{
+                            "index": 0,
+                            "delta": {
+                                "codex_output_items": [extension]
+                            },
+                            "finish_reason": Value::Null
+                        }]
+                    }));
+                }
             }
             None
         },
@@ -537,7 +625,10 @@ fn convert_response_value_to_chat_chunk(
                         item.get("type")
                             .and_then(Value::as_str)
                             .is_some_and(|kind| {
-                                matches!(kind, "function_call" | "custom_tool_call")
+                                matches!(
+                                    kind,
+                                    "function_call" | "custom_tool_call" | "local_shell_call"
+                                )
                             })
                     })
                 }) {
@@ -723,6 +814,71 @@ mod tests {
             json!("*** Begin Patch")
         );
         assert!(done_chunk.is_none());
+    }
+
+    #[test]
+    fn completed_chat_completion_maps_local_shell_call_and_preserves_server_tools() {
+        let value = json!({
+            "id": "resp_1",
+            "model": "gpt-5.3-codex",
+            "output": [
+                {
+                    "type": "local_shell_call",
+                    "call_id": "callshell1",
+                    "status": "completed",
+                    "action": {"type":"exec","command":["pwd"]}
+                },
+                {
+                    "type": "web_search_call",
+                    "id": "ws_1",
+                    "status": "completed",
+                    "action": {"type":"search","query":"weather seattle"}
+                },
+                {
+                    "type": "image_generation_call",
+                    "id": "ig_1",
+                    "status": "completed",
+                    "revised_prompt": "blue square",
+                    "result": "Zm9v"
+                }
+            ]
+        });
+
+        let mapped = super::map_response_to_chat_completion(&value, None);
+        assert_eq!(
+            mapped["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            json!("local_shell")
+        );
+        assert_eq!(
+            mapped["choices"][0]["message"]["codex_output_items"][0]["type"],
+            json!("web_search_call")
+        );
+        assert_eq!(
+            mapped["choices"][0]["message"]["codex_output_items"][1]["type"],
+            json!("image_generation_call")
+        );
+        assert_eq!(mapped["choices"][0]["finish_reason"], json!("tool_calls"));
+    }
+
+    #[test]
+    fn streamed_web_search_call_is_preserved_as_chat_extension_chunk() {
+        let mut metadata = ChatStreamMetadata::default();
+        let value = json!({
+            "type": "response.output_item.done",
+            "item": {
+                "type": "web_search_call",
+                "id": "ws_1",
+                "status": "completed",
+                "action": {"type":"search","query":"weather seattle"}
+            }
+        });
+
+        let chunk =
+            convert_response_value_to_chat_chunk(&value, None, &mut metadata).expect("chunk");
+        assert_eq!(
+            chunk["choices"][0]["delta"]["codex_output_items"][0]["type"],
+            json!("web_search_call")
+        );
     }
 }
 
