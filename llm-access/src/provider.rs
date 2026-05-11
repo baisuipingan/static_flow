@@ -26,6 +26,7 @@ use llm_access_codex::{
     },
     request::{
         apply_gpt53_codex_spark_mapping, external_origin, extract_client_ip_from_headers,
+        extract_last_message_content as extract_codex_last_message_content,
         prepare_gateway_request_from_bytes, resolve_request_url_from_headers,
         serialize_headers_json,
     },
@@ -78,7 +79,7 @@ use llm_access_kiro::{
         UserInputMessageContext,
     },
 };
-use serde_json::Value;
+use serde_json::{json, Value};
 
 use crate::{
     activity::RequestActivityTracker, codex_refresh, geoip::GeoIpResolver, kiro_headers,
@@ -293,6 +294,14 @@ fn capture_upstream_request_body_json(meta: &mut ProviderUsageMetadata, body: &[
 fn captured_body_json(body: &Option<Bytes>) -> Option<String> {
     body.as_ref()
         .map(|bytes| String::from_utf8_lossy(bytes.as_ref()).into_owned())
+}
+
+fn extract_model_from_json_body(body: &Bytes) -> Option<String> {
+    serde_json::from_slice::<Value>(body)
+        .ok()
+        .and_then(|value| value.get("model").cloned())
+        .and_then(|value| value.as_str().map(str::trim).map(str::to_string))
+        .filter(|value| !value.is_empty())
 }
 
 /// Shared provider request state.
@@ -939,7 +948,22 @@ async fn dispatch_codex_proxy(
     let body_read_started = Instant::now();
     let body = match to_bytes(request.into_body(), MAX_PROVIDER_PROXY_BODY_BYTES).await {
         Ok(body) => body,
-        Err(_) => return (StatusCode::BAD_REQUEST, "request body is too large").into_response(),
+        Err(_) => {
+            record_codex_preflight_failure(CodexPreflightFailureRecord {
+                control_store: control_store.as_ref(),
+                key: &key,
+                endpoint: &gateway_path,
+                model: None,
+                status: StatusCode::BAD_REQUEST,
+                meta: &mut usage_meta,
+            })
+            .await;
+            return codex_surface_error_response(
+                &gateway_path,
+                StatusCode::BAD_REQUEST,
+                "request body is too large",
+            );
+        },
     };
     usage_meta =
         usage_meta.with_request_body(&body, clamp_duration_ms(body_read_started.elapsed()));
@@ -949,11 +973,34 @@ async fn dispatch_codex_proxy(
         &query,
         method,
         &request_headers,
-        body,
+        body.clone(),
         MAX_PROVIDER_PROXY_BODY_BYTES,
     ) {
         Ok(prepared) => prepared,
-        Err(err) => return (err.status, err.message).into_response(),
+        Err(err) => {
+            capture_client_request_body_json(&mut usage_meta, &body);
+            if usage_meta.last_message_content.is_none() {
+                usage_meta.last_message_content =
+                    extract_codex_last_message_content(&body).ok().flatten();
+            }
+            tracing::error!(
+                key_id = %key.key_id,
+                endpoint = %gateway_path,
+                status = %err.status,
+                error_message = %err.message,
+                "codex request rejected before upstream dispatch"
+            );
+            record_codex_preflight_failure(CodexPreflightFailureRecord {
+                control_store: control_store.as_ref(),
+                key: &key,
+                endpoint: &gateway_path,
+                model: extract_model_from_json_body(&body),
+                status: err.status,
+                meta: &mut usage_meta,
+            })
+            .await;
+            return codex_surface_error_response(&gateway_path, err.status, &err.message);
+        },
     };
     usage_meta.mark_pre_handler_done(clamp_duration_ms(parse_started.elapsed()));
     usage_meta.last_message_content = prepared.last_message_content.clone();
@@ -1412,6 +1459,26 @@ async fn adapt_codex_upstream_response_from_parts(
     {
         return (StatusCode::INTERNAL_SERVER_ERROR, format!("failed to record codex usage: {err}"))
             .into_response();
+    }
+    if !status.is_success()
+        && prepared.response_adapter == GatewayResponseAdapter::AnthropicMessages
+    {
+        let message = summarize_codex_upstream_error_bytes(&bytes);
+        let body = json!({
+            "error": {
+                "type": codex_error_type_for_status(status),
+                "message": message,
+            }
+        });
+        let builder = Response::builder()
+            .status(status)
+            .header(header::CONTENT_TYPE, "application/json")
+            .header(header::CACHE_CONTROL, "no-store");
+        return apply_upstream_response_headers(builder, &upstream_headers)
+            .body(Body::from(body.to_string()))
+            .unwrap_or_else(|_| {
+                (StatusCode::BAD_GATEWAY, "codex upstream response build failed").into_response()
+            });
     }
     let response_content_type =
         if status.is_success() && prepared.response_adapter != GatewayResponseAdapter::Responses {
@@ -4268,7 +4335,7 @@ fn kiro_error_reason(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn kiro_json_error(status: StatusCode, error_type: &str, message: &str) -> Response {
+fn anthropic_json_error(status: StatusCode, error_type: &str, message: &str) -> Response {
     let body = serde_json::json!({
         "error": {
             "type": error_type,
@@ -4282,6 +4349,80 @@ fn kiro_json_error(status: StatusCode, error_type: &str, message: &str) -> Respo
         .unwrap_or_else(|_| {
             (StatusCode::INTERNAL_SERVER_ERROR, "failed to build error").into_response()
         })
+}
+
+fn kiro_json_error(status: StatusCode, error_type: &str, message: &str) -> Response {
+    anthropic_json_error(status, error_type, message)
+}
+
+fn codex_error_type_for_status(status: StatusCode) -> &'static str {
+    if status.is_client_error() {
+        "invalid_request_error"
+    } else {
+        "api_error"
+    }
+}
+
+fn codex_json_error(status: StatusCode, message: &str) -> Response {
+    let body = json!({
+        "error": {
+            "message": message,
+            "type": codex_error_type_for_status(status),
+            "param": Value::Null,
+            "code": Value::Null,
+        }
+    });
+    Response::builder()
+        .status(status)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(Body::from(body.to_string()))
+        .unwrap_or_else(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "failed to build error").into_response()
+        })
+}
+
+fn codex_endpoint_prefers_anthropic_errors(endpoint: &str) -> bool {
+    endpoint == "/v1/messages" || endpoint.starts_with("/v1/messages?")
+}
+
+fn codex_surface_error_response(endpoint: &str, status: StatusCode, message: &str) -> Response {
+    if codex_endpoint_prefers_anthropic_errors(endpoint) {
+        anthropic_json_error(status, codex_error_type_for_status(status), message)
+    } else {
+        codex_json_error(status, message)
+    }
+}
+
+fn extract_error_message_from_json_value(value: &Value) -> Option<String> {
+    if let Some(message) = value.get("error").and_then(Value::as_str) {
+        return Some(message.to_string());
+    }
+    if let Some(error) = value.get("error").and_then(Value::as_object) {
+        if let Some(message) = error.get("message").and_then(Value::as_str) {
+            return Some(message.to_string());
+        }
+    }
+    value
+        .get("message")
+        .and_then(Value::as_str)
+        .map(ToString::to_string)
+}
+
+fn summarize_codex_upstream_error_bytes(bytes: &Bytes) -> String {
+    if let Ok(value) = serde_json::from_slice::<Value>(bytes.as_ref()) {
+        if let Some(message) = extract_error_message_from_json_value(&value)
+            .map(|message| message.trim().to_string())
+            .filter(|message| !message.is_empty())
+        {
+            return message;
+        }
+    }
+    let body = String::from_utf8_lossy(bytes.as_ref()).trim().to_string();
+    if body.is_empty() {
+        "Unknown upstream error".to_string()
+    } else {
+        body
+    }
 }
 
 fn kiro_conversion_error_response(err: ConversionError) -> Response {
@@ -5313,6 +5454,64 @@ fn sse_data_payloads(bytes: &[u8]) -> Vec<String> {
             }
         })
         .collect()
+}
+
+struct CodexPreflightFailureRecord<'a> {
+    control_store: &'a dyn ControlStore,
+    key: &'a AuthenticatedKey,
+    endpoint: &'a str,
+    model: Option<String>,
+    status: StatusCode,
+    meta: &'a mut ProviderUsageMetadata,
+}
+
+async fn record_codex_preflight_failure(record: CodexPreflightFailureRecord<'_>) {
+    record.meta.mark_stream_finish();
+    let event = UsageEvent {
+        event_id: format!("llm-usage-{}", uuid::Uuid::new_v4()),
+        created_at_ms: now_millis(),
+        provider_type: ProviderType::Codex,
+        protocol_family: codex_protocol_family_for_endpoint(record.endpoint),
+        key_id: record.key.key_id.clone(),
+        key_name: record.key.key_name.clone(),
+        account_name: None,
+        account_group_id_at_event: None,
+        route_strategy_at_event: None,
+        request_method: record.meta.request_method.clone(),
+        request_url: record.meta.request_url.clone(),
+        endpoint: record.endpoint.to_string(),
+        model: record.model,
+        mapped_model: None,
+        status_code: i64::from(record.status.as_u16()),
+        request_body_bytes: record.meta.request_body_bytes,
+        quota_failover_count: record.meta.quota_failover_count,
+        routing_diagnostics_json: record.meta.routing_diagnostics_json.clone(),
+        input_uncached_tokens: 0,
+        input_cached_tokens: 0,
+        output_tokens: 0,
+        billable_tokens: 0,
+        credit_usage: None,
+        usage_missing: true,
+        credit_usage_missing: false,
+        client_ip: record.meta.client_ip.clone(),
+        ip_region: record.meta.ip_region.clone(),
+        request_headers_json: record.meta.request_headers_json.clone(),
+        last_message_content: record.meta.last_message_content.clone(),
+        client_request_body_json: captured_body_json(&record.meta.client_request_body_json),
+        upstream_request_body_json: captured_body_json(&record.meta.upstream_request_body_json),
+        full_request_json: captured_body_json(&record.meta.full_request_json),
+        timing: record.meta.to_timing(),
+        stream: record.meta.to_stream_details(),
+    };
+    if let Err(err) = record.control_store.apply_usage_rollup_owned(event).await {
+        tracing::warn!(
+            key_id = %record.key.key_id,
+            endpoint = record.endpoint,
+            status = %record.status,
+            error = %err,
+            "failed to record codex preflight failure usage"
+        );
+    }
 }
 
 async fn record_codex_usage(
@@ -7430,6 +7629,64 @@ mod tests {
             .expect("unauthorized upstream response")
     }
 
+    async fn fake_codex_responses_always_bad_gateway(
+        State(captured): State<Arc<CapturedCodexUpstream>>,
+        headers: HeaderMap,
+        request: Request<Body>,
+    ) -> Response {
+        let path = request.uri().path().to_string();
+        let query = request.uri().query().map(ToString::to_string);
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("upstream request body");
+        let body = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice::<serde_json::Value>(&body).expect("upstream json")
+        };
+        captured
+            .requests
+            .lock()
+            .expect("captured requests")
+            .push(CapturedCodexRequest {
+                path,
+                query,
+                authorization: headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string),
+                accept: headers
+                    .get(header::ACCEPT)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string),
+                user_agent: headers
+                    .get(header::USER_AGENT)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string),
+                x_client_request_id: headers
+                    .get("x-client-request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string),
+                session_id: headers
+                    .get("session_id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string),
+                x_codex_turn_state: headers
+                    .get("x-codex-turn-state")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string),
+                body,
+            });
+
+        Response::builder()
+            .status(StatusCode::BAD_GATEWAY)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":{"message":"temporary upstream failure","type":"api_error","param":"unused","code":"bad_gateway"}}"#,
+            ))
+            .expect("bad gateway upstream response")
+    }
+
     async fn fake_codex_models(
         State(captured): State<Arc<CapturedCodexUpstream>>,
         headers: HeaderMap,
@@ -8335,6 +8592,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_dispatch_rejects_invalid_anthropic_messages_with_json_error_and_usage() {
+        let store = Arc::new(RecordingControlStore::default());
+        let state = super::ProviderState::new(store.clone(), static_codex_route_store());
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/api/llm-gateway/v1/messages")
+                .header("x-api-key", "codex-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from("[]"))
+                .expect("request"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body = serde_json::from_slice::<serde_json::Value>(&body).expect("json response");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("messages requires a JSON object body"));
+
+        let events = store.usage_events.lock().expect("usage events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status_code, 400);
+        assert_eq!(events[0].endpoint, "/v1/messages");
+        assert_eq!(events[0].request_url, "/api/llm-gateway/v1/messages");
+        assert_eq!(events[0].account_name, None);
+        assert!(events[0].client_request_body_json.is_some());
+    }
+
+    #[tokio::test]
+    async fn codex_dispatch_adapts_upstream_error_for_anthropic_messages() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("codex upstream env lock");
+        let captured = Arc::new(CapturedCodexUpstream::default());
+        let app = Router::new()
+            .route("/v1/responses", post(fake_codex_responses_always_bad_gateway))
+            .with_state(captured);
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake upstream");
+        });
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+
+        let store = Arc::new(RecordingControlStore::default());
+        let state = super::ProviderState::new(store.clone(), static_codex_route_store());
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/api/llm-gateway/v1/messages")
+                .header("x-api-key", "codex-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model": "gpt-5.3-codex",
+                        "max_tokens": 128,
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": false
+                    }"#,
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body = serde_json::from_slice::<serde_json::Value>(&body).expect("json response");
+        assert_eq!(body["error"]["type"], "api_error");
+        assert_eq!(body["error"]["message"], "temporary upstream failure");
+
+        let events = store.usage_events.lock().expect("usage events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status_code, 502);
+        assert_eq!(events[0].endpoint, "/v1/messages");
+        assert_eq!(events[0].account_name.as_deref(), Some("codex-a"));
+    }
+
+    #[tokio::test]
     async fn codex_dispatch_streams_anthropic_messages_events_from_responses_sse() {
         let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
@@ -8456,6 +8821,58 @@ mod tests {
         assert_eq!(event.output_tokens, 3);
         assert_eq!(event.billable_tokens, 25);
         assert!(!event.usage_missing);
+    }
+
+    #[tokio::test]
+    async fn codex_dispatch_rejects_chat_tool_call_without_output_with_json_error_and_usage() {
+        let store = Arc::new(RecordingControlStore::default());
+        let state = super::ProviderState::new(store.clone(), static_codex_route_store());
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::AUTHORIZATION, "Bearer codex-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model":"gpt-5.3-codex",
+                        "messages":[
+                            {"role":"user","content":"hello"},
+                            {"role":"assistant","tool_calls":[{"id":"callauto12","type":"function","function":{"name":"lookup","arguments":"{}"}}]}
+                        ]
+                    }"#,
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            response
+                .headers()
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body = serde_json::from_slice::<serde_json::Value>(&body).expect("json response");
+        assert_eq!(body["error"]["type"], "invalid_request_error");
+        assert!(body["error"]["message"]
+            .as_str()
+            .expect("error message")
+            .contains("No tool output found for function call callauto12"));
+
+        let events = store.usage_events.lock().expect("usage events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].status_code, 400);
+        assert_eq!(events[0].endpoint, "/v1/chat/completions");
+        assert_eq!(events[0].request_url, "/v1/chat/completions");
+        assert_eq!(events[0].account_name, None);
+        assert!(events[0].client_request_body_json.is_some());
+        assert!(events[0].upstream_request_body_json.is_none());
     }
 
     #[tokio::test]
