@@ -5241,37 +5241,34 @@ async fn forward_upstream_response(
                 match event {
                     Ok(event) => {
                         collector.observe_event(&event);
-                        match stream_response_adapter {
-                            GatewayResponseAdapter::Responses => {
+                        if stream_response_adapter == GatewayResponseAdapter::ChatCompletions {
+                            if let Some(chunk) = convert_response_event_to_chat_chunk(
+                                &event,
+                                Some(&stream_prepared.tool_name_restore_map),
+                                &mut chat_metadata,
+                                stream_prepared.model.as_deref(),
+                                stream_prepared.client_visible_model.as_deref(),
+                            ) {
                                 if let Some(context) = stream_event_context.as_mut() {
                                     if context.first_sse_write_ms.is_none() {
                                         context.first_sse_write_ms =
                                             Some(elapsed_ms_i32(context.started_at));
                                     }
                                 }
-                                yield Ok::<Bytes, std::io::Error>(encode_sse_event_with_model_alias(
-                                    &event,
-                                    stream_prepared.model.as_deref(),
-                                    stream_prepared.client_visible_model.as_deref(),
-                                ));
+                                yield Ok::<Bytes, std::io::Error>(encode_json_sse_chunk(&chunk));
                             }
-                            GatewayResponseAdapter::ChatCompletions => {
-                                if let Some(chunk) = convert_response_event_to_chat_chunk(
-                                    &event,
-                                    Some(&stream_prepared.tool_name_restore_map),
-                                    &mut chat_metadata,
-                                    stream_prepared.model.as_deref(),
-                                    stream_prepared.client_visible_model.as_deref(),
-                                ) {
-                                    if let Some(context) = stream_event_context.as_mut() {
-                                        if context.first_sse_write_ms.is_none() {
-                                            context.first_sse_write_ms =
-                                                Some(elapsed_ms_i32(context.started_at));
-                                        }
-                                    }
-                                    yield Ok::<Bytes, std::io::Error>(encode_json_sse_chunk(&chunk));
+                        } else {
+                            if let Some(context) = stream_event_context.as_mut() {
+                                if context.first_sse_write_ms.is_none() {
+                                    context.first_sse_write_ms =
+                                        Some(elapsed_ms_i32(context.started_at));
                                 }
                             }
+                            yield Ok::<Bytes, std::io::Error>(encode_sse_event_with_model_alias(
+                                &event,
+                                stream_prepared.model.as_deref(),
+                                stream_prepared.client_visible_model.as_deref(),
+                            ));
                         }
                     }
                     Err(err) => {
