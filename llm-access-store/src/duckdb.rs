@@ -1470,7 +1470,8 @@ fn configure_duckdb_compact_connection(
         .ok_or_else(|| anyhow!("duckdb compact temp directory path is not valid UTF-8"))?;
     let sql = duckdb_compact_connection_sql(connection_config, temp_dir_str);
     conn.execute_batch(&sql)
-        .context("failed to configure duckdb compact connection")
+        .context("failed to configure duckdb compact connection")?;
+    Ok(())
 }
 
 #[cfg(feature = "duckdb-runtime")]
