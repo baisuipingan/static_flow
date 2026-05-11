@@ -2047,7 +2047,7 @@ pub fn admin_llm_gateway_page() -> Html {
     let load_error = use_state(|| None::<String>);
     let ttl_input = use_state(|| "60".to_string());
     let max_request_body_input = use_state(|| (8 * 1024 * 1024_u64).to_string());
-    let account_failure_retry_limit_input = use_state(|| "3".to_string());
+    let account_failure_retry_limit_input = use_state(|| "10".to_string());
     let codex_client_version_input =
         use_state(|| DEFAULT_LLM_GATEWAY_CODEX_CLIENT_VERSION.to_string());
     let codex_refresh_min_input = use_state(|| "240".to_string());

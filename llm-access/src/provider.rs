@@ -95,12 +95,17 @@ const KIRO_REMOTE_MEDIA_TIMEOUT: Duration = Duration::from_secs(15);
 const KIRO_LAST_MESSAGE_PART_PREVIEW_CHARS: usize = 320;
 const KIRO_LAST_MESSAGE_TOTAL_PREVIEW_CHARS: usize = 1_024;
 const KIRO_VISION_BRIDGE_MODEL: &str = "claude-sonnet-4.6";
-const MAX_CODEX_ROUTE_ATTEMPTS: usize = 3;
 const CODEX_QUOTA_EXHAUSTION_COOLDOWN: Duration = Duration::from_secs(5 * 60);
 const KIRO_VISION_BRIDGE_PROMPT: &str = "Describe the attached image(s) for another Claude model \
                                          that will answer the user's request. Include visible \
                                          text, objects, colors, layout, charts, tables, and \
                                          uncertainty. Return concise numbered visual facts only.";
+
+#[derive(Debug, Clone)]
+struct CodexDispatchRuntimeConfig {
+    client_version: String,
+    account_attempt_limit: usize,
+}
 
 #[derive(Debug, Clone)]
 struct ProviderUsageMetadata {
@@ -909,8 +914,9 @@ async fn dispatch_codex_proxy(
     let upstream_base = codex_upstream_base_url();
     let method = request.method().clone();
     let request_headers = request.headers().clone();
-    let codex_client_version = match load_codex_client_version(admin_config_store.as_ref()).await {
-        Ok(version) => version,
+    let runtime_config = match load_codex_dispatch_runtime_config(admin_config_store.as_ref()).await
+    {
+        Ok(config) => config,
         Err(response) => return response,
     };
 
@@ -925,7 +931,7 @@ async fn dispatch_codex_proxy(
             &request_headers,
             query.trim_start_matches('?'),
             &upstream_base,
-            &codex_client_version,
+            &runtime_config.client_version,
         )
         .await;
     }
@@ -964,6 +970,7 @@ async fn dispatch_codex_proxy(
         Ok(permit) => permit,
         Err(rejection) => return codex_key_limit_response(&rejection),
     };
+    let account_attempt_limit = runtime_config.account_attempt_limit;
     let mut key_permit = Some(key_permit);
     let mut failed_accounts = HashSet::new();
     let mut attempt_count = 0_usize;
@@ -997,7 +1004,7 @@ async fn dispatch_codex_proxy(
             Err(_) => {
                 usage_meta.mark_failover();
                 failed_accounts.insert(route.account_name.clone());
-                if attempt_count >= MAX_CODEX_ROUTE_ATTEMPTS {
+                if attempt_count >= account_attempt_limit {
                     return (
                         StatusCode::BAD_GATEWAY,
                         "all eligible codex accounts failed for this request",
@@ -1018,7 +1025,7 @@ async fn dispatch_codex_proxy(
             Err(_) => {
                 usage_meta.mark_failover();
                 failed_accounts.insert(route.account_name.clone());
-                if attempt_count >= MAX_CODEX_ROUTE_ATTEMPTS {
+                if attempt_count >= account_attempt_limit {
                     return (
                         StatusCode::BAD_GATEWAY,
                         "all eligible codex accounts failed for this request",
@@ -1033,7 +1040,7 @@ async fn dispatch_codex_proxy(
             &request_headers,
             &prepared,
             &auth,
-            &codex_client_version,
+            &runtime_config.client_version,
         );
         let mut response = match upstream.send().await {
             Ok(response) => {
@@ -1043,7 +1050,7 @@ async fn dispatch_codex_proxy(
             Err(_) => {
                 usage_meta.mark_failover();
                 failed_accounts.insert(route.account_name.clone());
-                if attempt_count >= MAX_CODEX_ROUTE_ATTEMPTS {
+                if attempt_count >= account_attempt_limit {
                     return (
                         StatusCode::BAD_GATEWAY,
                         "all eligible codex accounts failed for this request",
@@ -1067,7 +1074,7 @@ async fn dispatch_codex_proxy(
                         &request_headers,
                         &prepared,
                         &auth,
-                        &codex_client_version,
+                        &runtime_config.client_version,
                     );
                     response = match retry.send().await {
                         Ok(response) => {
@@ -1077,7 +1084,7 @@ async fn dispatch_codex_proxy(
                         Err(_) => {
                             usage_meta.mark_failover();
                             failed_accounts.insert(route.account_name.clone());
-                            if attempt_count >= MAX_CODEX_ROUTE_ATTEMPTS {
+                            if attempt_count >= account_attempt_limit {
                                 return (
                                     StatusCode::BAD_GATEWAY,
                                     "all eligible codex accounts failed for this request",
@@ -1091,7 +1098,7 @@ async fn dispatch_codex_proxy(
                 Err(_) => {
                     usage_meta.mark_failover();
                     failed_accounts.insert(route.account_name.clone());
-                    if attempt_count >= MAX_CODEX_ROUTE_ATTEMPTS {
+                    if attempt_count >= account_attempt_limit {
                         return (
                             StatusCode::BAD_GATEWAY,
                             "all eligible codex accounts failed for this request",
@@ -1101,6 +1108,62 @@ async fn dispatch_codex_proxy(
                     continue;
                 },
             }
+        }
+        if matches!(response.status(), StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN) {
+            let status = response.status();
+            let upstream_headers = response.headers().clone();
+            let content_type = upstream_headers
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+            let bytes = match response.bytes().await {
+                Ok(bytes) => bytes,
+                Err(_) => {
+                    return (StatusCode::BAD_GATEWAY, "codex upstream response read failed")
+                        .into_response()
+                },
+            };
+            codex_refresh::persist_terminal_request_auth_error(
+                &route,
+                route_store.as_ref(),
+                status,
+                &bytes,
+            )
+            .await;
+            if attempt_count < account_attempt_limit
+                && routes.iter().any(|candidate| {
+                    !failed_accounts.contains(&candidate.account_name)
+                        && candidate.account_name != route.account_name
+                })
+            {
+                usage_meta.mark_failover();
+                failed_accounts.insert(route.account_name.clone());
+                continue;
+            }
+            let permits = vec![
+                key_permit
+                    .take()
+                    .expect("codex key permit should be held until response is returned"),
+                account_permit,
+            ];
+            return adapt_codex_upstream_response_from_parts(
+                CodexUpstreamResponseParts {
+                    status,
+                    upstream_headers,
+                    content_type,
+                    bytes,
+                },
+                CodexCompletedResponseContext {
+                    prepared,
+                    key,
+                    route,
+                    control_store,
+                    permits,
+                    usage_meta,
+                },
+            )
+            .await;
         }
         if response.status().is_success() {
             let permits = vec![
@@ -1137,7 +1200,7 @@ async fn dispatch_codex_proxy(
         if let Some(cooldown) = codex_quota_exhaustion_cooldown(status, &bytes) {
             codex_account_cooldowns.mark_account_cooldown(&route.account_name, cooldown);
         }
-        if attempt_count < MAX_CODEX_ROUTE_ATTEMPTS
+        if attempt_count < account_attempt_limit
             && routes.iter().any(|candidate| {
                 !failed_accounts.contains(&candidate.account_name)
                     && candidate.account_name != route.account_name
@@ -4979,11 +5042,20 @@ pub(crate) fn resolve_codex_client_version(raw: Option<&str>) -> String {
         .unwrap_or_else(|| llm_access_core::store::DEFAULT_CODEX_CLIENT_VERSION.to_string())
 }
 
-async fn load_codex_client_version(
+fn resolve_codex_account_attempt_limit(raw: u64) -> usize {
+    usize::try_from(raw).unwrap_or(usize::MAX).max(1)
+}
+
+async fn load_codex_dispatch_runtime_config(
     admin_config_store: &dyn AdminConfigStore,
-) -> Result<String, Response> {
+) -> Result<CodexDispatchRuntimeConfig, Response> {
     match admin_config_store.get_admin_runtime_config().await {
-        Ok(config) => Ok(resolve_codex_client_version(Some(&config.codex_client_version))),
+        Ok(config) => Ok(CodexDispatchRuntimeConfig {
+            client_version: resolve_codex_client_version(Some(&config.codex_client_version)),
+            account_attempt_limit: resolve_codex_account_attempt_limit(
+                config.account_failure_retry_limit,
+            ),
+        }),
         Err(_) => {
             Err((StatusCode::INTERNAL_SERVER_ERROR, "runtime config store error").into_response())
         },
@@ -5757,7 +5829,7 @@ fn now_seconds() -> i64 {
 )]
 mod tests {
     use std::{
-        collections::{BTreeMap, HashSet},
+        collections::{BTreeMap, HashMap, HashSet},
         sync::{Arc, Mutex},
         time::{Duration, Instant},
     };
@@ -5774,9 +5846,10 @@ mod tests {
     use llm_access_core::{
         provider::RouteStrategy,
         store::{
-            AdminConfigStore, AdminKiroStatusCacheUpdate, AdminRuntimeConfig, AuthenticatedKey,
-            ControlStore, EmptyProviderRouteStore, ProviderCodexRoute, ProviderKiroAuthUpdate,
-            ProviderKiroRoute, ProviderProxyConfig, ProviderRouteStore,
+            is_terminal_codex_auth_error, AdminConfigStore, AdminKiroStatusCacheUpdate,
+            AdminRuntimeConfig, AuthenticatedKey, ControlStore, EmptyProviderRouteStore,
+            ProviderCodexAuthUpdate, ProviderCodexRoute, ProviderKiroAuthUpdate, ProviderKiroRoute,
+            ProviderProxyConfig, ProviderRouteStore,
         },
         usage::UsageStreamDetails,
     };
@@ -6167,6 +6240,77 @@ mod tests {
             &self,
             _update: llm_access_core::store::ProviderCodexAuthUpdate,
         ) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    #[derive(Clone)]
+    struct RefreshingCodexRouteStore {
+        candidate_routes: Vec<ProviderCodexRoute>,
+        latest_routes: Arc<Mutex<HashMap<String, ProviderCodexRoute>>>,
+        codex_updates: Arc<Mutex<Vec<ProviderCodexAuthUpdate>>>,
+        kiro_route: ProviderKiroRoute,
+    }
+
+    #[async_trait]
+    impl ProviderRouteStore for RefreshingCodexRouteStore {
+        async fn resolve_codex_route(
+            &self,
+            _key: &AuthenticatedKey,
+        ) -> anyhow::Result<Option<ProviderCodexRoute>> {
+            Ok(self.candidate_routes.first().cloned())
+        }
+
+        async fn resolve_codex_route_candidates(
+            &self,
+            _key: &AuthenticatedKey,
+        ) -> anyhow::Result<Vec<ProviderCodexRoute>> {
+            Ok(self.candidate_routes.clone())
+        }
+
+        async fn resolve_codex_account_route(
+            &self,
+            account_name: &str,
+        ) -> anyhow::Result<Option<ProviderCodexRoute>> {
+            Ok(self
+                .latest_routes
+                .lock()
+                .expect("latest routes")
+                .get(account_name)
+                .cloned())
+        }
+
+        async fn resolve_kiro_route(
+            &self,
+            _key: &AuthenticatedKey,
+        ) -> anyhow::Result<Option<ProviderKiroRoute>> {
+            Ok(Some(self.kiro_route.clone()))
+        }
+
+        async fn save_kiro_auth_update(
+            &self,
+            _update: ProviderKiroAuthUpdate,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
+        async fn save_codex_auth_update(
+            &self,
+            update: ProviderCodexAuthUpdate,
+        ) -> anyhow::Result<()> {
+            if let Some(route) = self
+                .latest_routes
+                .lock()
+                .expect("latest routes")
+                .get_mut(&update.account_name)
+            {
+                route.auth_json = update.auth_json.clone();
+                route.cached_error_message = update.last_error.clone();
+            }
+            self.codex_updates
+                .lock()
+                .expect("codex updates")
+                .push(update);
             Ok(())
         }
     }
@@ -7226,6 +7370,64 @@ mod tests {
                 )))
                 .expect("upstream response"),
         }
+    }
+
+    async fn fake_codex_responses_always_unauthorized(
+        State(captured): State<Arc<CapturedCodexUpstream>>,
+        headers: HeaderMap,
+        request: Request<Body>,
+    ) -> Response {
+        let path = request.uri().path().to_string();
+        let query = request.uri().query().map(ToString::to_string);
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("upstream request body");
+        let body = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice::<serde_json::Value>(&body).expect("upstream json")
+        };
+        captured
+            .requests
+            .lock()
+            .expect("captured requests")
+            .push(CapturedCodexRequest {
+                path,
+                query,
+                authorization: headers
+                    .get(header::AUTHORIZATION)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string),
+                accept: headers
+                    .get(header::ACCEPT)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string),
+                user_agent: headers
+                    .get(header::USER_AGENT)
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string),
+                x_client_request_id: headers
+                    .get("x-client-request-id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string),
+                session_id: headers
+                    .get("session_id")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string),
+                x_codex_turn_state: headers
+                    .get("x-codex-turn-state")
+                    .and_then(|value| value.to_str().ok())
+                    .map(ToString::to_string),
+                body,
+            });
+
+        Response::builder()
+            .status(StatusCode::UNAUTHORIZED)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":{"code":"invalid_api_key","message":"access token rejected"}}"#,
+            ))
+            .expect("unauthorized upstream response")
     }
 
     async fn fake_codex_models(
@@ -8320,7 +8522,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_dispatch_caps_failover_attempts_at_three_routes() {
+    async fn codex_dispatch_uses_default_failover_limit_of_ten() {
         let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
             .expect("codex upstream env lock");
@@ -8369,6 +8571,80 @@ mod tests {
 
         std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
 
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = captured.requests.lock().expect("captured requests");
+        let auths = requests
+            .iter()
+            .filter_map(|request| request.authorization.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(auths, vec![
+            "Bearer upstream-token-a".to_string(),
+            "Bearer upstream-token-b".to_string(),
+            "Bearer upstream-token-c".to_string(),
+            "Bearer upstream-token-d".to_string(),
+        ]);
+    }
+
+    #[tokio::test]
+    async fn codex_dispatch_respects_runtime_account_failure_retry_limit() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("codex upstream env lock");
+        let captured = Arc::new(CapturedCodexUpstream::default());
+        let app = Router::new()
+            .route("/v1/responses", post(fake_codex_responses_fail_first_three))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake upstream");
+        });
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+
+        let route_store = Arc::new(StaticMultiCodexRouteStore {
+            codex_routes: vec![
+                codex_route_for_account("codex-a", "upstream-token-a"),
+                codex_route_for_account("codex-b", "upstream-token-b"),
+                codex_route_for_account("codex-c", "upstream-token-c"),
+                codex_route_for_account("codex-d", "upstream-token-d"),
+            ],
+            kiro_route: static_kiro_route(),
+        });
+        let config = AdminRuntimeConfig {
+            account_failure_retry_limit: 2,
+            ..AdminRuntimeConfig::default()
+        };
+        let state = super::ProviderState::new_with_config_store(
+            Arc::new(TestStore),
+            route_store,
+            Arc::new(StaticAdminConfigStore {
+                config,
+            }),
+        );
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::AUTHORIZATION, "Bearer codex-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model": "gpt-5.3-codex",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": false
+                    }"#,
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+
         assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
         let body = to_bytes(response.into_body(), usize::MAX)
             .await
@@ -8383,8 +8659,84 @@ mod tests {
         assert_eq!(auths, vec![
             "Bearer upstream-token-a".to_string(),
             "Bearer upstream-token-b".to_string(),
-            "Bearer upstream-token-c".to_string(),
         ]);
+    }
+
+    #[tokio::test]
+    async fn codex_dispatch_persists_terminal_request_auth_error_after_forced_refresh_failure() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("codex upstream env lock");
+        let captured = Arc::new(CapturedCodexUpstream::default());
+        let app = Router::new()
+            .route("/v1/responses", post(fake_codex_responses_always_unauthorized))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake upstream");
+        });
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+
+        let stale_route = codex_route_for_account("codex-a", "upstream-token-stale");
+        let latest_route = codex_route_for_account("codex-a", "upstream-token-fresh");
+        let route_store = Arc::new(RefreshingCodexRouteStore {
+            candidate_routes: vec![stale_route],
+            latest_routes: Arc::new(Mutex::new(HashMap::from([(
+                "codex-a".to_string(),
+                latest_route.clone(),
+            )]))),
+            codex_updates: Arc::new(Mutex::new(Vec::new())),
+            kiro_route: static_kiro_route(),
+        });
+        let state = super::ProviderState::new(Arc::new(TestStore), route_store.clone());
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::AUTHORIZATION, "Bearer codex-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model": "gpt-5.3-codex",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "stream": false
+                    }"#,
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        let requests = captured.requests.lock().expect("captured requests");
+        let auths = requests
+            .iter()
+            .filter_map(|request| request.authorization.clone())
+            .collect::<Vec<_>>();
+        assert_eq!(auths, vec![
+            "Bearer upstream-token-stale".to_string(),
+            "Bearer upstream-token-fresh".to_string(),
+        ]);
+
+        let updates = route_store.codex_updates.lock().expect("codex updates");
+        assert_eq!(updates.len(), 1);
+        let update = &updates[0];
+        assert_eq!(update.account_name, "codex-a");
+        assert_eq!(update.auth_json, latest_route.auth_json);
+        let error = update
+            .last_error
+            .as_deref()
+            .expect("request auth error should be persisted");
+        assert!(error.contains("codex request returned 401 Unauthorized after forced refresh"));
+        assert!(error.contains("access token rejected"));
+        assert!(is_terminal_codex_auth_error(error));
     }
 
     #[tokio::test]

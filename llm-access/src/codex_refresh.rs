@@ -134,11 +134,63 @@ async fn persist_codex_refresh_error(
     err: &anyhow::Error,
 ) {
     let error_message = format!("{err:#}");
+    persist_codex_route_error(
+        store,
+        route,
+        latest.account_id.clone(),
+        error_message,
+        "failed to persist codex refresh error",
+    )
+    .await;
+}
+
+pub(crate) async fn persist_terminal_request_auth_error(
+    route: &ProviderCodexRoute,
+    store: &dyn ProviderRouteStore,
+    status: reqwest::StatusCode,
+    body: &[u8],
+) {
+    let latest_route = match store.resolve_codex_account_route(&route.account_name).await {
+        Ok(Some(latest_route)) => latest_route,
+        Ok(None) => route.clone(),
+        Err(err) => {
+            tracing::warn!(
+                account_name = %route.account_name,
+                error = ?err,
+                "failed to reload codex account before persisting request auth error"
+            );
+            route.clone()
+        },
+    };
+    let account_id = parse_auth_parts_allow_missing_access(&latest_route.auth_json)
+        .ok()
+        .and_then(|parts| parts.account_id);
+    let error_message = format!(
+        "codex request returned {status} after forced refresh: {}",
+        String::from_utf8_lossy(body)
+    );
+    persist_codex_route_error(
+        store,
+        &latest_route,
+        account_id,
+        error_message,
+        "failed to persist codex request auth error",
+    )
+    .await;
+}
+
+async fn persist_codex_route_error(
+    store: &dyn ProviderRouteStore,
+    route: &ProviderCodexRoute,
+    account_id: Option<String>,
+    error_message: String,
+    log_message: &str,
+) {
     if let Err(update_err) = store
         .save_codex_auth_update(ProviderCodexAuthUpdate {
             account_name: route.account_name.clone(),
             auth_json: route.auth_json.clone(),
-            account_id: latest.account_id.clone(),
+            account_id,
             status: KEY_STATUS_ACTIVE.to_string(),
             last_error: Some(error_message.clone()),
             refreshed_at_ms: now_ms(),
@@ -149,7 +201,7 @@ async fn persist_codex_refresh_error(
             account_name = %route.account_name,
             error = %error_message,
             update_error = ?update_err,
-            "failed to persist codex refresh error"
+            "{log_message}"
         );
     }
 }

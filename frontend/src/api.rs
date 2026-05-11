@@ -7315,7 +7315,7 @@ pub async fn fetch_admin_llm_gateway_config() -> Result<LlmGatewayRuntimeConfig,
         Ok(LlmGatewayRuntimeConfig {
             auth_cache_ttl_seconds: 60,
             max_request_body_bytes: 8 * 1024 * 1024,
-            account_failure_retry_limit: 3,
+            account_failure_retry_limit: 10,
             codex_client_version: default_codex_client_version(),
             codex_status_refresh_min_interval_seconds: 240,
             codex_status_refresh_max_interval_seconds: 300,
@@ -10418,7 +10418,7 @@ mod tests {
             r#"{
                 "auth_cache_ttl_seconds": 60,
                 "max_request_body_bytes": 8388608,
-                "account_failure_retry_limit": 3,
+                "account_failure_retry_limit": 10,
                 "kiro_channel_max_concurrency": 1,
                 "kiro_channel_min_start_interval_ms": 0,
                 "codex_status_refresh_min_interval_seconds": 240,

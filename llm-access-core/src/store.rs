@@ -15,7 +15,7 @@ pub const DEFAULT_CODEX_STATUS_REFRESH_SECONDS: u64 = 300;
 /// Default maximum request body size enforced by provider request handlers.
 pub const DEFAULT_MAX_REQUEST_BODY_BYTES: u64 = 8 * 1024 * 1024;
 /// Default consecutive upstream failure threshold before an account is skipped.
-pub const DEFAULT_ACCOUNT_FAILURE_RETRY_LIMIT: u64 = 3;
+pub const DEFAULT_ACCOUNT_FAILURE_RETRY_LIMIT: u64 = 10;
 /// Default Codex client version sent to upstream requests.
 pub const DEFAULT_CODEX_CLIENT_VERSION: &str = "0.124.0";
 /// Default lower bound for randomized Codex status refresh.
@@ -1160,6 +1160,9 @@ pub fn is_terminal_codex_auth_error(message: &str) -> bool {
         || ((message.contains("codex refresh token returned 401")
             || message.contains("codex refresh token returned 403"))
             && message.contains("invalid_request_error"))
+        || ((message.contains("codex request returned 401")
+            || message.contains("codex request returned 403"))
+            && message.contains("after forced refresh"))
 }
 
 /// Resolved Kiro account selected for one provider request.

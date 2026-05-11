@@ -5112,7 +5112,7 @@ impl RuntimeConfigRecord {
             id: "default".to_string(),
             auth_cache_ttl_seconds: 60,
             max_request_body_bytes: 1_048_576,
-            account_failure_retry_limit: 3,
+            account_failure_retry_limit: core_store::DEFAULT_ACCOUNT_FAILURE_RETRY_LIMIT as i64,
             codex_client_version: "0.124.0".to_string(),
             kiro_channel_max_concurrency: 4,
             kiro_channel_min_start_interval_ms: 100,
