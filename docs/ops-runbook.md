@@ -173,7 +173,7 @@ private env files, not in tracked docs.
 - `/swapfile` and `/swapfile-llm-extra` are each 2 GiB emergency swap files,
   enabled through `/etc/fstab`; host swap total is 4 GiB.
 - `/etc/sysctl.d/99-staticflow-memory-guard.conf` sets `vm.swappiness=10`.
-- `llm-access.service` has `MemoryHigh=2200M`, `MemoryMax=3072M`,
+- `llm-access.service` has `MemoryHigh=4608M`, `MemoryMax=5120M`,
   `MemorySwapMax=1024M`, `TasksMax=256`, and `OOMPolicy=kill`.
 - `llm-access-usage-worker.service` should carry the DuckDB memory budget after
   the split. Start with `MemoryHigh=2200M`, `MemoryMax=3072M`,
@@ -263,7 +263,7 @@ extra swap as an emergency buffer, not as normal working memory.
   - current `ExecStart`: worker process with local journal root,
     local active DuckDB dir, and JuiceFS archive/catalog dirs
   - cgroup guard observed live:
-    `MemoryHigh=2200M`, `MemoryMax=3072M`, `MemorySwapMax=1024M`
+    `MemoryHigh=4608M`, `MemoryMax=5120M`, `MemorySwapMax=1024M`
 - Live health checks that should all pass:
   ```bash
   curl -fsS http://127.0.0.1:19080/healthz

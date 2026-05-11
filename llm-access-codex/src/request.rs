@@ -813,6 +813,60 @@ fn validate_tool_call_history(root: &Map<String, Value>) -> CodexGatewayResult<(
     Ok(())
 }
 
+fn normalize_tool_parameters_schema(value: Value) -> Value {
+    match value {
+        Value::Object(mut obj) => {
+            if obj
+                .get("type")
+                .and_then(Value::as_str)
+                .is_some_and(|schema_type| schema_type == "object")
+            {
+                match obj.get_mut("properties") {
+                    Some(Value::Object(properties)) => {
+                        for child in properties.values_mut() {
+                            *child = normalize_tool_parameters_schema(child.take());
+                        }
+                    },
+                    Some(other) => {
+                        *other = Value::Object(Map::new());
+                    },
+                    None => {
+                        obj.insert("properties".to_string(), Value::Object(Map::new()));
+                    },
+                }
+            }
+
+            for key in ["items", "additionalProperties", "not"] {
+                if let Some(child) = obj.get_mut(key) {
+                    *child = normalize_tool_parameters_schema(child.take());
+                }
+            }
+            for key in ["allOf", "anyOf", "oneOf", "prefixItems"] {
+                if let Some(Value::Array(items)) = obj.get_mut(key) {
+                    for item in items {
+                        *item = normalize_tool_parameters_schema(item.take());
+                    }
+                }
+            }
+            for key in ["$defs", "definitions"] {
+                if let Some(Value::Object(defs)) = obj.get_mut(key) {
+                    for schema in defs.values_mut() {
+                        *schema = normalize_tool_parameters_schema(schema.take());
+                    }
+                }
+            }
+            Value::Object(obj)
+        },
+        Value::Array(items) => Value::Array(
+            items
+                .into_iter()
+                .map(normalize_tool_parameters_schema)
+                .collect(),
+        ),
+        other => other,
+    }
+}
+
 /// Map OpenAI chat roles into the role set accepted by the responses API.
 fn normalize_openai_role_for_responses(role: &str) -> Option<&'static str> {
     match role {
@@ -1411,10 +1465,7 @@ fn adapt_openai_chat_completions_request(
                             .map(str::trim)
                             .filter(|value| !value.is_empty())
                         else {
-                            return Err(bad_request(&format!(
-                                "chat.completions assistant tool_call {tool_call_index} is \
-                                 missing function.name"
-                            )));
+                            continue;
                         };
                         let function_name =
                             shorten_openai_tool_name_with_map(function_name, &tool_name_map);
@@ -1529,7 +1580,10 @@ fn adapt_openai_chat_completions_request(
                     mapped.insert("description".to_string(), description.clone());
                 }
                 if let Some(parameters) = function.get("parameters") {
-                    mapped.insert("parameters".to_string(), parameters.clone());
+                    mapped.insert(
+                        "parameters".to_string(),
+                        normalize_tool_parameters_schema(parameters.clone()),
+                    );
                 }
                 if let Some(strict) = function.get("strict") {
                     mapped.insert("strict".to_string(), strict.clone());
@@ -1569,6 +1623,7 @@ fn adapt_openai_chat_completions_request(
                 .or_else(|| tool_obj.get("inputSchema"))
                 .or_else(|| tool_obj.get("parameters"))
                 .cloned()
+                .map(normalize_tool_parameters_schema)
                 .unwrap_or_else(|| json!({ "type": "object", "properties": {} }));
             let mut mapped = Map::new();
             mapped.insert("type".to_string(), Value::String("function".to_string()));
@@ -2198,6 +2253,36 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_gateway_request_repairs_chat_tool_call_without_function_name() {
+        let headers = axum::http::HeaderMap::new();
+        let body = Body::from(
+            r#"{
+                "model":"gpt-5.3-codex",
+                "messages":[
+                    {"role":"user","content":"hello"},
+                    {"role":"assistant","tool_calls":[{"id":"callauto12","type":"function","function":{"arguments":"{}"}}]}
+                ]
+            }"#,
+        );
+
+        let prepared = prepare_gateway_request(
+            "/v1/chat/completions",
+            "",
+            axum::http::Method::POST,
+            &headers,
+            body,
+            1024 * 1024,
+        )
+        .await
+        .expect("chat request with malformed tool call should normalize");
+
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&prepared.request_body).expect("upstream body json");
+        assert_eq!(upstream["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(upstream["input"][0]["role"], "user");
+    }
+
+    #[tokio::test]
     async fn prepare_gateway_request_allows_orphan_tool_output_when_previous_response_id_exists() {
         let headers = axum::http::HeaderMap::new();
         let body = Body::from(
@@ -2260,6 +2345,40 @@ mod tests {
         assert_eq!(upstream["input"][0]["input"], json!("*** Begin Patch"));
         assert!(upstream["input"][0].get("arguments").is_none());
         assert_eq!(upstream["input"][1]["type"], json!("custom_tool_call_output"));
+    }
+
+    #[tokio::test]
+    async fn prepare_gateway_request_repairs_function_tool_schema_missing_properties() {
+        let headers = axum::http::HeaderMap::new();
+        let body = Body::from(
+            r#"{
+                "model":"gpt-5.3-codex",
+                "messages":[{"role":"user","content":"hello"}],
+                "tools":[{
+                    "type":"function",
+                    "function":{
+                        "name":"mcp__matlab__detect_matlab_toolboxes",
+                        "description":"Detect installed MATLAB toolboxes.",
+                        "parameters":{"type":"object"}
+                    }
+                }]
+            }"#,
+        );
+
+        let prepared = prepare_gateway_request(
+            "/v1/chat/completions",
+            "",
+            axum::http::Method::POST,
+            &headers,
+            body,
+            1024 * 1024,
+        )
+        .await
+        .expect("tool schema without properties should normalize");
+
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&prepared.request_body).expect("upstream body json");
+        assert_eq!(upstream["tools"][0]["parameters"], json!({"type":"object","properties":{}}));
     }
 
     #[tokio::test]

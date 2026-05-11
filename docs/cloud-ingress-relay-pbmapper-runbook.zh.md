@@ -149,7 +149,7 @@ sudo journalctl -u caddy -n 120 --no-pager -l
 - GCP VM 是 2c8g 级别。
 - 主机有两个 2GiB swap 文件：`/swapfile` 和 `/swapfile-llm-extra`。
 - `vm.swappiness=10`。
-- `llm-access.service`：`MemoryHigh=2200M`、`MemoryMax=3072M`、
+- `llm-access.service`：`MemoryHigh=4608M`、`MemoryMax=5120M`、
   `MemorySwapMax=1024M`、`TasksMax=256`、`OOMPolicy=kill`。
 - `juicefs-llm-access.service`：`MemoryHigh=1800M`、`MemoryMax=2560M`、
   `MemorySwapMax=0`、`TasksMax=256`、`OOMPolicy=kill`。

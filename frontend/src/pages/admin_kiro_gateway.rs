@@ -53,6 +53,10 @@ fn should_load_kiro_usage_preview(active_tab: &str) -> bool {
     active_tab == TAB_USAGE
 }
 
+fn should_load_kiro_inventory(active_tab: &str) -> bool {
+    matches!(active_tab, TAB_ACCOUNTS | TAB_KEYS | TAB_GROUPS)
+}
+
 /// Shared Tailwind classes for the dark "Kiro" pill badge.
 fn kiro_badge() -> Classes {
     classes!(
@@ -2848,6 +2852,9 @@ pub fn admin_kiro_gateway_page() -> Html {
     let kiro_conversation_anchor_ttl_seconds = use_state(String::new);
     let loading = use_state(|| true);
     let error = use_state(|| None::<String>);
+    let inventory_loading = use_state(|| false);
+    let inventory_error = use_state(|| None::<String>);
+    let inventory_loaded_for_refresh = use_state(|| None::<u32>);
     let flash = use_state(|| None::<String>);
     let toast = use_state(|| None::<(String, bool)>);
     let toast_timeout = use_mut_ref(|| None::<Timeout>);
@@ -2967,10 +2974,6 @@ pub fn admin_kiro_gateway_page() -> Html {
     };
 
     {
-        let accounts = accounts.clone();
-        let keys = keys.clone();
-        let account_groups = account_groups.clone();
-        let kiro_models = kiro_models.clone();
         let proxy_configs = proxy_configs.clone();
         let proxy_bindings = proxy_bindings.clone();
         let runtime_config = runtime_config.clone();
@@ -2990,10 +2993,6 @@ pub fn admin_kiro_gateway_page() -> Html {
         let loading = loading.clone();
         let error = error.clone();
         use_effect_with(*refresh_tick, move |_| {
-            let accounts = accounts.clone();
-            let keys = keys.clone();
-            let account_groups = account_groups.clone();
-            let kiro_models = kiro_models.clone();
             let proxy_configs = proxy_configs.clone();
             let proxy_bindings = proxy_bindings.clone();
             let runtime_config = runtime_config.clone();
@@ -3017,41 +3016,17 @@ pub fn admin_kiro_gateway_page() -> Html {
                 error.set(None);
                 let (
                     config_result,
-                    accounts_result,
-                    keys_result,
-                    account_groups_result,
-                    models_result,
                     proxy_configs_result,
                     proxy_bindings_result,
                     cache_stats_result,
                 ) = futures::join!(
                     fetch_admin_llm_gateway_config(),
-                    fetch_admin_kiro_accounts(),
-                    fetch_admin_kiro_keys(),
-                    fetch_admin_kiro_account_groups(),
-                    fetch_kiro_models(),
                     fetch_admin_llm_gateway_proxy_configs(),
                     fetch_admin_llm_gateway_proxy_bindings(),
                     fetch_admin_kiro_cache_stats(),
                 );
-                match (
-                    config_result,
-                    accounts_result,
-                    keys_result,
-                    account_groups_result,
-                    models_result,
-                    proxy_configs_result,
-                    proxy_bindings_result,
-                ) {
-                    (
-                        Ok(config_resp),
-                        Ok(accounts_resp),
-                        Ok(keys_resp),
-                        Ok(account_groups_resp),
-                        Ok(models_resp),
-                        Ok(proxy_configs_resp),
-                        Ok(proxy_bindings_resp),
-                    ) => {
+                match (config_result, proxy_configs_result, proxy_bindings_result) {
+                    (Ok(config_resp), Ok(proxy_configs_resp), Ok(proxy_bindings_resp)) => {
                         let policy_form = match parse_kiro_cache_policy_form_json(
                             &config_resp.kiro_cache_policy_json,
                         ) {
@@ -3091,10 +3066,6 @@ pub fn admin_kiro_gateway_page() -> Html {
                         kiro_conversation_anchor_ttl_seconds
                             .set(config_resp.kiro_conversation_anchor_ttl_seconds.to_string());
                         runtime_config.set(Some(config_resp));
-                        accounts.set(accounts_resp.accounts);
-                        keys.set(keys_resp.keys);
-                        account_groups.set(account_groups_resp.groups);
-                        kiro_models.set(models_resp.data);
                         proxy_configs.set(proxy_configs_resp.proxy_configs);
                         proxy_bindings.set(proxy_bindings_resp.bindings);
                         match cache_stats_result {
@@ -3108,13 +3079,7 @@ pub fn admin_kiro_gateway_page() -> Html {
                             },
                         }
                     },
-                    (Err(err), _, _, _, _, _, _)
-                    | (_, Err(err), _, _, _, _, _)
-                    | (_, _, Err(err), _, _, _, _)
-                    | (_, _, _, Err(err), _, _, _)
-                    | (_, _, _, _, Err(err), _, _)
-                    | (_, _, _, _, _, Err(err), _)
-                    | (_, _, _, _, _, _, Err(err)) => {
+                    (Err(err), _, _) | (_, Err(err), _) | (_, _, Err(err)) => {
                         error.set(Some(err));
                     },
                 }
@@ -3122,6 +3087,67 @@ pub fn admin_kiro_gateway_page() -> Html {
             });
             || ()
         });
+    }
+
+    {
+        let accounts = accounts.clone();
+        let keys = keys.clone();
+        let account_groups = account_groups.clone();
+        let kiro_models = kiro_models.clone();
+        let active_tab = active_tab.clone();
+        let refresh_tick = refresh_tick.clone();
+        let inventory_loading = inventory_loading.clone();
+        let inventory_error = inventory_error.clone();
+        let inventory_loaded_for_refresh = inventory_loaded_for_refresh.clone();
+        use_effect_with(
+            ((*active_tab).clone(), *refresh_tick),
+            move |(active_tab, refresh_tick)| {
+                let should_fetch = should_load_kiro_inventory(active_tab)
+                    && (*inventory_loaded_for_refresh).is_none_or(|loaded| loaded != *refresh_tick);
+                if should_fetch {
+                    let accounts = accounts.clone();
+                    let keys = keys.clone();
+                    let account_groups = account_groups.clone();
+                    let kiro_models = kiro_models.clone();
+                    let inventory_loading = inventory_loading.clone();
+                    let inventory_error = inventory_error.clone();
+                    let inventory_loaded_for_refresh = inventory_loaded_for_refresh.clone();
+                    let refresh_tick_value = *refresh_tick;
+                    wasm_bindgen_futures::spawn_local(async move {
+                        inventory_loading.set(true);
+                        inventory_error.set(None);
+                        let (accounts_result, keys_result, account_groups_result, models_result) = futures::join!(
+                            fetch_admin_kiro_accounts(),
+                            fetch_admin_kiro_keys(),
+                            fetch_admin_kiro_account_groups(),
+                            fetch_kiro_models(),
+                        );
+                        match (accounts_result, keys_result, account_groups_result, models_result) {
+                            (
+                                Ok(accounts_resp),
+                                Ok(keys_resp),
+                                Ok(account_groups_resp),
+                                Ok(models_resp),
+                            ) => {
+                                accounts.set(accounts_resp.accounts);
+                                keys.set(keys_resp.keys);
+                                account_groups.set(account_groups_resp.groups);
+                                kiro_models.set(models_resp.data);
+                                inventory_loaded_for_refresh.set(Some(refresh_tick_value));
+                            },
+                            (Err(err), _, _, _)
+                            | (_, Err(err), _, _)
+                            | (_, _, Err(err), _)
+                            | (_, _, _, Err(err)) => {
+                                inventory_error.set(Some(err));
+                            },
+                        }
+                        inventory_loading.set(false);
+                    });
+                }
+                || ()
+            },
+        );
     }
 
     {
@@ -4235,7 +4261,15 @@ pub fn admin_kiro_gateway_page() -> Html {
                         </p>
                     </article>
                 </div>
-                if (*accounts).is_empty() {
+                if *inventory_loading && (*accounts).is_empty() {
+                    <div class={classes!("mt-4", "rounded-xl", "border", "border-dashed", "border-[var(--border)]", "bg-[var(--surface)]", "p-5", "text-sm", "text-[var(--muted)]")}>
+                        { "正在加载 Kiro 账号摘要…" }
+                    </div>
+                } else if let Some(err) = (*inventory_error).clone() {
+                    <div class={classes!("mt-4", "rounded-xl", "border", "border-dashed", "border-red-400/50", "bg-red-500/10", "p-5", "text-sm", "text-red-700", "dark:text-red-200")}>
+                        { format!("Kiro 账号摘要加载失败：{err}") }
+                    </div>
+                } else if (*accounts).is_empty() {
                     <div class={classes!("mt-4", "rounded-xl", "border", "border-dashed", "border-[var(--border)]", "bg-[var(--surface)]", "p-5", "text-sm", "text-[var(--muted)]")}>
                         { "当前还没有导入任何 Kiro 账号。可以先从上面的 SQLite 导入，或者手动填写字段生成一个账号文件。" }
                     </div>
@@ -4302,7 +4336,7 @@ pub fn admin_kiro_gateway_page() -> Html {
                             Callback::from(move |_| on_reload.emit(()))
                         }}
                     >
-                        { if *loading { "Refreshing..." } else { "Refresh" } }
+                        { if *inventory_loading { "Refreshing..." } else { "Refresh" } }
                     </button>
                 </div>
                 <div class={classes!("mt-4", "max-w-md")}>
@@ -4319,7 +4353,19 @@ pub fn admin_kiro_gateway_page() -> Html {
                 }
                 <div class={classes!("mt-4", "grid", "gap-4", "xl:grid-cols-2")}>
                     {
-                        if (*keys).is_empty() {
+                        if *inventory_loading && (*keys).is_empty() {
+                            html! {
+                                <div class={classes!("rounded-xl", "border", "border-dashed", "border-[var(--border)]", "bg-[var(--surface)]", "p-5", "text-sm", "text-[var(--muted)]")}>
+                                    { "正在加载 Kiro key 清单…" }
+                                </div>
+                            }
+                        } else if let Some(err) = (*inventory_error).clone() {
+                            html! {
+                                <div class={classes!("rounded-xl", "border", "border-dashed", "border-red-400/50", "bg-red-500/10", "p-5", "text-sm", "text-red-700", "dark:text-red-200")}>
+                                    { format!("Kiro key 清单加载失败：{err}") }
+                                </div>
+                            }
+                        } else if (*keys).is_empty() {
                             html! {
                                 <div class={classes!("rounded-xl", "border", "border-dashed", "border-[var(--border)]", "bg-[var(--surface)]", "p-5", "text-sm", "text-[var(--muted)]")}>
                                     { "还没有 Kiro key。先创建一个，然后把 base URL 和 key 发给 Claude Code 或 Anthropic SDK 使用。" }
@@ -4375,7 +4421,7 @@ pub fn admin_kiro_gateway_page() -> Html {
                             Callback::from(move |_| on_reload.emit(()))
                         }}
                     >
-                        { if *loading { "Refreshing..." } else { "Refresh Groups" } }
+                        { if *inventory_loading { "Refreshing..." } else { "Refresh Groups" } }
                     </button>
                 </div>
 
@@ -4429,7 +4475,15 @@ pub fn admin_kiro_gateway_page() -> Html {
                             </label>
                             <div class={classes!("space-y-2")}>
                                 <div class={classes!("text-sm", "text-[var(--muted)]")}>{ "成员账号" }</div>
-                                if accounts.is_empty() {
+                                if *inventory_loading && accounts.is_empty() {
+                                    <div class={classes!("rounded-lg", "border", "border-dashed", "border-[var(--border)]", "px-3", "py-3", "text-xs", "text-[var(--muted)]")}>
+                                        { "正在加载 Kiro 账号…" }
+                                    </div>
+                                } else if let Some(err) = (*inventory_error).clone() {
+                                    <div class={classes!("rounded-lg", "border", "border-dashed", "border-red-400/50", "bg-red-500/10", "px-3", "py-3", "text-xs", "text-red-700", "dark:text-red-200")}>
+                                        { format!("Kiro 账号加载失败：{err}") }
+                                    </div>
+                                } else if accounts.is_empty() {
                                     <div class={classes!("rounded-lg", "border", "border-dashed", "border-[var(--border)]", "px-3", "py-3", "text-xs", "text-[var(--muted)]")}>
                                         { "当前没有可加入账号组的 Kiro 账号。" }
                                     </div>
@@ -4503,7 +4557,19 @@ pub fn admin_kiro_gateway_page() -> Html {
 
                 <div class={classes!("mt-4", "grid", "gap-4", "xl:grid-cols-2")}>
                     {
-                        if (*account_groups).is_empty() {
+                        if *inventory_loading && (*account_groups).is_empty() {
+                            html! {
+                                <div class={classes!("rounded-xl", "border", "border-dashed", "border-[var(--border)]", "bg-[var(--surface-alt)]", "p-5", "text-sm", "text-[var(--muted)]")}>
+                                    { "正在加载 Kiro 账号组…" }
+                                </div>
+                            }
+                        } else if let Some(err) = (*inventory_error).clone() {
+                            html! {
+                                <div class={classes!("rounded-xl", "border", "border-dashed", "border-red-400/50", "bg-red-500/10", "p-5", "text-sm", "text-red-700", "dark:text-red-200")}>
+                                    { format!("Kiro 账号组加载失败：{err}") }
+                                </div>
+                            }
+                        } else if (*account_groups).is_empty() {
                             html! {
                                 <div class={classes!("rounded-xl", "border", "border-dashed", "border-[var(--border)]", "bg-[var(--surface-alt)]", "p-5", "text-sm", "text-[var(--muted)]")}>
                                     { "当前还没有 Kiro 账号组。" }
@@ -4768,8 +4834,9 @@ mod tests {
         format_kiro_cache_policy_summary, kiro_account_status_cta_text, kiro_account_status_route,
         kiro_cache_token_percent, kiro_key_candidate_credit_summary, kiro_key_route_summary,
         parse_kiro_cache_policy_form_json, sanitize_kiro_account_group_id,
-        should_load_kiro_usage_preview, should_reset_kiro_cache_policy_editor, TAB_GROUPS,
-        TAB_KEYS, TAB_OVERVIEW, TAB_USAGE,
+        should_load_kiro_inventory, should_load_kiro_usage_preview,
+        should_reset_kiro_cache_policy_editor, TAB_ACCOUNTS, TAB_GROUPS, TAB_KEYS, TAB_OVERVIEW,
+        TAB_USAGE,
     };
     use crate::{
         api::{AdminAccountGroupView, KiroAccountView, KiroBalanceView, KiroCacheView},
@@ -5264,6 +5331,15 @@ mod tests {
         assert!(!should_load_kiro_usage_preview(TAB_OVERVIEW));
         assert!(!should_load_kiro_usage_preview(TAB_KEYS));
         assert!(!should_load_kiro_usage_preview(TAB_GROUPS));
+    }
+
+    #[test]
+    fn should_load_kiro_inventory_only_for_inventory_tabs() {
+        assert!(!should_load_kiro_inventory(TAB_OVERVIEW));
+        assert!(should_load_kiro_inventory(TAB_ACCOUNTS));
+        assert!(should_load_kiro_inventory(TAB_KEYS));
+        assert!(should_load_kiro_inventory(TAB_GROUPS));
+        assert!(!should_load_kiro_inventory(TAB_USAGE));
     }
 
     #[test]
