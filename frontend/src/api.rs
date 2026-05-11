@@ -6233,6 +6233,7 @@ pub struct AdminUsageJournalPreviewFileView {
     pub bytes_scanned: u64,
     pub complete_blocks: u64,
     pub truncated_tail: bool,
+    pub total_events: usize,
     pub events: Vec<AdminUsageJournalPreviewEventView>,
 }
 
@@ -6242,6 +6243,10 @@ pub struct AdminUsageJournalPreviewResponse {
     pub journal_root: String,
     pub producer_current_file: Option<AdminUsageJournalFileView>,
     pub preview: Option<AdminUsageJournalPreviewFileView>,
+    pub limit: usize,
+    pub offset: usize,
+    pub total: usize,
+    pub has_more: bool,
     pub generated_at: i64,
 }
 
@@ -7487,6 +7492,7 @@ pub async fn fetch_admin_usage_journal_status() -> Result<AdminUsageJournalStatu
 
 pub async fn fetch_admin_usage_journal_preview(
     limit: Option<usize>,
+    offset: Option<usize>,
 ) -> Result<AdminUsageJournalPreviewResponse, String> {
     #[cfg(feature = "mock")]
     {
@@ -7496,8 +7502,16 @@ pub async fn fetch_admin_usage_journal_preview(
     #[cfg(not(feature = "mock"))]
     {
         let mut url = format!("{}/admin/llm-access/usage-journal/preview", admin_base());
+        let mut query = Vec::new();
         if let Some(limit) = limit {
-            url.push_str(&format!("?limit={limit}"));
+            query.push(format!("limit={limit}"));
+        }
+        if let Some(offset) = offset {
+            query.push(format!("offset={offset}"));
+        }
+        if !query.is_empty() {
+            url.push('?');
+            url.push_str(&query.join("&"));
         }
         let response = api_get(&url)
             .send()
@@ -10558,6 +10572,8 @@ mod tests {
         let status = AdminUsageJournalStatusView::default();
         let _fetch = fetch_admin_usage_journal_status;
 
+        assert_eq!(status.current_rpm, 0);
+        assert_eq!(status.current_in_flight, 0);
         assert_eq!(status.worker.processed_events, 0);
         assert_eq!(status.worker.process_memory.rss_bytes, None);
         assert!(status.sealed_files.is_empty());

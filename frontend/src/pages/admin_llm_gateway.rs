@@ -59,6 +59,7 @@ use crate::{
 const USAGE_PAGE_SIZE: usize = 20;
 const USAGE_MAX_OFFSET: usize = 200;
 const USAGE_MAX_PAGES: usize = (USAGE_MAX_OFFSET / USAGE_PAGE_SIZE) + 1;
+const JOURNAL_PREVIEW_PAGE_SIZE: usize = 20;
 const USAGE_TIME_RANGE_ALL: &str = "all";
 const USAGE_TIME_RANGE_1H: &str = "1h";
 const USAGE_TIME_RANGE_24H: &str = "24h";
@@ -867,9 +868,11 @@ fn usage_journal_preview_message_table_preview(
 }
 
 async fn tokio_like_join_usage_journal(
+    preview_offset: usize,
 ) -> Result<(AdminUsageJournalStatusView, AdminUsageJournalPreviewResponse), String> {
     let status_fut = fetch_admin_usage_journal_status();
-    let preview_fut = fetch_admin_usage_journal_preview(Some(50));
+    let preview_fut =
+        fetch_admin_usage_journal_preview(Some(JOURNAL_PREVIEW_PAGE_SIZE), Some(preview_offset));
     let (status, preview) = futures::future::join(status_fut, preview_fut).await;
     Ok((status?, preview?))
 }
@@ -2055,6 +2058,7 @@ pub fn admin_llm_gateway_page() -> Html {
     let usage_source = use_state(|| USAGE_SOURCE_HOT.to_string());
     let usage_journal_status = use_state(|| None::<AdminUsageJournalStatusView>);
     let usage_journal_preview = use_state(|| None::<AdminUsageJournalPreviewResponse>);
+    let usage_journal_preview_page = use_state(|| 1_usize);
     let usage_journal_loading = use_state(|| false);
     let usage_journal_error = use_state(|| None::<String>);
     let token_requests = use_state(Vec::<AdminLlmGatewayTokenRequestView>::new);
@@ -2255,19 +2259,27 @@ pub fn admin_llm_gateway_page() -> Html {
     let reload_usage_journal_status = {
         let usage_journal_status = usage_journal_status.clone();
         let usage_journal_preview = usage_journal_preview.clone();
+        let usage_journal_preview_page = usage_journal_preview_page.clone();
         let usage_journal_loading = usage_journal_loading.clone();
         let usage_journal_error = usage_journal_error.clone();
-        Callback::from(move |_| {
+        Callback::from(move |requested_page: Option<usize>| {
             let usage_journal_status = usage_journal_status.clone();
             let usage_journal_preview = usage_journal_preview.clone();
+            let usage_journal_preview_page = usage_journal_preview_page.clone();
             let usage_journal_loading = usage_journal_loading.clone();
             let usage_journal_error = usage_journal_error.clone();
+            let page = requested_page.unwrap_or(*usage_journal_preview_page).max(1);
+            let offset = (page - 1) * JOURNAL_PREVIEW_PAGE_SIZE;
             usage_journal_loading.set(true);
             wasm_bindgen_futures::spawn_local(async move {
-                match tokio_like_join_usage_journal().await {
+                match tokio_like_join_usage_journal(offset).await {
                     Ok((status, preview)) => {
+                        let actual_page = (preview.offset / preview.limit.max(1))
+                            .saturating_add(1)
+                            .max(1);
                         usage_journal_status.set(Some(status));
                         usage_journal_preview.set(Some(preview));
+                        usage_journal_preview_page.set(actual_page);
                         usage_journal_error.set(None);
                     },
                     Err(err) => usage_journal_error.set(Some(err)),
@@ -2648,9 +2660,9 @@ pub fn admin_llm_gateway_page() -> Html {
         let reload_usage_journal_status = reload_usage_journal_status.clone();
         use_effect_with(((*active_tab).clone(),), move |(active_tab,)| {
             let interval = if should_load_usage_journal(active_tab) {
-                reload_usage_journal_status.emit(());
+                reload_usage_journal_status.emit(None);
                 Some(Interval::new(5_000, move || {
-                    reload_usage_journal_status.emit(());
+                    reload_usage_journal_status.emit(None);
                 }))
             } else {
                 None
@@ -3349,6 +3361,15 @@ pub fn admin_llm_gateway_page() -> Html {
         })
     };
 
+    let on_usage_journal_preview_page_change = {
+        let usage_journal_preview_page = usage_journal_preview_page.clone();
+        let reload_usage_journal_status = reload_usage_journal_status.clone();
+        Callback::from(move |page: usize| {
+            usage_journal_preview_page.set(page);
+            reload_usage_journal_status.emit(Some(page));
+        })
+    };
+
     let on_usage_scroll_top = {
         let usage_scroll_top_ref = usage_scroll_top_ref.clone();
         let usage_scroll_bottom_ref = usage_scroll_bottom_ref.clone();
@@ -3423,6 +3444,10 @@ pub fn admin_llm_gateway_page() -> Html {
         .max(1)
         .div_ceil(USAGE_PAGE_SIZE)
         .min(USAGE_MAX_PAGES);
+    let usage_journal_preview_total_pages = (*usage_journal_preview)
+        .as_ref()
+        .map(|resp| resp.total.max(1).div_ceil(resp.limit.max(1)))
+        .unwrap_or(1);
     let token_request_total_pages = (*token_request_total)
         .max(1)
         .div_ceil(TOKEN_REQUEST_PAGE_SIZE);
@@ -4909,7 +4934,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                 class={classes!("btn-terminal", "btn-terminal-secondary")}
                                 onclick={{
                                     let reload_usage_journal_status = reload_usage_journal_status.clone();
-                                    Callback::from(move |_| reload_usage_journal_status.emit(()))
+                                    Callback::from(move |_| reload_usage_journal_status.emit(None))
                                 }}
                                 disabled={*usage_journal_loading}
                             >
@@ -5059,7 +5084,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                     aria-label="刷新预览"
                                     onclick={{
                                         let reload_usage_journal_status = reload_usage_journal_status.clone();
-                                        Callback::from(move |_| reload_usage_journal_status.emit(()))
+                                        Callback::from(move |_| reload_usage_journal_status.emit(None))
                                     }}
                                     disabled={*usage_journal_loading}
                                 >
@@ -5167,6 +5192,16 @@ pub fn admin_llm_gateway_page() -> Html {
                                         </tbody>
                                     </table>
                                     </div>
+                                </div>
+                                <div class={classes!("mt-5", "flex", "items-center", "justify-between", "gap-3", "flex-wrap")}>
+                                    <div class={classes!("text-xs", "text-[var(--muted)]")}>
+                                        { format!("第 {} 页 · {} 条", *usage_journal_preview_page, preview.total_events) }
+                                    </div>
+                                    <Pagination
+                                        current_page={*usage_journal_preview_page}
+                                        total_pages={usage_journal_preview_total_pages}
+                                        on_page_change={on_usage_journal_preview_page_change.clone()}
+                                    />
                                 </div>
                             } else {
                                 <div class={classes!("mt-4", "text-sm", "text-[var(--muted)]")}>

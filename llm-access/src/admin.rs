@@ -199,6 +199,8 @@ struct AdminSponsorRequestsResponse {
 struct AdminUsageJournalStatusResponse {
     journal_enabled: bool,
     journal_root: String,
+    current_rpm: u32,
+    current_in_flight: u32,
     active_file_sequence: Option<u64>,
     active_file_bytes: u64,
     sealed_file_count: u64,
@@ -223,6 +225,7 @@ struct AdminUsageJournalStatusResponse {
 #[derive(Debug, Deserialize)]
 pub(crate) struct AdminUsageJournalPreviewQuery {
     limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -230,6 +233,10 @@ struct AdminUsageJournalPreviewResponse {
     journal_root: String,
     producer_current_file: Option<AdminUsageJournalFileView>,
     preview: Option<AdminUsageJournalPreviewFileView>,
+    limit: usize,
+    offset: usize,
+    total: usize,
+    has_more: bool,
     generated_at: i64,
 }
 
@@ -240,6 +247,7 @@ struct AdminUsageJournalPreviewFileView {
     bytes_scanned: u64,
     complete_blocks: u64,
     truncated_tail: bool,
+    total_events: usize,
     events: Vec<AdminUsageJournalPreviewEventView>,
 }
 
@@ -1177,6 +1185,7 @@ pub(crate) async fn get_usage_journal_status(
             .map(|path| path.display().to_string())
             .unwrap_or_default();
     }
+    let activity = state.request_activity.snapshot(None);
     let now = now_ms();
     let files = match journal_file_lists(&state) {
         Ok(files) => files,
@@ -1190,6 +1199,8 @@ pub(crate) async fn get_usage_journal_status(
     Json(AdminUsageJournalStatusResponse {
         journal_enabled: journal.journal_enabled,
         journal_root: journal.journal_root,
+        current_rpm: activity.rpm,
+        current_in_flight: activity.in_flight,
         active_file_sequence: journal.active_file_sequence,
         active_file_bytes: journal.active_file_bytes,
         sealed_file_count: journal.sealed_file_count,
@@ -1252,10 +1263,11 @@ pub(crate) async fn get_usage_journal_preview(
         },
     };
     let producer_current_file = producer_current_journal_file(&journal, &files.active);
+    let limit = query.limit.unwrap_or(50).clamp(1, 200);
+    let offset = query.offset.unwrap_or(0);
     let preview = if let Some(file) = producer_current_file.as_ref() {
-        let limit = query.limit.unwrap_or(50).clamp(1, 200);
         match JournalPreviewReader::open(FsPath::new(&file.path))
-            .and_then(|reader| reader.read_last_events(limit))
+            .and_then(|reader| reader.read_recent_events_page(limit, offset))
         {
             Ok(report) => Some(admin_usage_journal_preview_view(report)),
             Err(err) => {
@@ -1270,10 +1282,16 @@ pub(crate) async fn get_usage_journal_preview(
     } else {
         None
     };
+    let total = preview.as_ref().map(|view| view.total_events).unwrap_or(0);
+    let has_more = total > offset.saturating_add(limit);
     Json(AdminUsageJournalPreviewResponse {
         journal_root: journal.journal_root,
         producer_current_file,
         preview,
+        limit,
+        offset,
+        total,
+        has_more,
         generated_at: now_ms(),
     })
     .into_response()
@@ -3437,6 +3455,7 @@ fn admin_usage_journal_preview_view(
         bytes_scanned: report.bytes_scanned,
         complete_blocks: report.complete_blocks,
         truncated_tail: report.truncated_tail,
+        total_events: report.total_events,
         events: report
             .events
             .into_iter()

@@ -28,6 +28,8 @@ pub struct JournalPreviewReport {
     pub truncated_tail: bool,
     /// Most recent events retained by the preview limit.
     pub events: Vec<JournalUsageEventV1>,
+    /// Total decoded events across complete blocks.
+    pub total_events: usize,
 }
 
 /// Best-effort reader for a producer-side active journal file.
@@ -50,13 +52,25 @@ impl JournalPreviewReader {
 
     /// Read the most recent `event_limit` events from a producer journal file.
     pub fn read_last_events(&self, event_limit: usize) -> Result<JournalPreviewReport> {
+        self.read_recent_events_page(event_limit, 0)
+    }
+
+    /// Read a recent events page from a producer journal file.
+    ///
+    /// `offset` counts backwards from the newest event: `offset=0` returns the
+    /// newest page, `offset=limit` returns the next older page.
+    pub fn read_recent_events_page(
+        &self,
+        event_limit: usize,
+        offset: usize,
+    ) -> Result<JournalPreviewReport> {
         let mut file = File::open(&self.path)
             .with_context(|| format!("failed to open journal preview `{}`", self.path.display()))?;
         let header = read_file_header(&mut file)?;
         let mut bytes_scanned = 8_u64;
         let mut complete_blocks = 0_u64;
         let mut truncated_tail = false;
-        let mut events = Vec::new();
+        let mut all_events = Vec::new();
 
         loop {
             match read_record_tag_preview(&mut file)? {
@@ -103,7 +117,7 @@ impl JournalPreviewReader {
                     }
                     let batch: JournalUsageBatchV1 = postcard::from_bytes(&decoded)?;
                     complete_blocks = complete_blocks.saturating_add(1);
-                    push_recent_events(&mut events, batch.events, event_limit);
+                    all_events.extend(batch.events);
                 },
                 PreviewTag::Tag(tag) => {
                     return Err(anyhow!(
@@ -114,6 +128,11 @@ impl JournalPreviewReader {
             }
         }
 
+        let total_events = all_events.len();
+        let end = total_events.saturating_sub(offset);
+        let start = end.saturating_sub(event_limit);
+        let events = if start >= end { Vec::new() } else { all_events.drain(start..end).collect() };
+
         Ok(JournalPreviewReport {
             path: self.path.clone(),
             file_sequence: header.file_sequence,
@@ -121,22 +140,8 @@ impl JournalPreviewReader {
             complete_blocks,
             truncated_tail,
             events,
+            total_events,
         })
-    }
-}
-
-fn push_recent_events(
-    retained: &mut Vec<JournalUsageEventV1>,
-    incoming: Vec<JournalUsageEventV1>,
-    event_limit: usize,
-) {
-    if event_limit == 0 {
-        return;
-    }
-    retained.extend(incoming);
-    if retained.len() > event_limit {
-        let drop_count = retained.len() - event_limit;
-        retained.drain(0..drop_count);
     }
 }
 
@@ -302,5 +307,32 @@ mod tests {
         assert_eq!(preview.events.len(), 2);
         assert_eq!(preview.events[0].event_id, "evt-1");
         assert_eq!(preview.events[1].event_id, "evt-2");
+    }
+
+    #[test]
+    fn preview_reader_pages_back_from_newest_events() {
+        let root = tempdir().expect("tempdir");
+        let config = JournalConfig::new(root.path().to_path_buf());
+        let mut writer = JournalWriter::open(config).expect("writer");
+        writer
+            .append_events(&[
+                sample_event("evt-1", 1),
+                sample_event("evt-2", 2),
+                sample_event("evt-3", 3),
+                sample_event("evt-4", 4),
+            ])
+            .expect("append events");
+        writer.flush().expect("flush");
+        let path = writer.active_path().to_path_buf();
+
+        let preview = super::JournalPreviewReader::open(&path)
+            .expect("preview open")
+            .read_recent_events_page(2, 1)
+            .expect("preview read");
+
+        assert_eq!(preview.total_events, 4);
+        assert_eq!(preview.events.len(), 2);
+        assert_eq!(preview.events[0].event_id, "evt-2");
+        assert_eq!(preview.events[1].event_id, "evt-3");
     }
 }
