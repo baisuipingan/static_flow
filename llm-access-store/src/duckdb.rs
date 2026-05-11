@@ -202,7 +202,7 @@ impl UsageEventRow {
     }
 }
 
-/// Return the insert statement for the DuckDB `usage_events` wide fact table.
+/// Return the insert statement for the DuckDB `usage_events` fact table.
 pub fn insert_usage_event_sql() -> &'static str {
     "INSERT INTO usage_events (
         source_seq, source_event_id, event_id, created_at_ms, created_at,
@@ -214,19 +214,28 @@ pub fn insert_usage_event_sql() -> &'static str {
         request_json_parse_ms, pre_handler_ms, first_sse_write_ms,
         stream_finish_ms, stream_completed_cleanly, downstream_disconnect,
         final_event_type, bytes_streamed, request_body_bytes,
-        quota_failover_count, routing_diagnostics_json,
-        input_uncached_tokens, input_cached_tokens, output_tokens, billable_tokens,
-        credit_usage, usage_missing, credit_usage_missing, client_ip, ip_region,
-        request_headers_json, last_message_content, client_request_body_json,
-        upstream_request_body_json, full_request_json
+        quota_failover_count, input_uncached_tokens, input_cached_tokens,
+        output_tokens, billable_tokens, credit_usage, usage_missing,
+        credit_usage_missing, client_ip, ip_region
      ) VALUES (
         ?1, ?2, ?3, ?4, to_timestamp(?4 / 1000.0),
         CAST(to_timestamp(?4 / 1000.0) AS DATE),
         date_trunc('hour', to_timestamp(?4 / 1000.0)),
         ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
         ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-        ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44,
-        ?45, ?46, ?47, ?48
+        ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42
+     )
+     ON CONFLICT DO NOTHING"
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn insert_usage_event_detail_sql() -> &'static str {
+    "INSERT INTO usage_event_details (
+        event_id, request_headers_json, routing_diagnostics_json,
+        last_message_content, client_request_body_json,
+        upstream_request_body_json, full_request_json
+     ) VALUES (
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7
      )
      ON CONFLICT DO NOTHING"
 }
@@ -249,56 +258,6 @@ fn duckdb_compact_connection_sql(
         duckdb_string_literal(DUCKDB_COMPACT_MAX_TEMP_DIRECTORY_SIZE),
     )
 }
-
-#[cfg(feature = "duckdb-runtime")]
-const COMPACT_COPY_USAGE_EVENTS_SQL: &str = "
-    INSERT INTO usage_events (
-        source_seq, source_event_id, event_id, created_at_ms, created_at,
-        created_date, created_hour, provider_type, protocol_family, key_id,
-        key_name, key_status_at_event, account_name, account_group_id_at_event,
-        route_strategy_at_event, request_method, request_url, endpoint, model,
-        mapped_model, status_code, latency_ms, routing_wait_ms,
-        upstream_headers_ms, post_headers_body_ms, request_body_read_ms,
-        request_json_parse_ms, pre_handler_ms, first_sse_write_ms,
-        stream_finish_ms, stream_completed_cleanly, downstream_disconnect,
-        final_event_type, bytes_streamed, request_body_bytes,
-        quota_failover_count, routing_diagnostics_json,
-        input_uncached_tokens, input_cached_tokens, output_tokens, billable_tokens,
-        credit_usage, usage_missing, credit_usage_missing, client_ip, ip_region,
-        request_headers_json, last_message_content, client_request_body_json,
-        upstream_request_body_json, full_request_json
-    )
-    SELECT
-        source_seq, source_event_id, event_id, created_at_ms, created_at,
-        created_date, created_hour, provider_type, protocol_family, key_id,
-        key_name, key_status_at_event, account_name, account_group_id_at_event,
-        route_strategy_at_event, request_method, request_url, endpoint, model,
-        mapped_model, status_code, latency_ms, routing_wait_ms,
-        upstream_headers_ms, post_headers_body_ms, request_body_read_ms,
-        request_json_parse_ms, pre_handler_ms, first_sse_write_ms,
-        stream_finish_ms, stream_completed_cleanly, downstream_disconnect,
-        final_event_type, bytes_streamed, request_body_bytes,
-        quota_failover_count, routing_diagnostics_json,
-        input_uncached_tokens, input_cached_tokens, output_tokens, billable_tokens,
-        credit_usage, usage_missing, credit_usage_missing, client_ip, ip_region,
-        request_headers_json, last_message_content, client_request_body_json,
-        upstream_request_body_json, full_request_json
-    FROM pending_segment.usage_events;
-";
-
-#[cfg(feature = "duckdb-runtime")]
-const COMPACT_COPY_USAGE_EVENT_DETAILS_SQL: &str = "
-    INSERT INTO usage_event_details (
-        event_id, request_headers_json, routing_diagnostics_json,
-        last_message_content, client_request_body_json,
-        upstream_request_body_json, full_request_json
-    )
-    SELECT
-        event_id, request_headers_json, routing_diagnostics_json,
-        last_message_content, client_request_body_json,
-        upstream_request_body_json, full_request_json
-    FROM pending_segment.usage_event_details;
-";
 
 #[cfg(feature = "duckdb-runtime")]
 const COMPACT_COPY_USAGE_ROLLUPS_HOURLY_SQL: &str = "
@@ -341,6 +300,189 @@ const COMPACT_COPY_USAGE_ROLLUPS_DAILY_SQL: &str = "
 ";
 
 #[cfg(feature = "duckdb-runtime")]
+fn compact_copy_usage_events_sql(columns: &HashSet<String>) -> String {
+    let select = vec![
+        compact_source_required_expr("source_seq"),
+        compact_source_required_expr("source_event_id"),
+        compact_source_required_expr("event_id"),
+        compact_source_required_expr("created_at_ms"),
+        compact_source_required_expr("created_at"),
+        compact_source_required_expr("created_date"),
+        compact_source_required_expr("created_hour"),
+        compact_source_required_expr("provider_type"),
+        compact_source_required_expr("protocol_family"),
+        compact_source_required_expr("key_id"),
+        compact_source_required_expr("key_name"),
+        compact_source_required_expr("key_status_at_event"),
+        compact_source_column_expr(columns, "account_name", "CAST(NULL AS VARCHAR)"),
+        compact_source_column_expr(columns, "account_group_id_at_event", "CAST(NULL AS VARCHAR)"),
+        compact_source_column_expr(columns, "route_strategy_at_event", "CAST(NULL AS VARCHAR)"),
+        compact_source_column_expr(columns, "request_method", "'POST'"),
+        compact_source_column_expr(columns, "request_url", "''"),
+        compact_source_required_expr("endpoint"),
+        compact_source_column_expr(columns, "model", "CAST(NULL AS VARCHAR)"),
+        compact_source_column_expr(columns, "mapped_model", "CAST(NULL AS VARCHAR)"),
+        compact_source_required_expr("status_code"),
+        compact_source_column_expr(columns, "latency_ms", "CAST(NULL AS INTEGER)"),
+        compact_source_column_expr(columns, "routing_wait_ms", "CAST(NULL AS INTEGER)"),
+        compact_source_column_expr(columns, "upstream_headers_ms", "CAST(NULL AS INTEGER)"),
+        compact_source_column_expr(columns, "post_headers_body_ms", "CAST(NULL AS INTEGER)"),
+        compact_source_column_expr(columns, "request_body_read_ms", "CAST(NULL AS INTEGER)"),
+        compact_source_column_expr(columns, "request_json_parse_ms", "CAST(NULL AS INTEGER)"),
+        compact_source_column_expr(columns, "pre_handler_ms", "CAST(NULL AS INTEGER)"),
+        compact_source_column_expr(columns, "first_sse_write_ms", "CAST(NULL AS INTEGER)"),
+        compact_source_column_expr(columns, "stream_finish_ms", "CAST(NULL AS INTEGER)"),
+        compact_source_column_expr(columns, "stream_completed_cleanly", "CAST(NULL AS BOOLEAN)"),
+        compact_source_column_expr(columns, "downstream_disconnect", "CAST(NULL AS BOOLEAN)"),
+        compact_source_column_expr(columns, "final_event_type", "CAST(NULL AS VARCHAR)"),
+        compact_source_column_expr(columns, "bytes_streamed", "CAST(NULL AS BIGINT)"),
+        compact_source_column_expr(columns, "request_body_bytes", "CAST(NULL AS BIGINT)"),
+        compact_source_column_expr(columns, "quota_failover_count", "CAST(0 AS BIGINT)"),
+        compact_source_required_expr("input_uncached_tokens"),
+        compact_source_required_expr("input_cached_tokens"),
+        compact_source_required_expr("output_tokens"),
+        compact_source_required_expr("billable_tokens"),
+        compact_source_expr(
+            columns,
+            "credit_usage",
+            "CAST(e.credit_usage AS VARCHAR)",
+            "CAST(NULL AS VARCHAR)",
+        ),
+        compact_source_column_expr(columns, "usage_missing", "false"),
+        compact_source_column_expr(columns, "credit_usage_missing", "true"),
+        compact_source_column_expr(columns, "client_ip", "CAST(NULL AS VARCHAR)"),
+        compact_source_column_expr(columns, "ip_region", "CAST(NULL AS VARCHAR)"),
+    ]
+    .join(",\n        ");
+
+    format!(
+        "INSERT INTO usage_events (
+        source_seq, source_event_id, event_id, created_at_ms, created_at,
+        created_date, created_hour, provider_type, protocol_family, key_id,
+        key_name, key_status_at_event, account_name, account_group_id_at_event,
+        route_strategy_at_event, request_method, request_url, endpoint, model,
+        mapped_model, status_code, latency_ms, routing_wait_ms,
+        upstream_headers_ms, post_headers_body_ms, request_body_read_ms,
+        request_json_parse_ms, pre_handler_ms, first_sse_write_ms,
+        stream_finish_ms, stream_completed_cleanly, downstream_disconnect,
+        final_event_type, bytes_streamed, request_body_bytes,
+        quota_failover_count, input_uncached_tokens, input_cached_tokens,
+        output_tokens, billable_tokens, credit_usage, usage_missing,
+        credit_usage_missing, client_ip, ip_region
+    )
+    SELECT
+        {select}
+    FROM pending_segment.usage_events e;"
+    )
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn compact_copy_usage_event_details_sql(
+    event_columns: &HashSet<String>,
+    pending_has_details_table: bool,
+) -> String {
+    let request_headers_expr = compact_detail_payload_expr(
+        event_columns,
+        pending_has_details_table,
+        "request_headers_json",
+        "'{}'",
+    );
+    let routing_expr = compact_detail_payload_expr(
+        event_columns,
+        pending_has_details_table,
+        "routing_diagnostics_json",
+        "CAST(NULL AS VARCHAR)",
+    );
+    let last_message_expr = compact_detail_payload_expr(
+        event_columns,
+        pending_has_details_table,
+        "last_message_content",
+        "CAST(NULL AS VARCHAR)",
+    );
+    let client_body_expr = compact_detail_payload_expr(
+        event_columns,
+        pending_has_details_table,
+        "client_request_body_json",
+        "CAST(NULL AS VARCHAR)",
+    );
+    let upstream_body_expr = compact_detail_payload_expr(
+        event_columns,
+        pending_has_details_table,
+        "upstream_request_body_json",
+        "CAST(NULL AS VARCHAR)",
+    );
+    let full_request_expr = compact_detail_payload_expr(
+        event_columns,
+        pending_has_details_table,
+        "full_request_json",
+        "CAST(NULL AS VARCHAR)",
+    );
+    let from_sql = if pending_has_details_table {
+        "FROM pending_segment.usage_events e
+    LEFT JOIN pending_segment.usage_event_details d ON d.event_id = e.event_id"
+    } else {
+        "FROM pending_segment.usage_events e"
+    };
+
+    format!(
+        "INSERT INTO usage_event_details (
+        event_id, request_headers_json, routing_diagnostics_json,
+        last_message_content, client_request_body_json,
+        upstream_request_body_json, full_request_json
+    )
+    SELECT
+        e.event_id AS event_id,
+        {request_headers_expr} AS request_headers_json,
+        {routing_expr} AS routing_diagnostics_json,
+        {last_message_expr} AS last_message_content,
+        {client_body_expr} AS client_request_body_json,
+        {upstream_body_expr} AS upstream_request_body_json,
+        {full_request_expr} AS full_request_json
+    {from_sql};"
+    )
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn compact_source_required_expr(column: &'static str) -> String {
+    format!("e.{column} AS {column}")
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn compact_source_column_expr(
+    columns: &HashSet<String>,
+    column: &'static str,
+    missing_sql: &'static str,
+) -> String {
+    compact_source_expr(columns, column, &format!("e.{column}"), missing_sql)
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn compact_source_expr(
+    columns: &HashSet<String>,
+    column: &'static str,
+    present_sql: &str,
+    missing_sql: &'static str,
+) -> String {
+    let sql = if columns.contains(column) { present_sql } else { missing_sql };
+    format!("{sql} AS {column}")
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn compact_detail_payload_expr(
+    event_columns: &HashSet<String>,
+    pending_has_details_table: bool,
+    column: &'static str,
+    missing_sql: &'static str,
+) -> String {
+    match (pending_has_details_table, event_columns.contains(column)) {
+        (true, true) => format!("COALESCE(d.{column}, e.{column})"),
+        (true, false) => format!("d.{column}"),
+        (false, true) => format!("e.{column}"),
+        (false, false) => missing_sql.to_string(),
+    }
+}
+
+#[cfg(feature = "duckdb-runtime")]
 const USAGE_EVENT_ONLINE_MAX_LIMIT: usize = 20;
 #[cfg(feature = "duckdb-runtime")]
 const USAGE_EVENT_ONLINE_MAX_OFFSET: usize = 200;
@@ -355,11 +497,11 @@ const COUNT_USAGE_EVENTS_SQL: &str = "SELECT count(*)
 
 #[cfg(feature = "duckdb-runtime")]
 fn list_usage_event_summaries_sql(conn: &duckdb::Connection) -> anyhow::Result<String> {
-    let columns = usage_event_table_columns(conn)?;
+    let columns = duckdb_table_columns(conn, "usage_events")?;
     let select = usage_event_summary_select_exprs(&columns).join(",\n        ");
     Ok(format!(
         "SELECT {select}
-    FROM usage_events
+    FROM usage_events e
     WHERE (?1 IS NULL OR key_id = ?1)
       AND (?2 IS NULL OR provider_type = ?2)
       AND (?3 IS NULL OR created_at_ms >= ?3)
@@ -370,53 +512,87 @@ fn list_usage_event_summaries_sql(conn: &duckdb::Connection) -> anyhow::Result<S
 
 #[cfg(feature = "duckdb-runtime")]
 fn get_usage_event_detail_sql(conn: &duckdb::Connection) -> anyhow::Result<String> {
-    let columns = usage_event_table_columns(conn)?;
-    let select = usage_event_detail_select_exprs(&columns).join(",\n        ");
-    Ok(format!(
-        "SELECT {select}
-    FROM usage_events
-    WHERE event_id = ?1"
-    ))
+    let columns = duckdb_table_columns(conn, "usage_events")?;
+    let detail_table_exists = duckdb_relation_exists(conn, "usage_event_details");
+    let select = usage_event_detail_select_exprs(&columns, detail_table_exists).join(",\n        ");
+    let from_sql = if detail_table_exists {
+        "FROM usage_events e
+    LEFT JOIN usage_event_details d ON d.event_id = e.event_id"
+    } else {
+        "FROM usage_events e"
+    };
+    Ok(format!("SELECT {select}\n    {from_sql}\n    WHERE e.event_id = ?1"))
 }
 
 #[cfg(feature = "duckdb-runtime")]
-fn usage_event_table_columns(conn: &duckdb::Connection) -> anyhow::Result<HashSet<String>> {
+fn duckdb_table_columns(
+    conn: &duckdb::Connection,
+    table_name: &str,
+) -> anyhow::Result<HashSet<String>> {
     let mut stmt = conn
-        .prepare("PRAGMA table_info('usage_events')")
-        .context("prepare usage_events schema lookup")?;
+        .prepare(&format!("PRAGMA table_info({})", duckdb_string_literal(table_name)))
+        .with_context(|| format!("prepare {table_name} schema lookup"))?;
     let rows = stmt
         .query_map([], |row| row.get::<_, String>(1))
-        .context("query usage_events schema")?;
+        .with_context(|| format!("query {table_name} schema"))?;
     let mut columns = HashSet::new();
     for row in rows {
-        columns.insert(row.context("read usage_events schema row")?);
+        columns.insert(row.with_context(|| format!("read {table_name} schema row"))?);
     }
     Ok(columns)
 }
 
 #[cfg(feature = "duckdb-runtime")]
+fn duckdb_relation_exists(conn: &duckdb::Connection, relation_name: &str) -> bool {
+    let sql = format!("SELECT 1 FROM {relation_name} LIMIT 0");
+    conn.prepare(&sql)
+        .and_then(|mut stmt| stmt.exists([]))
+        .is_ok()
+}
+
+#[cfg(feature = "duckdb-runtime")]
 fn usage_event_summary_select_exprs(columns: &HashSet<String>) -> Vec<String> {
-    let mut exprs = usage_event_base_select_exprs(columns, false);
+    let mut exprs = usage_event_base_select_exprs(columns, false, false);
     exprs.push("CAST(NULL AS VARCHAR) AS last_message_content".to_string());
     exprs
 }
 
 #[cfg(feature = "duckdb-runtime")]
-fn usage_event_detail_select_exprs(columns: &HashSet<String>) -> Vec<String> {
-    let mut exprs = usage_event_base_select_exprs(columns, true);
-    exprs.push(usage_event_column_expr(columns, "last_message_content", "CAST(NULL AS VARCHAR)"));
-    exprs.push(usage_event_column_expr(columns, "request_headers_json", "'{}'"));
-    exprs.push(usage_event_column_expr(
+fn usage_event_detail_select_exprs(
+    columns: &HashSet<String>,
+    detail_table_exists: bool,
+) -> Vec<String> {
+    let mut exprs = usage_event_base_select_exprs(columns, true, detail_table_exists);
+    exprs.push(usage_event_detail_payload_expr(
         columns,
+        detail_table_exists,
+        "last_message_content",
+        "CAST(NULL AS VARCHAR)",
+    ));
+    exprs.push(usage_event_detail_payload_expr(
+        columns,
+        detail_table_exists,
+        "request_headers_json",
+        "'{}'",
+    ));
+    exprs.push(usage_event_detail_payload_expr(
+        columns,
+        detail_table_exists,
         "client_request_body_json",
         "CAST(NULL AS VARCHAR)",
     ));
-    exprs.push(usage_event_column_expr(
+    exprs.push(usage_event_detail_payload_expr(
         columns,
+        detail_table_exists,
         "upstream_request_body_json",
         "CAST(NULL AS VARCHAR)",
     ));
-    exprs.push(usage_event_column_expr(columns, "full_request_json", "CAST(NULL AS VARCHAR)"));
+    exprs.push(usage_event_detail_payload_expr(
+        columns,
+        detail_table_exists,
+        "full_request_json",
+        "CAST(NULL AS VARCHAR)",
+    ));
     exprs
 }
 
@@ -424,6 +600,7 @@ fn usage_event_detail_select_exprs(columns: &HashSet<String>) -> Vec<String> {
 fn usage_event_base_select_exprs(
     columns: &HashSet<String>,
     include_detail_payload: bool,
+    detail_table_exists: bool,
 ) -> Vec<String> {
     vec![
         usage_event_required_expr("event_id"),
@@ -431,7 +608,7 @@ fn usage_event_base_select_exprs(
         usage_event_required_expr("provider_type"),
         usage_event_required_expr("protocol_family"),
         usage_event_required_expr("key_id"),
-        usage_event_column_expr(columns, "key_name", "key_id"),
+        usage_event_column_expr(columns, "key_name", "e.key_id"),
         usage_event_column_expr(columns, "account_name", "CAST(NULL AS VARCHAR)"),
         usage_event_column_expr(columns, "account_group_id_at_event", "CAST(NULL AS VARCHAR)"),
         usage_event_column_expr(columns, "route_strategy_at_event", "CAST(NULL AS VARCHAR)"),
@@ -444,7 +621,12 @@ fn usage_event_base_select_exprs(
         usage_event_column_expr(columns, "request_body_bytes", "CAST(NULL AS BIGINT)"),
         usage_event_column_expr(columns, "quota_failover_count", "CAST(0 AS BIGINT)"),
         if include_detail_payload {
-            usage_event_column_expr(columns, "routing_diagnostics_json", "CAST(NULL AS VARCHAR)")
+            usage_event_detail_payload_expr(
+                columns,
+                detail_table_exists,
+                "routing_diagnostics_json",
+                "CAST(NULL AS VARCHAR)",
+            )
         } else {
             "CAST(NULL AS VARCHAR) AS routing_diagnostics_json".to_string()
         },
@@ -480,7 +662,7 @@ fn usage_event_base_select_exprs(
 
 #[cfg(feature = "duckdb-runtime")]
 fn usage_event_required_expr(column: &'static str) -> String {
-    format!("{column} AS {column}")
+    format!("e.{column} AS {column}")
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -489,17 +671,33 @@ fn usage_event_column_expr(
     column: &'static str,
     missing_sql: &'static str,
 ) -> String {
-    usage_event_expr(columns, column, column, missing_sql)
+    usage_event_expr(columns, column, &format!("e.{column}"), missing_sql)
 }
 
 #[cfg(feature = "duckdb-runtime")]
 fn usage_event_expr(
     columns: &HashSet<String>,
     column: &'static str,
-    present_sql: &'static str,
+    present_sql: &str,
     missing_sql: &'static str,
 ) -> String {
     let sql = if columns.contains(column) { present_sql } else { missing_sql };
+    format!("{sql} AS {column}")
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn usage_event_detail_payload_expr(
+    event_columns: &HashSet<String>,
+    detail_table_exists: bool,
+    column: &'static str,
+    missing_sql: &'static str,
+) -> String {
+    let sql = match (detail_table_exists, event_columns.contains(column)) {
+        (true, true) => format!("COALESCE(d.{column}, e.{column})"),
+        (true, false) => format!("d.{column}"),
+        (false, true) => format!("e.{column}"),
+        (false, false) => missing_sql.to_string(),
+    };
     format!("{sql} AS {column}")
 }
 
@@ -532,9 +730,11 @@ impl DuckDbUsageWriter {
         }
         let tx = self.conn.transaction()?;
         {
-            let mut stmt = tx.prepare(insert_usage_event_sql())?;
+            let mut summary_stmt = tx.prepare(insert_usage_event_sql())?;
+            let mut detail_stmt = tx.prepare(insert_usage_event_detail_sql())?;
             for row in rows {
-                execute_usage_event_insert(&mut stmt, row)?;
+                execute_usage_event_insert(&mut summary_stmt, row)?;
+                execute_usage_event_detail_insert(&mut detail_stmt, row)?;
             }
         }
         tx.commit()?;
@@ -600,7 +800,6 @@ fn execute_usage_event_insert(
         row.bytes_streamed,
         row.request_body_bytes,
         row.quota_failover_count,
-        row.routing_diagnostics_json.as_deref(),
         row.input_uncached_tokens,
         row.input_cached_tokens,
         row.output_tokens,
@@ -610,7 +809,19 @@ fn execute_usage_event_insert(
         row.credit_usage_missing,
         row.client_ip.as_deref(),
         row.ip_region.as_deref(),
+    ])?;
+    Ok(())
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn execute_usage_event_detail_insert(
+    stmt: &mut duckdb::Statement<'_>,
+    row: &UsageEventRow,
+) -> anyhow::Result<()> {
+    stmt.execute(duckdb::params![
+        &row.event_id,
         &row.request_headers_json,
+        row.routing_diagnostics_json.as_deref(),
         row.last_message_content.as_deref(),
         row.client_request_body_json.as_deref(),
         row.upstream_request_body_json.as_deref(),
@@ -1415,6 +1626,15 @@ fn compact_pending_segment_to_local_file(
     segment_id: &str,
     connection_config: DuckDbUsageConnectionConfig,
 ) -> anyhow::Result<PathBuf> {
+    let pending_source_conn = DuckDbUsageRepository::open_read_only_conn(pending_path)?;
+    let pending_event_columns = duckdb_table_columns(&pending_source_conn, "usage_events")?;
+    let pending_has_details_table =
+        duckdb_relation_exists(&pending_source_conn, "usage_event_details");
+    let pending_has_hourly_rollups =
+        duckdb_relation_exists(&pending_source_conn, "usage_rollups_hourly");
+    let pending_has_daily_rollups =
+        duckdb_relation_exists(&pending_source_conn, "usage_rollups_daily");
+
     fs::create_dir_all(tiered_compacting_dir(config)).with_context(|| {
         format!(
             "failed to create compacting duckdb directory `{}`",
@@ -1437,15 +1657,20 @@ fn compact_pending_segment_to_local_file(
     conn.execute_batch(&attach_sql).with_context(|| {
         format!("failed to attach pending duckdb segment `{}`", pending_path.display())
     })?;
-    let compact_sql = [
-        COMPACT_COPY_USAGE_EVENTS_SQL,
-        COMPACT_COPY_USAGE_EVENT_DETAILS_SQL,
-        COMPACT_COPY_USAGE_ROLLUPS_HOURLY_SQL,
-        COMPACT_COPY_USAGE_ROLLUPS_DAILY_SQL,
-        "DETACH pending_segment;",
-        "CHECKPOINT;",
-    ]
-    .join("\n");
+    let copy_usage_events_sql = compact_copy_usage_events_sql(&pending_event_columns);
+    let copy_usage_event_details_sql =
+        compact_copy_usage_event_details_sql(&pending_event_columns, pending_has_details_table);
+    let mut compact_sql_parts =
+        vec![copy_usage_events_sql.as_str(), copy_usage_event_details_sql.as_str()];
+    if pending_has_hourly_rollups {
+        compact_sql_parts.push(COMPACT_COPY_USAGE_ROLLUPS_HOURLY_SQL);
+    }
+    if pending_has_daily_rollups {
+        compact_sql_parts.push(COMPACT_COPY_USAGE_ROLLUPS_DAILY_SQL);
+    }
+    compact_sql_parts.push("DETACH pending_segment;");
+    compact_sql_parts.push("CHECKPOINT;");
+    let compact_sql = compact_sql_parts.join("\n");
     conn.execute_batch(&compact_sql).with_context(|| {
         format!(
             "failed to compact pending duckdb segment `{}` into `{}`",
@@ -2766,6 +2991,16 @@ mod tests {
     }
 
     #[cfg(feature = "duckdb-runtime")]
+    fn assert_usage_event_detail_payloads(actual: &UsageEvent, expected: &UsageEvent) {
+        assert_eq!(actual.request_headers_json, expected.request_headers_json);
+        assert_eq!(actual.routing_diagnostics_json, expected.routing_diagnostics_json);
+        assert_eq!(actual.last_message_content, expected.last_message_content);
+        assert_eq!(actual.client_request_body_json, expected.client_request_body_json);
+        assert_eq!(actual.upstream_request_body_json, expected.upstream_request_body_json);
+        assert_eq!(actual.full_request_json, expected.full_request_json);
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
     fn create_legacy_usage_archive_without_stream_columns(path: &std::path::Path) {
         let conn = duckdb::Connection::open(path).expect("open legacy archive");
         conn.execute_batch(
@@ -3147,6 +3382,84 @@ mod tests {
             .await
             .expect("list deduplicated page");
         assert_eq!(page.total, 3);
+
+        std::fs::remove_dir_all(&root).expect("cleanup duckdb test directory");
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
+    #[tokio::test]
+    async fn duckdb_repository_separates_detail_payloads_from_usage_fact_rows() {
+        let root = std::env::temp_dir()
+            .join(format!("llm-access-duckdb-test-{}-detail-split", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create duckdb test directory");
+        let db_path = root.join("usage.duckdb");
+        let repo = super::DuckDbUsageRepository::open_path(&db_path).expect("open duckdb usage db");
+        let event = test_usage_event();
+
+        repo.append_usage_event(&event)
+            .await
+            .expect("append duckdb usage event");
+
+        let conn =
+            super::DuckDbUsageRepository::open_read_only_conn(&db_path).expect("open read-only db");
+        let fact_row = conn
+            .query_row(
+                "SELECT request_headers_json, routing_diagnostics_json, last_message_content,
+                        client_request_body_json, upstream_request_body_json, full_request_json
+                 FROM usage_events WHERE event_id = ?1",
+                [&event.event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .expect("read fact row");
+        assert_eq!(fact_row.0, "{}");
+        assert_eq!(fact_row.1, None);
+        assert_eq!(fact_row.2, None);
+        assert_eq!(fact_row.3, None);
+        assert_eq!(fact_row.4, None);
+        assert_eq!(fact_row.5, None);
+
+        let detail_row = conn
+            .query_row(
+                "SELECT request_headers_json, routing_diagnostics_json, last_message_content,
+                        client_request_body_json, upstream_request_body_json, full_request_json
+                 FROM usage_event_details WHERE event_id = ?1",
+                [&event.event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .expect("read detail row");
+        assert_eq!(detail_row.0.as_deref(), Some(event.request_headers_json.as_str()));
+        assert_eq!(detail_row.1.as_deref(), event.routing_diagnostics_json.as_deref());
+        assert_eq!(detail_row.2.as_deref(), event.last_message_content.as_deref());
+        assert_eq!(detail_row.3.as_deref(), event.client_request_body_json.as_deref());
+        assert_eq!(detail_row.4.as_deref(), event.upstream_request_body_json.as_deref());
+        assert_eq!(detail_row.5.as_deref(), event.full_request_json.as_deref());
+
+        let detail = repo
+            .get_usage_event(&event.event_id)
+            .await
+            .expect("get usage event detail")
+            .expect("usage event exists");
+        assert_usage_event_round_trips(&detail, &event);
+        assert_usage_event_detail_payloads(&detail, &event);
 
         std::fs::remove_dir_all(&root).expect("cleanup duckdb test directory");
     }
@@ -4022,6 +4335,92 @@ mod tests {
         assert_eq!(row.1, Some(1234));
 
         std::fs::remove_dir_all(&root).expect("cleanup reordered compact publish test directory");
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
+    #[test]
+    fn duckdb_tiered_publish_backfills_details_from_legacy_wide_pending_segment() {
+        let root = std::env::temp_dir().join(format!(
+            "llm-access-duckdb-test-{}-legacy-pending-detail-backfill",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create legacy pending compact test directory");
+        let config = super::TieredDuckDbUsageConfig {
+            active_dir: root.join("active"),
+            archive_dir: root.join("archive"),
+            catalog_dir: root.join("catalog"),
+            rollover_bytes: 1,
+        };
+        super::initialize_tiered_catalog(&config).expect("initialize tiered catalog");
+
+        let pending_path = root.join("pending-legacy-wide.duckdb");
+        create_legacy_usage_archive_without_stream_columns(&pending_path);
+
+        super::publish_pending_segment(
+            &config,
+            &pending_path,
+            "usage-legacy-pending-000001",
+            super::DuckDbUsageConnectionConfig::default(),
+        )
+        .expect("publish compacted legacy pending segment");
+
+        let archive_path = config
+            .archive_dir
+            .join("usage-legacy-pending-000001.duckdb");
+        let archived = super::DuckDbUsageRepository::open_read_only_conn(&archive_path)
+            .expect("open archived legacy pending segment");
+        let fact_row = archived
+            .query_row(
+                "SELECT request_headers_json, routing_diagnostics_json, last_message_content,
+                        client_request_body_json, upstream_request_body_json, full_request_json
+                 FROM usage_events WHERE event_id = 'legacy-archive-event'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .expect("read archived fact row");
+        assert_eq!(fact_row.0, "{}");
+        assert_eq!(fact_row.1, None);
+        assert_eq!(fact_row.2, None);
+        assert_eq!(fact_row.3, None);
+        assert_eq!(fact_row.4, None);
+        assert_eq!(fact_row.5, None);
+
+        let detail_row = archived
+            .query_row(
+                "SELECT request_headers_json, routing_diagnostics_json, last_message_content,
+                        client_request_body_json, upstream_request_body_json, full_request_json
+                 FROM usage_event_details WHERE event_id = 'legacy-archive-event'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, Option<String>>(0)?,
+                        row.get::<_, Option<String>>(1)?,
+                        row.get::<_, Option<String>>(2)?,
+                        row.get::<_, Option<String>>(3)?,
+                        row.get::<_, Option<String>>(4)?,
+                        row.get::<_, Option<String>>(5)?,
+                    ))
+                },
+            )
+            .expect("read archived detail row");
+        assert_eq!(detail_row.0.as_deref(), Some(r#"{"host":["example.test"]}"#));
+        assert_eq!(detail_row.1.as_deref(), Some(r#"{"route":"legacy"}"#));
+        assert_eq!(detail_row.2.as_deref(), Some("hello"));
+        assert_eq!(detail_row.3.as_deref(), Some(r#"{"model":"claude-sonnet-4-5"}"#));
+        assert_eq!(detail_row.4.as_deref(), Some(r#"{"conversationState":{}}"#));
+        assert_eq!(detail_row.5.as_deref(), Some(r#"{"model":"claude-sonnet-4-5"}"#));
+
+        std::fs::remove_dir_all(&root).expect("cleanup legacy pending compact test directory");
     }
 
     #[cfg(feature = "duckdb-runtime")]
