@@ -887,18 +887,18 @@ impl DuckDbUsageRepository {
         })
     }
 
-    fn open_conn(path: &Path) -> anyhow::Result<duckdb::Connection> {
-        Self::open_conn_with_connection_config(path, DuckDbUsageConnectionConfig::default())
-    }
-
     fn open_conn_with_connection_config(
         path: &Path,
         connection_config: DuckDbUsageConnectionConfig,
     ) -> anyhow::Result<duckdb::Connection> {
-        let conn = duckdb::Connection::open(path)
-            .with_context(|| format!("failed to open duckdb database `{}`", path.display()))?;
+        let conn = Self::open_raw_conn(path)?;
         configure_duckdb_usage_connection(&conn, connection_config)?;
         Ok(conn)
+    }
+
+    fn open_raw_conn(path: &Path) -> anyhow::Result<duckdb::Connection> {
+        duckdb::Connection::open(path)
+            .with_context(|| format!("failed to open duckdb database `{}`", path.display()))
     }
 
     fn open_read_only_conn(path: &Path) -> anyhow::Result<duckdb::Connection> {
@@ -916,8 +916,7 @@ impl DuckDbUsageRepository {
         path: &Path,
         connection_config: DuckDbUsageConnectionConfig,
     ) -> anyhow::Result<duckdb::Connection> {
-        let conn = duckdb::Connection::open(path)
-            .with_context(|| format!("failed to open duckdb database `{}`", path.display()))?;
+        let conn = Self::open_raw_conn(path)?;
         let temp_dir = path
             .parent()
             .unwrap_or_else(|| Path::new("."))
@@ -1425,7 +1424,7 @@ fn compact_pending_segment_to_local_file(
     let compact_path = compacting_segment_path(config, segment_id);
     remove_file_if_exists(&compact_path)?;
 
-    let conn = DuckDbUsageRepository::open_conn(&compact_path)?;
+    let conn = DuckDbUsageRepository::open_raw_conn(&compact_path)?;
     configure_duckdb_compact_connection(&conn, &tiered_compacting_dir(config), connection_config)?;
     crate::initialize_duckdb_target(&conn)?;
     let pending_path_str = pending_path
