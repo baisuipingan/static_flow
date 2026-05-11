@@ -2230,6 +2230,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_gateway_request_repairs_custom_tool_call_to_use_input_field() {
+        let headers = axum::http::HeaderMap::new();
+        let body = Body::from(
+            r#"{
+                "model":"gpt-5.3-codex",
+                "input":[
+                    {"type":"custom_tool_call","call_id":"callpatch1","name":"apply_patch","arguments":"*** Begin Patch"},
+                    {"type":"custom_tool_call_output","call_id":"callpatch1","output":"ok"}
+                ]
+            }"#,
+        );
+
+        let prepared = prepare_gateway_request(
+            "/v1/responses",
+            "",
+            axum::http::Method::POST,
+            &headers,
+            body,
+            1024 * 1024,
+        )
+        .await
+        .expect("custom tool call should normalize");
+
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&prepared.request_body).expect("upstream body json");
+        assert_eq!(upstream["input"][0]["type"], json!("custom_tool_call"));
+        assert_eq!(upstream["input"][0]["call_id"], json!("callpatch1"));
+        assert_eq!(upstream["input"][0]["input"], json!("*** Begin Patch"));
+        assert!(upstream["input"][0].get("arguments").is_none());
+        assert_eq!(upstream["input"][1]["type"], json!("custom_tool_call_output"));
+    }
+
+    #[tokio::test]
     async fn prepare_gateway_request_repairs_responses_tool_call_without_output() {
         let headers = axum::http::HeaderMap::new();
         let body = Body::from(

@@ -82,6 +82,23 @@ fn map_response_content_text(content: &Value, out: &mut String) {
     }
 }
 
+fn responses_tool_call_arguments_string(item_obj: &Map<String, Value>, item_type: &str) -> String {
+    let value = match item_type {
+        "custom_tool_call" => item_obj.get("input"),
+        _ => item_obj.get("arguments"),
+    };
+    value.map_or_else(
+        || "{}".to_string(),
+        |raw| {
+            if let Some(text) = raw.as_str() {
+                text.to_string()
+            } else {
+                serde_json::to_string(raw).unwrap_or_else(|_| "{}".to_string())
+            }
+        },
+    )
+}
+
 /// Adapt a completed responses payload into the classic chat/completions
 /// schema.
 fn map_response_to_chat_completion(
@@ -135,16 +152,7 @@ fn map_response_to_chat_completion(
                         .and_then(Value::as_str)
                         .map(|name| restore_openai_tool_name(name, tool_name_restore_map))
                         .unwrap_or_else(|| "tool".to_string());
-                    let arguments = item_obj
-                        .get("arguments")
-                        .map(|raw| {
-                            if let Some(text) = raw.as_str() {
-                                text.to_string()
-                            } else {
-                                serde_json::to_string(raw).unwrap_or_else(|_| "{}".to_string())
-                            }
-                        })
-                        .unwrap_or_else(|| "{}".to_string());
+                    let arguments = responses_tool_call_arguments_string(item_obj, item_type);
                     tool_calls.push(json!({
                         "id": call_id,
                         "type": "function",
@@ -437,14 +445,8 @@ fn convert_response_value_to_chat_chunk(
                 let name = item.get("name").and_then(Value::as_str).unwrap_or("tool");
                 let name = restore_openai_tool_name(name, tool_name_restore_map);
                 let arguments = item
-                    .get("arguments")
-                    .map(|raw| {
-                        if let Some(text) = raw.as_str() {
-                            text.to_string()
-                        } else {
-                            serde_json::to_string(raw).unwrap_or_else(|_| "{}".to_string())
-                        }
-                    })
+                    .as_object()
+                    .map(|obj| responses_tool_call_arguments_string(obj, item_type))
                     .unwrap_or_else(|| "{}".to_string());
                 return Some(json!({
                     "id": stream_event_response_id(value),

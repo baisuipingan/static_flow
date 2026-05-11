@@ -212,15 +212,28 @@ fn repair_function_call_item(
 ) -> Option<Map<String, Value>> {
     let call_id = extract_non_empty_string(obj.get("call_id").or_else(|| obj.get("id")))?;
     let name = extract_non_empty_string(obj.get("name"))?;
-    let arguments = obj
-        .get("arguments")
-        .cloned()
-        .unwrap_or_else(|| Value::String("{}".to_string()));
     let mut out = Map::new();
     out.insert("type".to_string(), Value::String(item_type.to_string()));
     out.insert("call_id".to_string(), Value::String(call_id.to_string()));
     out.insert("name".to_string(), Value::String(name.to_string()));
-    out.insert("arguments".to_string(), normalize_arguments(arguments));
+    match item_type {
+        "custom_tool_call" => {
+            let input = obj
+                .get("input")
+                .cloned()
+                .or_else(|| obj.get("arguments").cloned())
+                .unwrap_or_else(|| Value::String(String::new()));
+            out.insert("input".to_string(), normalize_custom_tool_input(input));
+        },
+        _ => {
+            let arguments = obj
+                .get("arguments")
+                .cloned()
+                .or_else(|| obj.get("input").cloned())
+                .unwrap_or_else(|| Value::String("{}".to_string()));
+            out.insert("arguments".to_string(), normalize_arguments(arguments));
+        },
+    }
     Some(out)
 }
 
@@ -245,6 +258,13 @@ fn normalize_arguments(arguments: Value) -> Value {
     match arguments {
         Value::String(text) => Value::String(text),
         other => Value::String(serde_json::to_string(&other).unwrap_or_else(|_| "{}".to_string())),
+    }
+}
+
+fn normalize_custom_tool_input(input: Value) -> Value {
+    match input {
+        Value::String(text) => Value::String(text),
+        other => Value::String(serde_json::to_string(&other).unwrap_or_else(|_| String::new())),
     }
 }
 
@@ -351,5 +371,43 @@ mod tests {
         assert_eq!(input[1]["call_id"], json!("callauto12"));
         assert_eq!(input[2]["call_id"], json!("callauto12__sf_2"));
         assert_eq!(input[3]["call_id"], json!("callauto12__sf_2"));
+    }
+
+    #[test]
+    fn repair_custom_tool_call_preserves_input_contract() {
+        let mut root = serde_json::Map::new();
+        root.insert(
+            "input".to_string(),
+            json!([
+                {"type":"custom_tool_call","call_id":"callcustom1","name":"apply_patch","input":"*** Begin Patch"},
+                {"type":"custom_tool_call_output","call_id":"callcustom1","output":"ok"}
+            ]),
+        );
+
+        repair_responses_request(&mut root).expect("repair should succeed");
+
+        let input = root["input"].as_array().expect("input array");
+        assert_eq!(input[0]["type"], json!("custom_tool_call"));
+        assert_eq!(input[0]["input"], json!("*** Begin Patch"));
+        assert!(input[0].get("arguments").is_none());
+    }
+
+    #[test]
+    fn repair_custom_tool_call_recovers_buggy_arguments_field() {
+        let mut root = serde_json::Map::new();
+        root.insert(
+            "input".to_string(),
+            json!([
+                {"type":"custom_tool_call","call_id":"callcustom1","name":"apply_patch","arguments":"*** Begin Patch"},
+                {"type":"custom_tool_call_output","call_id":"callcustom1","output":"ok"}
+            ]),
+        );
+
+        repair_responses_request(&mut root).expect("repair should succeed");
+
+        let input = root["input"].as_array().expect("input array");
+        assert_eq!(input[0]["type"], json!("custom_tool_call"));
+        assert_eq!(input[0]["input"], json!("*** Begin Patch"));
+        assert!(input[0].get("arguments").is_none());
     }
 }

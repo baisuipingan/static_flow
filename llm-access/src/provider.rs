@@ -7626,6 +7626,7 @@ mod tests {
             .expect("upstream json response")
     }
 
+
     async fn fake_codex_responses_empty_completed_output(
         State(captured): State<Arc<CapturedCodexUpstream>>,
         headers: HeaderMap,
@@ -9308,6 +9309,7 @@ mod tests {
         assert_eq!(input[1]["role"], json!("assistant"));
         assert_eq!(input[2]["role"], json!("user"));
     }
+
 
     #[tokio::test]
     async fn codex_dispatch_rejects_invalid_anthropic_messages_with_json_error_and_usage() {

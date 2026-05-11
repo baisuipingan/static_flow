@@ -767,6 +767,13 @@ fn parse_tool_arguments_value(value: Option<&Value>) -> Value {
     value.clone()
 }
 
+fn parse_responses_tool_input_value(item_obj: &Map<String, Value>, item_type: &str) -> Value {
+    match item_type {
+        "custom_tool_call" => parse_tool_arguments_value(item_obj.get("input")),
+        _ => parse_tool_arguments_value(item_obj.get("arguments")),
+    }
+}
+
 fn anthropic_usage_from_response(source: &Value) -> Value {
     let usage = source.get("usage").cloned().unwrap_or(Value::Null);
     let input_total = usage
@@ -877,7 +884,7 @@ pub fn map_response_to_anthropic_message(
                         "type": "tool_use",
                         "id": call_id,
                         "name": name,
-                        "input": parse_tool_arguments_value(item_obj.get("arguments")),
+                        "input": parse_responses_tool_input_value(item_obj, item_type),
                     }));
                 },
                 _ => {},
@@ -1179,7 +1186,10 @@ pub fn convert_response_event_to_anthropic_sse_chunks(
                         "type": "tool_use",
                         "id": call_id,
                         "name": name,
-                        "input": parse_tool_arguments_value(item.get("arguments")),
+                        "input": item
+                            .as_object()
+                            .map(|obj| parse_responses_tool_input_value(obj, item_type))
+                            .unwrap_or_else(|| json!({})),
                     }
                 }),
             ));
