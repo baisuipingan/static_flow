@@ -201,6 +201,14 @@ pub fn format_number_i64(n: i64) -> String {
     }
 }
 
+pub fn token_usage_missing_label() -> &'static str {
+    "token usage unavailable"
+}
+
+pub fn credit_usage_missing_label() -> &'static str {
+    "credit usage unavailable"
+}
+
 fn resolved_public_url(path: &str) -> String {
     if path.starts_with("http://") || path.starts_with("https://") {
         return path.to_string();
@@ -398,8 +406,9 @@ fn parse_gpt_model_rank(slug: &str) -> Option<(i32, i32, i32, i32)> {
 #[cfg(test)]
 mod tests {
     use super::{
-        codex_model_catalog_download_command, codex_provider_config, format_kiro_disabled_reason,
-        preferred_model_slug_from_catalog_json,
+        codex_model_catalog_download_command, codex_provider_config, credit_usage_missing_label,
+        format_kiro_disabled_reason, preferred_model_slug_from_catalog_json,
+        token_usage_missing_label,
     };
 
     #[test]
@@ -463,5 +472,11 @@ mod tests {
 
         assert!(command.contains("model-catalog.json"));
         assert!(command.contains("~/.codex/model_catalog.json"));
+    }
+
+    #[test]
+    fn usage_missing_badge_labels_are_specific() {
+        assert_eq!(token_usage_missing_label(), "token usage unavailable");
+        assert_eq!(credit_usage_missing_label(), "credit usage unavailable");
     }
 }

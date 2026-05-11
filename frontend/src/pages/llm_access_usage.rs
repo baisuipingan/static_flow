@@ -9,7 +9,9 @@ use crate::{
         PublicLlmGatewayUsageLookupResponse,
     },
     components::{pagination::Pagination, token_usage_trend_chart::TokenUsageTrendChart},
-    pages::llm_access_shared::{format_ms, format_number_i64, format_number_u64},
+    pages::llm_access_shared::{
+        format_ms, format_number_i64, format_number_u64, token_usage_missing_label,
+    },
     router::Route,
 };
 
@@ -417,7 +419,7 @@ pub fn llm_access_usage_page() -> Html {
                                                     </div>
                                                     if event.usage_missing {
                                                         <div class={classes!("mt-2", "inline-flex", "rounded-full", "border", "border-amber-500/20", "bg-amber-500/10", "px-2", "py-1", "text-[11px]", "font-semibold", "uppercase", "tracking-[0.12em]", "text-amber-700", "dark:text-amber-200")}>
-                                                            { "usage missing" }
+                                                            { token_usage_missing_label() }
                                                         </div>
                                                     }
                                                 </td>

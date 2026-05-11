@@ -48,7 +48,8 @@ use crate::{
     },
     components::{pagination::Pagination, search_box::SearchBox, tab_bar::render_tab_bar},
     pages::llm_access_shared::{
-        confirm_destructive, format_ms, format_number_i64, format_number_u64, MaskedSecretCode,
+        confirm_destructive, credit_usage_missing_label, format_ms, format_number_i64,
+        format_number_u64, token_usage_missing_label, MaskedSecretCode,
     },
     router::Route,
 };
@@ -4453,7 +4454,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                 { event.credit_usage.map(format_credit4).unwrap_or_else(|| "-".to_string()) }
                             </div>
                             if event.credit_usage_missing {
-                                <div class={classes!("mt-1", "text-xs", "text-amber-700", "dark:text-amber-200")}>{ "missing" }</div>
+                                <div class={classes!("mt-1", "text-xs", "text-amber-700", "dark:text-amber-200")}>{ credit_usage_missing_label() }</div>
                             }
                         </div>
                     </div>
@@ -6837,7 +6838,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                                     <div>{ event.model.clone().unwrap_or_else(|| "-".to_string()) }</div>
                                                     if event.usage_missing {
                                                         <div class={classes!("mt-2", "inline-flex", "rounded-full", "border", "border-amber-500/20", "bg-amber-500/10", "px-2", "py-1", "text-[11px]", "font-semibold", "uppercase", "tracking-[0.12em]", "text-amber-700", "dark:text-amber-200")}>
-                                                            { "usage missing" }
+                                                            { token_usage_missing_label() }
                                                         </div>
                                                     }
                                                 </td>
@@ -6893,7 +6894,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                                         { event.credit_usage.map(format_credit4).unwrap_or_else(|| "-".to_string()) }
                                                     </span>
                                                     if event.credit_usage_missing {
-                                                        <span class={classes!("text-amber-700", "dark:text-amber-200")}>{ "missing" }</span>
+                                                        <span class={classes!("text-amber-700", "dark:text-amber-200")}>{ credit_usage_missing_label() }</span>
                                                     }
                                                 </div>
                                                 </td>
