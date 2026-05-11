@@ -27,24 +27,26 @@ use crate::{
         fetch_admin_llm_gateway_proxy_bindings, fetch_admin_llm_gateway_proxy_configs,
         fetch_admin_llm_gateway_sponsor_requests, fetch_admin_llm_gateway_token_requests,
         fetch_admin_llm_gateway_usage_event_detail, fetch_admin_llm_gateway_usage_events,
-        fetch_admin_usage_journal_status, import_admin_legacy_kiro_proxy_configs,
-        import_admin_llm_gateway_account, patch_admin_llm_gateway_account,
-        patch_admin_llm_gateway_account_group, patch_admin_llm_gateway_key,
-        patch_admin_llm_gateway_proxy_config, refresh_admin_llm_gateway_account,
-        update_admin_llm_gateway_config, update_admin_llm_gateway_proxy_binding,
-        AccountSummaryView, AdminAccountGroupView, AdminLlmGatewayAccountContributionRequestView,
+        fetch_admin_usage_journal_preview, fetch_admin_usage_journal_status,
+        import_admin_legacy_kiro_proxy_configs, import_admin_llm_gateway_account,
+        patch_admin_llm_gateway_account, patch_admin_llm_gateway_account_group,
+        patch_admin_llm_gateway_key, patch_admin_llm_gateway_proxy_config,
+        refresh_admin_llm_gateway_account, update_admin_llm_gateway_config,
+        update_admin_llm_gateway_proxy_binding, AccountSummaryView, AdminAccountGroupView,
+        AdminLlmGatewayAccountContributionRequestView,
         AdminLlmGatewayAccountContributionRequestsQuery, AdminLlmGatewayKeyView,
         AdminLlmGatewaySponsorRequestView, AdminLlmGatewaySponsorRequestsQuery,
         AdminLlmGatewayTokenRequestView, AdminLlmGatewayTokenRequestsQuery,
         AdminLlmGatewayUsageEventDetailView, AdminLlmGatewayUsageEventView,
         AdminLlmGatewayUsageEventsQuery, AdminUpstreamProxyBindingView,
         AdminUpstreamProxyCheckResponse, AdminUpstreamProxyCheckTargetView,
-        AdminUpstreamProxyConfigView, AdminUsageJournalFileView, AdminUsageJournalStatusView,
-        CodexAccountImportJobDetailView, CodexAccountImportJobSummaryView,
-        CreateAdminAccountGroupInput, CreateAdminUpstreamProxyConfigInput, LlmGatewayRuntimeConfig,
-        PatchAdminAccountGroupInput, PatchAdminLlmGatewayAccountInput,
-        PatchAdminLlmGatewayKeyRequest, PatchAdminUpstreamProxyConfigInput,
-        ProcessMemoryRuntimeStats, DEFAULT_LLM_GATEWAY_CODEX_CLIENT_VERSION,
+        AdminUpstreamProxyConfigView, AdminUsageJournalFileView, AdminUsageJournalPreviewResponse,
+        AdminUsageJournalStatusView, CodexAccountImportJobDetailView,
+        CodexAccountImportJobSummaryView, CreateAdminAccountGroupInput,
+        CreateAdminUpstreamProxyConfigInput, LlmGatewayRuntimeConfig, PatchAdminAccountGroupInput,
+        PatchAdminLlmGatewayAccountInput, PatchAdminLlmGatewayKeyRequest,
+        PatchAdminUpstreamProxyConfigInput, ProcessMemoryRuntimeStats,
+        DEFAULT_LLM_GATEWAY_CODEX_CLIENT_VERSION,
     },
     components::{pagination::Pagination, search_box::SearchBox, tab_bar::render_tab_bar},
     pages::llm_access_shared::{
@@ -74,8 +76,13 @@ const TAB_KEYS: &str = "keys";
 const TAB_GROUPS: &str = "groups";
 const TAB_ACCOUNTS: &str = "accounts";
 const TAB_USAGE: &str = "usage";
+const TAB_JOURNAL: &str = "journal";
 const TAB_REQUESTS: &str = "requests";
 const TAB_SETTINGS: &str = "settings";
+
+fn should_load_usage_journal(active_tab: &str) -> bool {
+    active_tab == TAB_JOURNAL
+}
 
 /// Render a horizontal tab bar with an optional numeric badge on one tab.
 /// `badge_tab` is `Some((tab_id, count))` to show a pending-count pill.
@@ -836,6 +843,35 @@ fn usage_last_message_table_preview(event: &AdminLlmGatewayUsageEventView) -> St
     }
     let single_line = preview.split_whitespace().collect::<Vec<_>>().join(" ");
     preview_text(&single_line, 120)
+}
+
+fn usage_journal_preview_message(
+    preview: &crate::api::AdminUsageJournalPreviewEventView,
+) -> String {
+    preview
+        .last_message_content
+        .clone()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "-".to_string())
+}
+
+fn usage_journal_preview_message_table_preview(
+    preview: &crate::api::AdminUsageJournalPreviewEventView,
+) -> String {
+    let message = usage_journal_preview_message(preview);
+    if message == "-" {
+        return message;
+    }
+    let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
+    preview_text(&single_line, 120)
+}
+
+async fn tokio_like_join_usage_journal(
+) -> Result<(AdminUsageJournalStatusView, AdminUsageJournalPreviewResponse), String> {
+    let status_fut = fetch_admin_usage_journal_status();
+    let preview_fut = fetch_admin_usage_journal_preview(Some(50));
+    let (status, preview) = futures::future::join(status_fut, preview_fut).await;
+    Ok((status?, preview?))
 }
 
 fn pretty_json_text(raw: &str) -> String {
@@ -2018,6 +2054,7 @@ pub fn admin_llm_gateway_page() -> Html {
     let usage_time_range = use_state(|| USAGE_TIME_RANGE_ALL.to_string());
     let usage_source = use_state(|| USAGE_SOURCE_HOT.to_string());
     let usage_journal_status = use_state(|| None::<AdminUsageJournalStatusView>);
+    let usage_journal_preview = use_state(|| None::<AdminUsageJournalPreviewResponse>);
     let usage_journal_loading = use_state(|| false);
     let usage_journal_error = use_state(|| None::<String>);
     let token_requests = use_state(Vec::<AdminLlmGatewayTokenRequestView>::new);
@@ -2217,17 +2254,20 @@ pub fn admin_llm_gateway_page() -> Html {
 
     let reload_usage_journal_status = {
         let usage_journal_status = usage_journal_status.clone();
+        let usage_journal_preview = usage_journal_preview.clone();
         let usage_journal_loading = usage_journal_loading.clone();
         let usage_journal_error = usage_journal_error.clone();
         Callback::from(move |_| {
             let usage_journal_status = usage_journal_status.clone();
+            let usage_journal_preview = usage_journal_preview.clone();
             let usage_journal_loading = usage_journal_loading.clone();
             let usage_journal_error = usage_journal_error.clone();
             usage_journal_loading.set(true);
             wasm_bindgen_futures::spawn_local(async move {
-                match fetch_admin_usage_journal_status().await {
-                    Ok(status) => {
+                match tokio_like_join_usage_journal().await {
+                    Ok((status, preview)) => {
                         usage_journal_status.set(Some(status));
+                        usage_journal_preview.set(Some(preview));
                         usage_journal_error.set(None);
                     },
                     Err(err) => usage_journal_error.set(Some(err)),
@@ -2594,10 +2634,8 @@ pub fn admin_llm_gateway_page() -> Html {
         let reload_token_requests = reload_token_requests.clone();
         let reload_account_contribution_requests = reload_account_contribution_requests.clone();
         let reload_sponsor_requests = reload_sponsor_requests.clone();
-        let reload_usage_journal_status = reload_usage_journal_status.clone();
         use_effect_with((), move |_| {
             reload.emit(());
-            reload_usage_journal_status.emit(());
             reload_token_requests.emit((Some(1), Some(String::new())));
             reload_account_contribution_requests.emit((Some(1), Some(String::new())));
             reload_sponsor_requests.emit((Some(1), Some(String::new())));
@@ -2606,11 +2644,17 @@ pub fn admin_llm_gateway_page() -> Html {
     }
 
     {
+        let active_tab = active_tab.clone();
         let reload_usage_journal_status = reload_usage_journal_status.clone();
-        use_effect_with((), move |_| {
-            let interval = Interval::new(5_000, move || {
+        use_effect_with(((*active_tab).clone(),), move |(active_tab,)| {
+            let interval = if should_load_usage_journal(active_tab) {
                 reload_usage_journal_status.emit(());
-            });
+                Some(Interval::new(5_000, move || {
+                    reload_usage_journal_status.emit(());
+                }))
+            } else {
+                None
+            };
             move || drop(interval)
         });
     }
@@ -4765,6 +4809,7 @@ pub fn admin_llm_gateway_page() -> Html {
                     (TAB_GROUPS, "Groups"),
                     (TAB_ACCOUNTS, "Accounts"),
                     (TAB_USAGE, "Usage"),
+                    (TAB_JOURNAL, "Journal"),
                     (TAB_REQUESTS, "Requests"),
                     (TAB_SETTINGS, "Settings"),
                 ], &on_tab_click, Some((TAB_REQUESTS, total_pending))) }
@@ -4849,15 +4894,15 @@ pub fn admin_llm_gateway_page() -> Html {
                 </section>
                 } // end TAB_OVERVIEW
 
-                // ── Settings Tab ──
-                if *active_tab == TAB_SETTINGS {
-                <section class={classes!("grid", "gap-4", "xl:grid-cols-2")}>
-                    <section class={classes!("rounded-xl", "border", "border-[var(--border)]", "bg-[var(--surface)]", "p-5", "xl:col-span-2")}>
+                // ── Journal Tab ──
+                if *active_tab == TAB_JOURNAL {
+                <section class={classes!("grid", "gap-4")}>
+                    <section class={classes!("rounded-xl", "border", "border-[var(--border)]", "bg-[var(--surface)]", "p-5")}>
                         <div class={classes!("flex", "items-start", "justify-between", "gap-3", "flex-wrap")}>
                             <div>
-                                <h2 class={classes!("m-0", "font-mono", "text-base", "font-bold", "text-[var(--text)]")}>{ "Usage Journal Worker" }</h2>
+                                <h2 class={classes!("m-0", "font-mono", "text-base", "font-bold", "text-[var(--text)]")}>{ "Usage Journal" }</h2>
                                 <p class={classes!("mt-2", "mb-0", "text-sm", "text-[var(--muted)]")}>
-                                    { "API writes local journal files; the worker imports sealed files into DuckDB on the independent query port." }
+                                    { "API writes active journal blocks locally; the worker seals and imports completed files into DuckDB. Live Preview only reads already-complete blocks from the current producer file." }
                                 </p>
                             </div>
                             <button
@@ -4986,6 +5031,140 @@ pub fn admin_llm_gateway_page() -> Html {
                         }
                     </section>
 
+                    <section class={classes!("rounded-xl", "border", "border-[var(--border)]", "bg-[var(--surface)]", "p-5")}>
+                        <div class={classes!("flex", "items-center", "justify-between", "gap-3", "flex-wrap")}>
+                            <div>
+                                <h2 class={classes!("m-0", "font-mono", "text-base", "font-bold", "text-[var(--text)]")}>{ "Live Preview" }</h2>
+                                <p class={classes!("mt-2", "mb-0", "text-sm", "text-[var(--muted)]")}>
+                                    { "Only the current producer file is previewed. Trailing partial writes are ignored until the next full block is flushed." }
+                                </p>
+                            </div>
+                            if let Some(preview) = (*usage_journal_preview).as_ref().and_then(|view| view.preview.as_ref()) {
+                                <span class={classes!("rounded-full", "border", "border-[var(--border)]", "px-3", "py-1", "text-xs", "font-semibold", "text-[var(--muted)]")}>
+                                    { format!("blocks {} · scanned {}", preview.complete_blocks, format_optional_bytes(Some(preview.bytes_scanned))) }
+                                </span>
+                            }
+                        </div>
+
+                        if let Some(preview_response) = (*usage_journal_preview).clone() {
+                            if let Some(preview) = preview_response.preview {
+                                <div class={classes!("mt-3", "grid", "gap-2", "text-xs", "text-[var(--muted)]", "xl:grid-cols-2")}>
+                                    <p class={classes!("m-0", "break-all")}>
+                                        { format!("producer_current_file: {}", preview_response.producer_current_file.as_ref().map(|file| file.path.clone()).unwrap_or_else(|| "-".to_string())) }
+                                    </p>
+                                    <p class={classes!("m-0")}>
+                                        { format!("truncated_tail: {}", if preview.truncated_tail { "yes" } else { "no" }) }
+                                    </p>
+                                </div>
+                                <div class={classes!("mt-4", "overflow-x-auto", "rounded-xl", "border", "border-[var(--border)]")}>
+                                    <table class={classes!("min-w-[110rem]", "w-full", "text-sm")}>
+                                        <thead>
+                                            <tr class={classes!("text-left", "text-[var(--muted)]")}>
+                                                <th class={classes!("py-2", "pr-3")}>{ "时间 / Event ID" }</th>
+                                                <th class={classes!("py-2", "pr-3")}>{ "Key" }</th>
+                                                <th class={classes!("py-2", "pr-3")}>{ "号池" }</th>
+                                                <th class={classes!("py-2", "pr-3")}>{ "Route" }</th>
+                                                <th class={classes!("py-2", "pr-3")}>{ "Model" }</th>
+                                                <th class={classes!("py-2", "pr-3")}>{ "Status" }</th>
+                                                <th class={classes!("py-2", "pr-3")}>{ "Stream" }</th>
+                                                <th class={classes!("py-2", "pr-3")}>{ "Tokens" }</th>
+                                                <th class={classes!("py-2", "pr-3")}>{ "最后一条内容" }</th>
+                                            </tr>
+                                        </thead>
+                                        <tbody>
+                                            if preview.events.is_empty() {
+                                                <tr class={classes!("border-t", "border-[var(--border)]")}>
+                                                    <td colspan="9" class={classes!("py-8", "text-center", "text-[var(--muted)]")}>{ "当前 producer file 里还没有完整 block 可预览" }</td>
+                                                </tr>
+                                            } else {
+                                                { for preview.events.iter().map(|event| {
+                                                    let account_label = event.account_name.clone().unwrap_or_else(|| "not captured".to_string());
+                                                    let last_message_preview = usage_journal_preview_message_table_preview(event);
+                                                    html! {
+                                                        <tr class={classes!("border-t", "border-[var(--border)]", "align-top")}>
+                                                            <td class={classes!("py-3", "pr-3", "min-w-[13rem]", "whitespace-nowrap")}>
+                                                                <div>{ format_ms(event.created_at_ms) }</div>
+                                                                <div class={classes!("mt-1", "font-mono", "text-[11px]", "text-[var(--muted)]")}>{ event.event_id.clone() }</div>
+                                                            </td>
+                                                            <td class={classes!("py-3", "pr-3", "min-w-[13rem]")}>
+                                                                <div class={classes!("font-semibold", "text-[var(--text)]")}>{ event.key_name.clone() }</div>
+                                                                <div class={classes!("mt-1", "font-mono", "text-xs", "text-[var(--muted)]")}>{ event.key_id.clone() }</div>
+                                                            </td>
+                                                            <td class={classes!("py-3", "pr-3", "min-w-[10rem]")}>
+                                                                <span class={classes!("inline-flex", "rounded-full", "border", "border-emerald-500/20", "bg-emerald-500/10", "px-2.5", "py-1", "text-xs", "font-semibold", "text-emerald-700", "dark:text-emerald-200")}>
+                                                                    { account_label }
+                                                                </span>
+                                                            </td>
+                                                            <td class={classes!("py-3", "pr-3", "min-w-[18rem]")}>
+                                                                <div class={classes!("flex", "items-start", "gap-2")}>
+                                                                    <span class={classes!("inline-flex", "rounded-full", "border", "border-sky-500/20", "bg-sky-500/10", "px-2", "py-1", "text-[11px]", "font-semibold", "uppercase", "tracking-[0.12em]", "text-sky-700", "dark:text-sky-200")}>
+                                                                        { event.request_method.clone() }
+                                                                    </span>
+                                                                    <div class={classes!("min-w-0", "flex-1")}>
+                                                                        <span class={classes!("truncate")} title={event.endpoint.clone()}>{ event.endpoint.clone() }</span>
+                                                                    </div>
+                                                                </div>
+                                                            </td>
+                                                            <td class={classes!("py-3", "pr-3", "min-w-[11rem]")}>
+                                                                <div>{ event.model.clone().unwrap_or_else(|| "-".to_string()) }</div>
+                                                                if event.usage_missing {
+                                                                    <div class={classes!("mt-2", "inline-flex", "rounded-full", "border", "border-amber-500/20", "bg-amber-500/10", "px-2", "py-1", "text-[11px]", "font-semibold", "uppercase", "tracking-[0.12em]", "text-amber-700", "dark:text-amber-200")}>
+                                                                        { token_usage_missing_label() }
+                                                                    </div>
+                                                                }
+                                                            </td>
+                                                            <td class={classes!("py-3", "pr-3", "whitespace-nowrap")}>{ event.status_code }</td>
+                                                            <td class={classes!("py-3", "pr-3", "min-w-[14rem]")}>
+                                                                <div class={classes!("flex", "items-center", "gap-2", "flex-wrap")}>
+                                                                    <span class={usage_stream_state_badge_classes(event.stream_completed_cleanly, event.downstream_disconnect)}>
+                                                                        { usage_stream_state_label(event.stream_completed_cleanly, event.downstream_disconnect) }
+                                                                    </span>
+                                                                    <span class={classes!("font-mono", "text-[11px]", "text-[var(--muted)]")}>
+                                                                        { format!("final {}", event.final_event_type.clone().unwrap_or_else(|| "-".to_string())) }
+                                                                    </span>
+                                                                </div>
+                                                            </td>
+                                                            <td class={classes!("py-3", "pr-3", "min-w-[12rem]")}>
+                                                                <div class={classes!("grid", "gap-1", "text-xs", "text-[var(--muted)]")}>
+                                                                    <span>{ format!("Uncached {}", format_number_u64(event.input_uncached_tokens)) }</span>
+                                                                    <span>{ format!("Cached {}", format_number_u64(event.input_cached_tokens)) }</span>
+                                                                    <span>{ format!("Out {}", format_number_u64(event.output_tokens)) }</span>
+                                                                    <span class={classes!("font-semibold", "text-[var(--text)]")}>{ format!("Billable {}", format_number_u64(event.billable_tokens)) }</span>
+                                                                </div>
+                                                            </td>
+                                                            <td class={classes!("py-3", "pr-3", "min-w-[18rem]")}>
+                                                                <div class={classes!("max-w-[18rem]", "overflow-hidden", "whitespace-normal", "break-words", "text-xs", "leading-5", "text-[var(--muted)]")}>
+                                                                    { last_message_preview }
+                                                                </div>
+                                                            </td>
+                                                        </tr>
+                                                    }
+                                                }) }
+                                            }
+                                        </tbody>
+                                    </table>
+                                </div>
+                            } else {
+                                <div class={classes!("mt-4", "text-sm", "text-[var(--muted)]")}>
+                                    { "当前还没有 producer file 可预览。" }
+                                </div>
+                            }
+                        } else if let Some(error) = (*usage_journal_error).clone() {
+                            <div class={classes!("mt-4", "rounded-lg", "border", "border-red-500/30", "bg-red-500/10", "p-3", "text-sm", "text-red-700", "dark:text-red-200")}>
+                                { error }
+                            </div>
+                        } else {
+                            <div class={classes!("mt-4", "text-sm", "text-[var(--muted)]")}>
+                                { "尚未加载实时预览。" }
+                            </div>
+                        }
+                    </section>
+                </section>
+                } // end TAB_JOURNAL
+
+                // ── Settings Tab ──
+                if *active_tab == TAB_SETTINGS {
+                <section class={classes!("grid", "gap-4", "xl:grid-cols-2")}>
                 <section class={classes!("rounded-xl", "border", "border-[var(--border)]", "bg-[var(--surface)]", "p-5")}>
                         <div class={classes!("flex", "items-start", "justify-between", "gap-3", "flex-wrap")}>
                             <div>
@@ -7547,6 +7726,44 @@ mod tests {
         };
 
         assert_eq!(usage_last_message_table_preview(&event), "short text");
+    }
+
+    #[test]
+    fn usage_journal_should_load_only_for_journal_tab() {
+        assert!(should_load_usage_journal(TAB_JOURNAL));
+        assert!(!should_load_usage_journal(TAB_OVERVIEW));
+        assert!(!should_load_usage_journal(TAB_USAGE));
+        assert!(!should_load_usage_journal(TAB_SETTINGS));
+    }
+
+    #[test]
+    fn usage_journal_preview_message_prefers_summary_content() {
+        let event = crate::api::AdminUsageJournalPreviewEventView {
+            last_message_content: Some("hello".to_string()),
+            ..crate::api::AdminUsageJournalPreviewEventView::default()
+        };
+
+        assert_eq!(usage_journal_preview_message(&event), "hello");
+    }
+
+    #[test]
+    fn usage_journal_preview_message_table_preview_collapses_whitespace_and_truncates() {
+        let event = crate::api::AdminUsageJournalPreviewEventView {
+            last_message_content: Some(
+                "first line\n\nsecond   line with   extra spaces and a very long suffix that \
+                 should be truncated in the table preview because it keeps going with more and \
+                 more text until the shortened variant must end with ellipsis"
+                    .to_string(),
+            ),
+            ..crate::api::AdminUsageJournalPreviewEventView::default()
+        };
+
+        let preview = usage_journal_preview_message_table_preview(&event);
+
+        assert!(!preview.contains('\n'));
+        assert!(preview.contains("first line second line with extra spaces"));
+        assert!(preview.ends_with("..."));
+        assert!(preview.chars().count() <= 123);
     }
 
     #[test]

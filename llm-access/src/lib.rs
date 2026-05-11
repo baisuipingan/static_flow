@@ -239,6 +239,8 @@ pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
         .route("/admin/llm-gateway/usage/:event_id", get(admin::get_llm_gateway_usage_event))
         .route("/admin/llm-access/usage-journal/status", get(admin::get_usage_journal_status))
         .route("/admin/llm-gateway/usage-journal/status", get(admin::get_usage_journal_status))
+        .route("/admin/llm-access/usage-journal/preview", get(admin::get_usage_journal_preview))
+        .route("/admin/llm-gateway/usage-journal/preview", get(admin::get_usage_journal_preview))
         .route("/admin/llm-gateway/token-requests", get(admin::list_llm_gateway_token_requests))
         .route(
             "/admin/llm-gateway/token-requests/:request_id/approve-and-issue",
@@ -475,11 +477,16 @@ mod tests {
         routing::get,
         Json, Router,
     };
-    use llm_access_core::store::{
-        AdminCodexAccountStore, AdminKiroAccountStore, AdminReviewQueueAction,
-        AdminReviewQueueStore, AuthenticatedKey, CodexPublicAccountStatus, CodexRateLimitStatus,
-        ControlStore, NewAdminCodexAccount, NewAdminKiroAccount,
-        NewPublicAccountContributionRequest, PublicStatusStore, PublicSubmissionStore,
+    use llm_access_core::{
+        provider::{ProtocolFamily, ProviderType},
+        store::{
+            AdminCodexAccountStore, AdminKiroAccountStore, AdminReviewQueueAction,
+            AdminReviewQueueStore, AuthenticatedKey, CodexPublicAccountStatus,
+            CodexRateLimitStatus, ControlStore, NewAdminCodexAccount, NewAdminKiroAccount,
+            NewPublicAccountContributionRequest, PublicStatusStore, PublicSubmissionStore,
+            UsageEventSink,
+        },
+        usage::{UsageEvent, UsageStreamDetails, UsageTiming},
     };
     use serde_json::json;
     use tower::util::ServiceExt;
@@ -562,6 +569,45 @@ mod tests {
             .await
             .expect("open runtime");
         (super::router(runtime), root)
+    }
+
+    fn sample_usage_event(event_id: &str) -> UsageEvent {
+        UsageEvent {
+            event_id: event_id.to_string(),
+            created_at_ms: 1_700_000_000_000,
+            provider_type: ProviderType::Codex,
+            protocol_family: ProtocolFamily::OpenAi,
+            key_id: "key-preview".to_string(),
+            key_name: "preview".to_string(),
+            account_name: Some("preview-account".to_string()),
+            account_group_id_at_event: None,
+            route_strategy_at_event: None,
+            request_method: "POST".to_string(),
+            request_url: "/v1/chat/completions".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            model: Some("gpt-5.3-codex".to_string()),
+            mapped_model: None,
+            status_code: 200,
+            request_body_bytes: None,
+            quota_failover_count: 0,
+            routing_diagnostics_json: None,
+            input_uncached_tokens: 1,
+            input_cached_tokens: 0,
+            output_tokens: 1,
+            billable_tokens: 2,
+            credit_usage: None,
+            usage_missing: false,
+            credit_usage_missing: false,
+            client_ip: "127.0.0.1".to_string(),
+            ip_region: "local".to_string(),
+            request_headers_json: "{}".to_string(),
+            last_message_content: Some(event_id.to_string()),
+            client_request_body_json: None,
+            upstream_request_body_json: None,
+            full_request_json: None,
+            timing: UsageTiming::default(),
+            stream: UsageStreamDetails::default(),
+        }
     }
 
     async fn wait_for_codex_batch_import_job_terminal_state(
@@ -1203,6 +1249,68 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(value["events"][0]["id"], "evt-proxied");
         assert_eq!(value["chart_points"][0]["tokens"], 42);
+    }
+
+    #[tokio::test]
+    async fn usage_journal_preview_reads_current_active_file_without_footer() {
+        let unique = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system clock")
+            .as_nanos();
+        let root = std::env::temp_dir().join(format!(
+            "llm-access-router-usage-journal-preview-{}-{unique}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create state root");
+        let config = crate::config::StorageConfig {
+            state_root: root.clone(),
+            sqlite_control: root.join("control/llm-access.sqlite3"),
+            duckdb: root.join("analytics/usage.duckdb"),
+            usage_journal_dir: root.join("usage-journal"),
+            duckdb_tiered: None,
+            kiro_auths_dir: root.join("auths/kiro"),
+            codex_auths_dir: root.join("auths/codex"),
+            logs_dir: root.join("logs"),
+        };
+        crate::bootstrap_api_storage(&config).expect("bootstrap storage");
+        let runtime = crate::runtime::LlmAccessRuntime::from_storage_config(&config)
+            .await
+            .expect("open runtime");
+        let sink = runtime.usage_journal_sink().expect("usage journal sink");
+        sink.append_usage_events(&[
+            sample_usage_event("evt-preview-1"),
+            sample_usage_event("evt-preview-2"),
+        ])
+        .await
+        .expect("append preview events");
+        let router = super::router(runtime);
+
+        let response = router
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("GET")
+                    .uri("/admin/llm-access/usage-journal/preview?limit=1")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        let json: serde_json::Value = serde_json::from_slice(&body).expect("json");
+        assert_eq!(json["preview"]["file_sequence"], 0);
+        assert_eq!(json["preview"]["complete_blocks"], 1);
+        assert_eq!(json["preview"]["truncated_tail"], false);
+        assert_eq!(json["preview"]["events"].as_array().map(Vec::len), Some(1));
+        assert_eq!(json["preview"]["events"][0]["event_id"], "evt-preview-2");
+        assert_eq!(json["producer_current_file"]["sequence"], 0);
+
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
     }
 
     #[tokio::test]

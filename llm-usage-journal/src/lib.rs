@@ -3,6 +3,7 @@
 pub mod cli;
 pub mod config;
 pub mod inspect;
+pub mod preview;
 pub mod reader;
 pub mod recovery;
 pub mod retention;
@@ -14,6 +15,7 @@ pub mod writer_state;
 
 pub use config::JournalConfig;
 pub use inspect::collect_journal_file_lists;
+pub use preview::{JournalPreviewReader, JournalPreviewReport};
 pub use reader::{JournalBatchStream, JournalFileSummary, JournalReader, JournalStreamReport};
 pub use recovery::{recover_orphan_active_files, ActiveRecoveryReport};
 pub use state::JournalConsumerState;

@@ -17,7 +17,7 @@ use axum::{
     Json,
 };
 use llm_access_core::{
-    provider::RouteStrategy,
+    provider::{ProtocolFamily, ProviderType, RouteStrategy},
     store::{
         self as core_store, AdminAccountContributionRequest, AdminAccountGroupPatch,
         AdminCodexAccountPatch, AdminCodexImportJobItemResult, AdminKeyPatch,
@@ -39,7 +39,7 @@ use llm_access_kiro::{
 };
 use llm_usage_journal::{
     collect_journal_file_lists, JournalFileListsSnapshot, JournalFileSnapshot,
-    JournalStatusSnapshot, WorkerProgressSnapshot,
+    JournalPreviewReader, JournalPreviewReport, JournalStatusSnapshot, WorkerProgressSnapshot,
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -218,6 +218,56 @@ struct AdminUsageJournalStatusResponse {
     bad_files: Vec<AdminUsageJournalFileView>,
     worker: AdminUsageWorkerProgressView,
     generated_at: i64,
+}
+
+#[derive(Debug, Deserialize)]
+pub(crate) struct AdminUsageJournalPreviewQuery {
+    limit: Option<usize>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminUsageJournalPreviewResponse {
+    journal_root: String,
+    producer_current_file: Option<AdminUsageJournalFileView>,
+    preview: Option<AdminUsageJournalPreviewFileView>,
+    generated_at: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminUsageJournalPreviewFileView {
+    path: String,
+    file_sequence: u64,
+    bytes_scanned: u64,
+    complete_blocks: u64,
+    truncated_tail: bool,
+    events: Vec<AdminUsageJournalPreviewEventView>,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminUsageJournalPreviewEventView {
+    event_id: String,
+    created_at_ms: i64,
+    provider_type: ProviderType,
+    protocol_family: ProtocolFamily,
+    key_id: String,
+    key_name: String,
+    account_name: Option<String>,
+    request_method: String,
+    endpoint: String,
+    model: Option<String>,
+    mapped_model: Option<String>,
+    status_code: i64,
+    input_uncached_tokens: i64,
+    input_cached_tokens: i64,
+    output_tokens: i64,
+    billable_tokens: i64,
+    usage_missing: bool,
+    credit_usage_missing: bool,
+    last_message_content: Option<String>,
+    final_event_type: Option<String>,
+    stream_completed_cleanly: Option<bool>,
+    downstream_disconnect: Option<bool>,
+    bytes_streamed: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -1159,6 +1209,72 @@ pub(crate) async fn get_usage_journal_status(
         bad_files: files.bad.into_iter().map(journal_file_view).collect(),
         worker,
         generated_at: now,
+    })
+    .into_response()
+}
+
+pub(crate) async fn get_usage_journal_preview(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Query(query): Query<AdminUsageJournalPreviewQuery>,
+) -> Response {
+    if let Err(response) = ensure_admin_access(&headers) {
+        return response.into_response();
+    }
+    let _permit = match acquire_admin_usage_query_permit(&state) {
+        Ok(permit) => permit,
+        Err(response) => return response.into_response(),
+    };
+    let config = match state.admin_config_store.get_admin_runtime_config().await {
+        Ok(config) => config,
+        Err(_) => return internal_error("Failed to load llm gateway config").into_response(),
+    };
+    let mut journal = match producer_journal_status(&state) {
+        Ok(status) => status,
+        Err(err) => {
+            tracing::warn!("failed to load usage journal producer status: {err:#}");
+            return internal_error("Failed to load usage journal status").into_response();
+        },
+    };
+    journal.journal_enabled = config.usage_journal_enabled;
+    if journal.journal_root.is_empty() {
+        journal.journal_root = state
+            .usage_journal_dir
+            .as_ref()
+            .map(|path| path.display().to_string())
+            .unwrap_or_default();
+    }
+    let files = match journal_file_lists(&state) {
+        Ok(files) => files,
+        Err(err) => {
+            tracing::warn!("failed to load usage journal file lists: {err:#}");
+            return internal_error("Failed to load usage journal file lists").into_response();
+        },
+    };
+    let producer_current_file = producer_current_journal_file(&journal, &files.active);
+    let preview = if let Some(file) = producer_current_file.as_ref() {
+        let limit = query.limit.unwrap_or(50).clamp(1, 200);
+        match JournalPreviewReader::open(FsPath::new(&file.path))
+            .and_then(|reader| reader.read_last_events(limit))
+        {
+            Ok(report) => Some(admin_usage_journal_preview_view(report)),
+            Err(err) => {
+                tracing::warn!(
+                    path = %file.path,
+                    "failed to preview producer usage journal file: {err:#}"
+                );
+                return internal_error("Failed to preview usage journal producer file")
+                    .into_response();
+            },
+        }
+    } else {
+        None
+    };
+    Json(AdminUsageJournalPreviewResponse {
+        journal_root: journal.journal_root,
+        producer_current_file,
+        preview,
+        generated_at: now_ms(),
     })
     .into_response()
 }
@@ -3309,6 +3425,47 @@ fn journal_file_view(file: JournalFileSnapshot) -> AdminUsageJournalFileView {
         sequence: file.sequence,
         bytes: file.bytes,
         age_ms: file.age_ms,
+    }
+}
+
+fn admin_usage_journal_preview_view(
+    report: JournalPreviewReport,
+) -> AdminUsageJournalPreviewFileView {
+    AdminUsageJournalPreviewFileView {
+        path: report.path.display().to_string(),
+        file_sequence: report.file_sequence,
+        bytes_scanned: report.bytes_scanned,
+        complete_blocks: report.complete_blocks,
+        truncated_tail: report.truncated_tail,
+        events: report
+            .events
+            .into_iter()
+            .map(|event| AdminUsageJournalPreviewEventView {
+                event_id: event.event_id,
+                created_at_ms: event.created_at_ms,
+                provider_type: event.provider_type,
+                protocol_family: event.protocol_family,
+                key_id: event.key_id,
+                key_name: event.key_name,
+                account_name: event.account_name,
+                request_method: event.request_method,
+                endpoint: event.endpoint,
+                model: event.model,
+                mapped_model: event.mapped_model,
+                status_code: event.status_code,
+                input_uncached_tokens: event.input_uncached_tokens,
+                input_cached_tokens: event.input_cached_tokens,
+                output_tokens: event.output_tokens,
+                billable_tokens: event.billable_tokens,
+                usage_missing: event.usage_missing,
+                credit_usage_missing: event.credit_usage_missing,
+                last_message_content: event.last_message_content,
+                final_event_type: event.stream.final_event_type,
+                stream_completed_cleanly: event.stream.stream_completed_cleanly,
+                downstream_disconnect: event.stream.downstream_disconnect,
+                bytes_streamed: event.stream.bytes_streamed,
+            })
+            .collect(),
     }
 }
 

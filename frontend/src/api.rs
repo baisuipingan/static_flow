@@ -6195,6 +6195,54 @@ pub struct AdminUsageJournalStatusView {
     pub generated_at: i64,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct AdminUsageJournalPreviewEventView {
+    pub event_id: String,
+    pub created_at_ms: i64,
+    pub provider_type: String,
+    pub protocol_family: String,
+    pub key_id: String,
+    pub key_name: String,
+    pub account_name: Option<String>,
+    pub request_method: String,
+    pub endpoint: String,
+    pub model: Option<String>,
+    pub mapped_model: Option<String>,
+    pub status_code: i32,
+    pub input_uncached_tokens: u64,
+    pub input_cached_tokens: u64,
+    pub output_tokens: u64,
+    pub billable_tokens: u64,
+    pub usage_missing: bool,
+    pub credit_usage_missing: bool,
+    pub last_message_content: Option<String>,
+    pub final_event_type: Option<String>,
+    pub stream_completed_cleanly: Option<bool>,
+    pub downstream_disconnect: Option<bool>,
+    pub bytes_streamed: Option<i64>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct AdminUsageJournalPreviewFileView {
+    pub path: String,
+    pub file_sequence: u64,
+    pub bytes_scanned: u64,
+    pub complete_blocks: u64,
+    pub truncated_tail: bool,
+    pub events: Vec<AdminUsageJournalPreviewEventView>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct AdminUsageJournalPreviewResponse {
+    pub journal_root: String,
+    pub producer_current_file: Option<AdminUsageJournalFileView>,
+    pub preview: Option<AdminUsageJournalPreviewFileView>,
+    pub generated_at: i64,
+}
+
 /// Query options for paginating and filtering LLM gateway usage events.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 pub struct AdminLlmGatewayUsageEventsQuery {
@@ -7427,6 +7475,46 @@ pub async fn fetch_admin_usage_journal_status() -> Result<AdminUsageJournalStatu
             return Err(format!(
                 "Unexpected response content-type `{content_type}` while loading Usage Journal \
                  Worker: {preview}"
+            ));
+        }
+        serde_json::from_str(&body).map_err(|e| {
+            format!("Parse error: {:?}; body: {}", e, body.chars().take(120).collect::<String>())
+        })
+    }
+}
+
+pub async fn fetch_admin_usage_journal_preview(
+    limit: Option<usize>,
+) -> Result<AdminUsageJournalPreviewResponse, String> {
+    #[cfg(feature = "mock")]
+    {
+        Ok(AdminUsageJournalPreviewResponse::default())
+    }
+
+    #[cfg(not(feature = "mock"))]
+    {
+        let mut url = format!("{}/admin/llm-access/usage-journal/preview", admin_base());
+        if let Some(limit) = limit {
+            url.push_str(&format!("?limit={limit}"));
+        }
+        let response = api_get(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {:?}", e))?;
+        if !response.ok() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed: {text}"));
+        }
+        let content_type = response.headers().get("content-type").unwrap_or_default();
+        let body = response
+            .text()
+            .await
+            .map_err(|e| format!("Read error: {:?}", e))?;
+        if !content_type.contains("json") {
+            let preview = body.chars().take(120).collect::<String>();
+            return Err(format!(
+                "Unexpected response content-type `{content_type}` while loading Usage Journal \
+                 Preview: {preview}"
             ));
         }
         serde_json::from_str(&body).map_err(|e| {
