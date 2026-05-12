@@ -1357,6 +1357,7 @@ fn adapt_openai_chat_completions_request(
     let tool_name_restore_map = build_openai_tool_name_restore_map(&tool_name_map);
 
     let mut input_items = Vec::<Value>::new();
+    let mut seen_tool_call_ids = BTreeSet::<String>::new();
 
     for (index, message) in source_messages.iter().enumerate() {
         let Some(message_obj) = message.as_object() else {
@@ -1482,6 +1483,7 @@ fn adapt_openai_chat_completions_request(
                             "name": function_name,
                             "arguments": arguments
                         }));
+                        seen_tool_call_ids.insert(call_id.to_string());
                         emitted_tool_call = true;
                     }
                 }
@@ -1496,6 +1498,9 @@ fn adapt_openai_chat_completions_request(
                     .map(str::trim)
                     .filter(|value| !value.is_empty())
                     .ok_or_else(|| bad_request("tool role message missing tool_call_id"))?;
+                if !seen_tool_call_ids.contains(call_id) {
+                    continue;
+                }
                 let output =
                     convert_tool_message_content_to_responses_output(message_obj.get("content"))
                         .map_err(|err| bad_request_with_detail("Invalid tool content", err))?;
@@ -2269,6 +2274,36 @@ mod tests {
         )
         .await
         .expect("chat request with malformed tool call should normalize");
+
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&prepared.request_body).expect("upstream body json");
+        assert_eq!(upstream["input"].as_array().map(Vec::len), Some(1));
+        assert_eq!(upstream["input"][0]["role"], "user");
+    }
+
+    #[tokio::test]
+    async fn prepare_gateway_request_repairs_chat_orphan_tool_output() {
+        let headers = axum::http::HeaderMap::new();
+        let body = Body::from(
+            r#"{
+                "model":"gpt-5.3-codex",
+                "messages":[
+                    {"role":"user","content":"hello"},
+                    {"role":"tool","tool_call_id":"callauto12","content":"{\"ok\":true}"}
+                ]
+            }"#,
+        );
+
+        let prepared = prepare_gateway_request(
+            "/v1/chat/completions",
+            "",
+            axum::http::Method::POST,
+            &headers,
+            body,
+            1024 * 1024,
+        )
+        .await
+        .expect("chat request with orphan tool output should be repaired");
 
         let upstream: serde_json::Value =
             serde_json::from_slice(&prepared.request_body).expect("upstream body json");
