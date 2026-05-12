@@ -8797,8 +8797,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_compact_uses_conversation_header_for_prompt_cache_key_without_overriding_headers(
-    ) {
+    async fn codex_compact_forwards_conversation_header_without_injecting_prompt_cache_key() {
         let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
             .expect("codex upstream env lock");
@@ -8845,7 +8844,7 @@ mod tests {
         assert_eq!(requests[0].conversation_id.as_deref(), Some("compact-thread"));
         assert_eq!(requests[0].session_id, None);
         assert_eq!(requests[0].x_client_request_id, None);
-        assert_eq!(requests[0].body["prompt_cache_key"].as_str(), Some("compact-thread"));
+        assert_eq!(requests[0].body.get("prompt_cache_key"), None);
     }
 
     #[tokio::test]
@@ -9027,7 +9026,7 @@ mod tests {
             .expect("codex upstream env lock");
         let captured = Arc::new(CapturedCodexUpstream::default());
         let app = Router::new()
-            .route("/v1/responses", post(fake_codex_responses))
+            .route("/v1/responses", post(fake_codex_responses_json_success))
             .with_state(captured.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -9090,13 +9089,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_responses_passes_through_upstream_response_ids_without_local_anchor() {
+    async fn codex_responses_preserves_previous_response_id_without_local_anchor() {
         let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
             .expect("codex upstream env lock");
         let captured = Arc::new(CapturedCodexUpstream::default());
         let app = Router::new()
-            .route("/v1/responses", post(fake_codex_responses))
+            .route("/v1/responses", post(fake_codex_responses_json_success))
             .with_state(captured.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -9138,7 +9137,7 @@ mod tests {
             .as_str()
             .expect("upstream response id")
             .to_string();
-        assert_eq!(previous_response_id, "resp_1");
+        assert_eq!(previous_response_id, "rs_compact_1");
 
         let second = super::provider_entry(
             state,
@@ -9169,7 +9168,10 @@ mod tests {
         assert_eq!(second.status(), StatusCode::OK);
         let requests = captured.requests.lock().expect("captured requests");
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1].body.get("previous_response_id"), None);
+        assert_eq!(
+            requests[1].body.get("previous_response_id"),
+            Some(&json!(previous_response_id))
+        );
         let input = requests[1].body["input"]
             .as_array()
             .expect("upstream input array");
@@ -9178,7 +9180,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn codex_compact_drops_previous_response_id_without_local_anchor() {
+    async fn codex_compact_preserves_previous_response_id_without_local_anchor() {
         let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
             .expect("codex upstream env lock");
@@ -9252,12 +9254,11 @@ mod tests {
         assert_eq!(second.status(), StatusCode::OK);
         let requests = captured.requests.lock().expect("captured requests");
         assert_eq!(requests.len(), 2);
-        assert_eq!(requests[1].body.get("previous_response_id"), None);
-        let input = requests[1].body["input"]
-            .as_array()
-            .expect("upstream input array");
-        assert_eq!(input.len(), 1);
-        assert_eq!(input[0]["role"], json!("user"));
+        assert_eq!(
+            requests[1].body.get("previous_response_id"),
+            Some(&json!(previous_response_id))
+        );
+        assert_eq!(requests[1].body["input"], json!("next compact"));
     }
 
 

@@ -172,14 +172,6 @@ pub fn prepare_gateway_request_from_bytes(
             if let Some(prompt_cache_key) = extract_non_empty_string(root.get("prompt_cache_key")) {
                 thread_anchor = Some(prompt_cache_key.to_string());
             }
-            if gateway_path == "/v1/responses" {
-                normalize_codex_input_message_roles(root);
-            } else {
-                normalize_responses_request(gateway_path, root, thread_anchor.as_deref());
-                repair_responses_request(root)?;
-                filter_responses_request_fields(gateway_path, root);
-                validate_responses_request(gateway_path, root)?;
-            }
         }
     }
 
@@ -2171,7 +2163,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_gateway_request_responses_maps_system_message_to_developer() {
+    async fn prepare_gateway_request_responses_preserves_system_message_role() {
         let headers = axum::http::HeaderMap::new();
         let body = Body::from(
             r#"{
@@ -2192,12 +2184,12 @@ mod tests {
             1024 * 1024,
         )
         .await
-        .expect("responses request with system message should normalize");
+        .expect("responses request with system message should pass through");
 
         let upstream: serde_json::Value =
             serde_json::from_slice(&prepared.request_body).expect("upstream body json");
 
-        assert_eq!(upstream["input"][0]["role"], "developer");
+        assert_eq!(upstream["input"][0]["role"], "system");
         assert_eq!(upstream["input"][1]["role"], "user");
     }
 
@@ -2375,6 +2367,47 @@ mod tests {
             serde_json::from_slice(&prepared.request_body).expect("upstream body json");
         assert_eq!(upstream["previous_response_id"], json!("resp_1"));
         assert_eq!(upstream["input"][0]["type"], json!("function_call_output"));
+    }
+
+    #[tokio::test]
+    async fn prepare_gateway_request_responses_preserves_function_call_namespace() {
+        let headers = axum::http::HeaderMap::new();
+        let body = Body::from(
+            r#"{
+                "model":"gpt-5.3-codex",
+                "input":[
+                    {
+                        "type":"function_call",
+                        "call_id":"call_ns_1",
+                        "name":"find_gameobjects",
+                        "namespace":"game_tools",
+                        "arguments":"{\"scene\":\"main\"}"
+                    },
+                    {
+                        "type":"function_call_output",
+                        "call_id":"call_ns_1",
+                        "output":"[]"
+                    }
+                ]
+            }"#,
+        );
+
+        let prepared = prepare_gateway_request(
+            "/v1/responses",
+            "",
+            axum::http::Method::POST,
+            &headers,
+            body,
+            1024 * 1024,
+        )
+        .await
+        .expect("native responses request should preserve namespace");
+
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&prepared.request_body).expect("upstream body json");
+        assert_eq!(upstream["input"][0]["type"], json!("function_call"));
+        assert_eq!(upstream["input"][0]["namespace"], json!("game_tools"));
+        assert_eq!(upstream["input"][0]["name"], json!("find_gameobjects"));
     }
 
     #[tokio::test]
@@ -2679,7 +2712,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_gateway_request_compact_preserves_remote_compact_parameters() {
+    async fn prepare_gateway_request_compact_keeps_native_body_without_local_normalization() {
         let headers = axum::http::HeaderMap::new();
         let body = Body::from(
             r#"{
@@ -2701,20 +2734,17 @@ mod tests {
             1024 * 1024,
         )
         .await
-        .expect("compact request should normalize");
+        .expect("compact request should pass through");
 
         let upstream: serde_json::Value =
             serde_json::from_slice(&prepared.request_body).expect("upstream body json");
 
-        assert_eq!(upstream["input"][0]["type"], "message");
-        assert_eq!(upstream["input"][0]["role"], "user");
-        assert_eq!(upstream["input"][0]["content"][0]["type"], "input_text");
-        assert_eq!(upstream["input"][0]["content"][0]["text"], "hello compact");
+        assert_eq!(upstream["input"], json!("hello compact"));
         assert_eq!(upstream["tools"], json!([{ "type": "web_search" }]));
         assert_eq!(upstream["parallel_tool_calls"], json!(true));
         assert_eq!(upstream["reasoning"], json!({"effort":"high","summary":"auto"}));
         assert_eq!(upstream["text"], json!({"verbosity":"low"}));
-        assert_eq!(upstream["instructions"].as_str(), Some(codex_default_instructions()));
+        assert!(upstream.get("instructions").is_none());
         assert!(
             upstream.get("stream").is_none(),
             "compact requests should not inject stream control"
@@ -2722,12 +2752,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_gateway_request_compact_filters_fields_not_in_codex_compact_schema() {
+    async fn prepare_gateway_request_compact_preserves_native_fields_and_history() {
         let headers = axum::http::HeaderMap::new();
         let body = Body::from(
             r#"{
                 "model":"gpt-5.3-codex",
-                "input":"hello compact",
+                "previous_response_id":"resp_compact_1",
+                "input":[
+                    {
+                        "type":"function_call",
+                        "call_id":"call_ns_1",
+                        "name":"find_gameobjects",
+                        "namespace":"game_tools",
+                        "arguments":"{\"scene\":\"main\"}"
+                    },
+                    {
+                        "type":"function_call_output",
+                        "call_id":"call_ns_1",
+                        "output":"[]"
+                    }
+                ],
                 "tools":[{"type":"web_search"}],
                 "parallel_tool_calls":true,
                 "reasoning":{"effort":"high","summary":"auto"},
@@ -2749,21 +2793,22 @@ mod tests {
             1024 * 1024,
         )
         .await
-        .expect("compact request should normalize");
+        .expect("compact request should pass through");
 
         let upstream: serde_json::Value =
             serde_json::from_slice(&prepared.request_body).expect("upstream body json");
 
+        assert_eq!(upstream["previous_response_id"], json!("resp_compact_1"));
+        assert_eq!(upstream["input"][0]["namespace"], json!("game_tools"));
         assert_eq!(upstream["tools"], json!([{ "type": "web_search" }]));
         assert_eq!(upstream["parallel_tool_calls"], json!(true));
         assert_eq!(upstream["reasoning"], json!({"effort":"high","summary":"auto"}));
         assert_eq!(upstream["text"], json!({"verbosity":"low"}));
-        assert_eq!(upstream["instructions"].as_str(), Some(codex_default_instructions()));
-        assert!(upstream.get("max_output_tokens").is_none());
-        assert!(upstream.get("store").is_none());
-        assert!(upstream.get("include").is_none());
-        assert!(upstream.get("client_metadata").is_none());
-        assert!(upstream.get("tool_choice").is_none());
+        assert_eq!(upstream["max_output_tokens"], json!(64));
+        assert_eq!(upstream["store"], json!(true));
+        assert_eq!(upstream["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(upstream["client_metadata"], json!({"source":"test"}));
+        assert_eq!(upstream["tool_choice"], json!("required"));
     }
 
     #[tokio::test]
