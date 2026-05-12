@@ -273,6 +273,51 @@ pub fn apply_gpt53_codex_spark_mapping(
     Ok(mapped)
 }
 
+/// Align the outgoing native responses `store` field with the selected
+/// upstream provider semantics.
+pub fn align_responses_store_with_upstream(
+    prepared: &PreparedGatewayRequest,
+    upstream_base: &str,
+) -> CodexGatewayResult<PreparedGatewayRequest> {
+    if !prepared.upstream_path.starts_with("/v1/responses") {
+        return Ok(prepared.clone());
+    }
+
+    let mut value = serde_json::from_slice::<Value>(&prepared.request_body).map_err(|err| {
+        internal_error("Failed to parse llm gateway request body for store alignment", err)
+    })?;
+    let Some(root) = value.as_object_mut() else {
+        return Err(internal_error(
+            "Failed to align llm gateway request store field",
+            "request body is not a JSON object",
+        ));
+    };
+
+    let changed = if prepared.upstream_path.starts_with("/v1/responses/compact") {
+        root.remove("store").is_some()
+    } else {
+        let store = is_azure_responses_upstream_base(upstream_base);
+        if root.get("store") == Some(&Value::Bool(store)) {
+            false
+        } else {
+            root.insert("store".to_string(), Value::Bool(store));
+            true
+        }
+    };
+
+    if !changed {
+        return Ok(prepared.clone());
+    }
+
+    let request_body = Bytes::from(serde_json::to_vec(&value).map_err(|err| {
+        internal_error("Failed to encode llm gateway request body after store alignment", err)
+    })?);
+
+    let mut aligned = prepared.clone();
+    aligned.request_body = request_body;
+    Ok(aligned)
+}
+
 /// Extract the last text-like message content from the request body.
 ///
 /// This intentionally parses request-format structures (`messages` for chat
@@ -606,6 +651,19 @@ pub fn normalize_upstream_base_url(base: &str) -> String {
         normalized = format!("{normalized}/backend-api/codex");
     }
     normalized
+}
+
+fn is_azure_responses_upstream_base(base_url: &str) -> bool {
+    let base_url = base_url.to_ascii_lowercase();
+    const AZURE_MARKERS: [&str; 6] = [
+        "openai.azure.",
+        "cognitiveservices.azure.",
+        "aoai.azure.",
+        "azure-api.",
+        "azurefd.",
+        "windows.net/openai",
+    ];
+    AZURE_MARKERS.iter().any(|marker| base_url.contains(marker))
 }
 
 /// Collapse user-provided reasoning-effort aliases into supported values.
@@ -1951,14 +2009,16 @@ mod tests {
     use std::io::Cursor;
 
     use axum::{
-        body::Body,
-        http::{header, HeaderValue, StatusCode},
+        body::{Body, Bytes},
+        http::{header, HeaderValue, Method, StatusCode},
     };
     use serde_json::json;
 
     use super::{
-        adapt_openai_chat_completions_request, codex_default_instructions, prepare_gateway_request,
+        adapt_openai_chat_completions_request, align_responses_store_with_upstream,
+        codex_default_instructions, prepare_gateway_request,
     };
+    use crate::types::{GatewayResponseAdapter, PreparedGatewayRequest};
 
     #[test]
     fn adapt_openai_chat_completions_request_rejects_message_without_role() {
@@ -2000,6 +2060,90 @@ mod tests {
         )
         .expect("unsupported user content should be dropped");
         assert_eq!(adapted["input"], json!([]));
+    }
+
+    fn prepared_responses_request(path: &str, body: serde_json::Value) -> PreparedGatewayRequest {
+        PreparedGatewayRequest {
+            original_path: path.to_string(),
+            upstream_path: path.to_string(),
+            method: Method::POST,
+            client_request_body: None,
+            request_body: Bytes::from(serde_json::to_vec(&body).expect("request body json")),
+            model: body
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .map(ToString::to_string),
+            client_visible_model: None,
+            wants_stream: false,
+            force_upstream_stream: false,
+            content_type: "application/json".to_string(),
+            response_adapter: GatewayResponseAdapter::Responses,
+            thread_anchor: None,
+            tool_name_restore_map: Default::default(),
+            billable_multiplier: 1,
+            last_message_content: None,
+        }
+    }
+
+    #[test]
+    fn align_responses_store_with_upstream_sets_false_for_non_azure() {
+        let prepared = prepared_responses_request(
+            "/v1/responses",
+            json!({
+                "model": "gpt-5.3-codex",
+                "input": "hello"
+            }),
+        );
+
+        let aligned =
+            align_responses_store_with_upstream(&prepared, "https://chatgpt.com/backend-api/codex")
+                .expect("store alignment should succeed");
+        let body: serde_json::Value =
+            serde_json::from_slice(&aligned.request_body).expect("aligned body json");
+
+        assert_eq!(body.get("store"), Some(&json!(false)));
+    }
+
+    #[test]
+    fn align_responses_store_with_upstream_sets_true_for_azure() {
+        let prepared = prepared_responses_request(
+            "/v1/responses",
+            json!({
+                "model": "gpt-5.3-codex",
+                "input": "hello",
+                "store": false
+            }),
+        );
+
+        let aligned = align_responses_store_with_upstream(
+            &prepared,
+            "https://foo.openai.azure.com/openai/deployments/bar",
+        )
+        .expect("store alignment should succeed");
+        let body: serde_json::Value =
+            serde_json::from_slice(&aligned.request_body).expect("aligned body json");
+
+        assert_eq!(body.get("store"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn align_responses_store_with_upstream_removes_compact_store_field() {
+        let prepared = prepared_responses_request(
+            "/v1/responses/compact",
+            json!({
+                "model": "gpt-5.3-codex",
+                "input": "hello compact",
+                "store": true
+            }),
+        );
+
+        let aligned =
+            align_responses_store_with_upstream(&prepared, "https://chatgpt.com/backend-api/codex")
+                .expect("store alignment should succeed");
+        let body: serde_json::Value =
+            serde_json::from_slice(&aligned.request_body).expect("aligned body json");
+
+        assert_eq!(body.get("store"), None);
     }
 
     #[tokio::test]

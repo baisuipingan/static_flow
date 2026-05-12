@@ -25,7 +25,8 @@ use llm_access_codex::{
         AnthropicStreamMetadata,
     },
     request::{
-        apply_gpt53_codex_spark_mapping, external_origin, extract_client_ip_from_headers,
+        align_responses_store_with_upstream, apply_gpt53_codex_spark_mapping, external_origin,
+        extract_client_ip_from_headers,
         extract_last_message_content as extract_codex_last_message_content,
         prepare_gateway_request_from_bytes, resolve_request_url_from_headers,
         serialize_headers_json,
@@ -1066,6 +1067,10 @@ async fn dispatch_codex_proxy(
                 Ok(prepared) => prepared,
                 Err(err) => return (err.status, err.message).into_response(),
             };
+        let prepared = match align_responses_store_with_upstream(&prepared, &upstream_base) {
+            Ok(prepared) => prepared,
+            Err(err) => return (err.status, err.message).into_response(),
+        };
         let upstream_url = compute_codex_upstream_url(&upstream_base, &prepared.upstream_path);
         let client = match provider_client(route.proxy.as_ref()) {
             Ok(client) => client,
@@ -9172,6 +9177,7 @@ mod tests {
             requests[1].body.get("previous_response_id"),
             Some(&json!(previous_response_id))
         );
+        assert_eq!(requests[1].body.get("store"), Some(&json!(false)));
         let input = requests[1].body["input"]
             .as_array()
             .expect("upstream input array");
@@ -9241,7 +9247,8 @@ mod tests {
                     json!({
                         "model": "gpt-5.3-codex",
                         "previous_response_id": previous_response_id,
-                        "input": "next compact"
+                        "input": "next compact",
+                        "store": true
                     })
                     .to_string(),
                 ))
@@ -9259,6 +9266,7 @@ mod tests {
             Some(&json!(previous_response_id))
         );
         assert_eq!(requests[1].body["input"], json!("next compact"));
+        assert_eq!(requests[1].body.get("store"), None);
     }
 
 
