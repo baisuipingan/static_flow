@@ -172,6 +172,7 @@ pub fn prepare_gateway_request_from_bytes(
             if let Some(prompt_cache_key) = extract_non_empty_string(root.get("prompt_cache_key")) {
                 thread_anchor = Some(prompt_cache_key.to_string());
             }
+            inject_default_instructions_when_missing(root);
         }
     }
 
@@ -569,6 +570,20 @@ pub fn extract_non_empty_string(value: Option<&Value>) -> Option<&str> {
         .and_then(Value::as_str)
         .map(str::trim)
         .filter(|value| !value.is_empty())
+}
+
+fn inject_default_instructions_when_missing(root: &mut Map<String, Value>) {
+    let needs_default_instructions = match root.get("instructions") {
+        None | Some(Value::Null) => true,
+        Some(Value::String(value)) => value.trim().is_empty(),
+        Some(_) => false,
+    };
+    if needs_default_instructions {
+        root.insert(
+            "instructions".to_string(),
+            Value::String(codex_default_instructions().to_string()),
+        );
+    }
 }
 
 /// Rewrite chat/completions requests onto the upstream responses endpoint.
@@ -2035,7 +2050,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prepare_gateway_request_does_not_inject_default_instructions_for_native_responses() {
+    async fn prepare_gateway_request_injects_default_instructions_for_native_responses_when_missing(
+    ) {
         let headers = axum::http::HeaderMap::new();
         let body = Body::from(r#"{"model":"gpt-5.3-codex","input":"hello"}"#);
 
@@ -2053,7 +2069,7 @@ mod tests {
         let upstream: serde_json::Value =
             serde_json::from_slice(&prepared.request_body).expect("upstream body json");
 
-        assert!(upstream.get("instructions").is_none());
+        assert_eq!(upstream["instructions"].as_str(), Some(codex_default_instructions()));
     }
 
     #[tokio::test]
@@ -2744,7 +2760,7 @@ mod tests {
         assert_eq!(upstream["parallel_tool_calls"], json!(true));
         assert_eq!(upstream["reasoning"], json!({"effort":"high","summary":"auto"}));
         assert_eq!(upstream["text"], json!({"verbosity":"low"}));
-        assert!(upstream.get("instructions").is_none());
+        assert_eq!(upstream["instructions"].as_str(), Some(codex_default_instructions()));
         assert!(
             upstream.get("stream").is_none(),
             "compact requests should not inject stream control"
@@ -2805,6 +2821,7 @@ mod tests {
         assert_eq!(upstream["reasoning"], json!({"effort":"high","summary":"auto"}));
         assert_eq!(upstream["text"], json!({"verbosity":"low"}));
         assert_eq!(upstream["max_output_tokens"], json!(64));
+        assert_eq!(upstream["instructions"].as_str(), Some(codex_default_instructions()));
         assert_eq!(upstream["store"], json!(true));
         assert_eq!(upstream["include"], json!(["reasoning.encrypted_content"]));
         assert_eq!(upstream["client_metadata"], json!({"source":"test"}));
