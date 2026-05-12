@@ -8,9 +8,6 @@ mod geoip;
 mod gpt2api_rs;
 mod handlers;
 mod health;
-mod kiro_gateway;
-mod llm_access_proxy;
-mod llm_gateway;
 #[cfg(feature = "local-media")]
 mod media_proxy;
 mod memory_profiler;
@@ -21,7 +18,6 @@ mod routes;
 mod seo;
 mod state;
 mod table_maintenance;
-mod upstream_proxy;
 
 use std::{env, net::SocketAddr, time::Duration};
 

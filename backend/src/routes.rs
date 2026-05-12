@@ -4,7 +4,7 @@ use axum::{
     http::{HeaderValue, Method},
     middleware,
     response::{Html, IntoResponse},
-    routing::{any, delete, get, patch, post, put},
+    routing::{any, get, patch, post, put},
     Router,
 };
 use tower_http::{
@@ -13,8 +13,7 @@ use tower_http::{
 };
 
 use crate::{
-    behavior_analytics, gpt2api_rs, handlers, health, kiro_gateway, llm_access_proxy, llm_gateway,
-    request_context, seo, state::AppState,
+    behavior_analytics, gpt2api_rs, handlers, health, request_context, seo, state::AppState,
 };
 
 #[cfg(feature = "local-media")]
@@ -32,7 +31,6 @@ where
 /// SPA fallbacks.
 pub fn create_router(state: AppState) -> Router {
     let behavior_state = state.clone();
-    let llm_gateway_state = state.clone();
     let allow_origin_env = std::env::var("ALLOWED_ORIGINS").ok();
     let allowed_origins = parse_allowed_origins(allow_origin_env.as_deref());
 
@@ -67,77 +65,12 @@ pub fn create_router(state: AppState) -> Router {
         },
     };
 
-    // Keep the LLM gateway proxy behind a dedicated middleware so request
-    // diagnostics can be captured once and reused when usage is persisted.
-    let llm_gateway_router = Router::new()
-        .route("/api/llm-gateway/v1/*path", any(llm_gateway::proxy_gateway_request))
-        .route_layer(middleware::from_fn_with_state(
-            llm_gateway_state,
-            llm_gateway::capture_gateway_event_context_middleware,
-        ));
-
     // API and admin routes have the highest priority so they cannot be
     // shadowed by the SPA history fallback below.
     let api_router = Router::new()
         .route("/api/healthz", get(health::get_healthz))
         .route("/api/articles", get(handlers::list_articles))
         .route("/api/articles/:id", get(handlers::get_article))
-        .route("/api/llm-gateway/access", get(llm_gateway::get_public_access))
-        .route(
-            "/api/llm-gateway/model-catalog.json",
-            get(llm_gateway::get_public_model_catalog),
-        )
-        .route("/api/kiro-gateway/access", get(kiro_gateway::get_public_access))
-        .route(
-            "/api/kiro-gateway/v1/models",
-            get(kiro_gateway::anthropic::get_models),
-        )
-        .route(
-            "/api/kiro-gateway/v1/messages",
-            post(kiro_gateway::anthropic::post_messages),
-        )
-        .route(
-            "/api/kiro-gateway/v1/messages/count_tokens",
-            post(kiro_gateway::anthropic::count_tokens),
-        )
-        .route(
-            "/api/kiro-gateway/cc/v1/messages",
-            post(kiro_gateway::anthropic::post_messages_cc),
-        )
-        .route(
-            "/api/kiro-gateway/cc/v1/messages/count_tokens",
-            post(kiro_gateway::anthropic::count_tokens),
-        )
-        .route("/api/llm-gateway/status", get(llm_gateway::get_public_rate_limit_status))
-        .route(
-            "/api/llm-gateway/public-usage/query",
-            post(llm_gateway::lookup_public_usage),
-        )
-        .route(
-            "/api/llm-gateway/support-config",
-            get(llm_gateway::get_public_support_config),
-        )
-        .route(
-            "/api/llm-gateway/support-assets/:file_name",
-            get(llm_gateway::get_public_support_asset),
-        )
-        .route(
-            "/api/llm-gateway/account-contributions",
-            get(llm_gateway::list_public_account_contributions),
-        )
-        .route("/api/llm-gateway/sponsors", get(llm_gateway::list_public_sponsors))
-        .route(
-            "/api/llm-gateway/token-requests/submit",
-            post(llm_gateway::submit_public_token_request),
-        )
-        .route(
-            "/api/llm-gateway/account-contribution-requests/submit",
-            post(llm_gateway::submit_public_account_contribution_request),
-        )
-        .route(
-            "/api/llm-gateway/sponsor-requests/submit",
-            post(llm_gateway::submit_public_sponsor_request),
-        )
         .route("/api/articles/:id/raw/:lang", get(handlers::get_article_raw_markdown))
         .route("/interactive-pages/:page_id", get(handlers::get_interactive_page_entry))
         .route(
@@ -197,107 +130,6 @@ pub fn create_router(state: AppState) -> Router {
         .route(
             "/admin/compaction-config",
             get(handlers::get_compaction_runtime_config).post(handlers::update_compaction_runtime_config),
-        )
-        .route(
-            "/admin/llm-gateway/config",
-            get(llm_gateway::get_admin_runtime_config)
-                .post(llm_gateway::update_admin_runtime_config),
-        )
-        .route(
-            "/admin/llm-gateway/proxy-configs",
-            get(llm_gateway::list_admin_proxy_configs).post(llm_gateway::create_admin_proxy_config),
-        )
-        .route(
-            "/admin/llm-gateway/proxy-configs/import-legacy-kiro",
-            post(llm_gateway::import_legacy_kiro_proxy_configs),
-        )
-        .route(
-            "/admin/llm-gateway/proxy-configs/:proxy_id",
-            patch(llm_gateway::patch_admin_proxy_config)
-                .delete(llm_gateway::delete_admin_proxy_config),
-        )
-        .route(
-            "/admin/llm-gateway/proxy-configs/:proxy_id/check/:provider_type",
-            post(llm_gateway::check_admin_proxy_config),
-        )
-        .route(
-            "/admin/llm-gateway/proxy-bindings",
-            get(llm_gateway::list_admin_proxy_bindings),
-        )
-        .route(
-            "/admin/llm-gateway/proxy-bindings/:provider_type",
-            post(llm_gateway::update_admin_proxy_binding),
-        )
-        .route(
-            "/admin/llm-gateway/account-groups",
-            get(llm_gateway::list_admin_account_groups)
-                .post(llm_gateway::create_admin_account_group),
-        )
-        .route(
-            "/admin/llm-gateway/account-groups/:group_id",
-            patch(llm_gateway::patch_admin_account_group)
-                .delete(llm_gateway::delete_admin_account_group),
-        )
-        .route(
-            "/admin/llm-gateway/keys",
-            get(llm_gateway::list_admin_keys).post(llm_gateway::create_admin_key),
-        )
-        .route(
-            "/admin/llm-gateway/keys/:key_id",
-            patch(llm_gateway::patch_admin_key).delete(llm_gateway::delete_admin_key),
-        )
-        .route("/admin/llm-gateway/usage", get(llm_gateway::list_admin_usage_events))
-        .route(
-            "/admin/llm-gateway/usage/:event_id",
-            get(llm_gateway::get_admin_usage_event_detail),
-        )
-        .route(
-            "/admin/llm-gateway/token-requests",
-            get(llm_gateway::list_admin_token_requests),
-        )
-        .route(
-            "/admin/llm-gateway/token-requests/:request_id/approve-and-issue",
-            post(llm_gateway::approve_and_issue_token_request),
-        )
-        .route(
-            "/admin/llm-gateway/token-requests/:request_id/reject",
-            post(llm_gateway::reject_token_request),
-        )
-        .route(
-            "/admin/llm-gateway/account-contribution-requests",
-            get(llm_gateway::list_admin_account_contribution_requests),
-        )
-        .route(
-            "/admin/llm-gateway/account-contribution-requests/:request_id/approve-and-issue",
-            post(llm_gateway::approve_and_issue_account_contribution_request),
-        )
-        .route(
-            "/admin/llm-gateway/account-contribution-requests/:request_id/reject",
-            post(llm_gateway::reject_account_contribution_request),
-        )
-        .route(
-            "/admin/llm-gateway/sponsor-requests",
-            get(llm_gateway::list_admin_sponsor_requests),
-        )
-        .route(
-            "/admin/llm-gateway/sponsor-requests/:request_id/approve",
-            post(llm_gateway::approve_sponsor_request),
-        )
-        .route(
-            "/admin/llm-gateway/sponsor-requests/:request_id",
-            delete(llm_gateway::delete_sponsor_request),
-        )
-        .route(
-            "/admin/llm-gateway/accounts",
-            get(llm_gateway::list_accounts).post(llm_gateway::import_account),
-        )
-        .route(
-            "/admin/llm-gateway/accounts/:name",
-            delete(llm_gateway::remove_account).patch(llm_gateway::patch_account_settings),
-        )
-        .route(
-            "/admin/llm-gateway/accounts/:name/refresh",
-            post(llm_gateway::refresh_account),
         )
         .route(
             "/admin/gpt2api-rs/config",
@@ -435,54 +267,10 @@ pub fn create_router(state: AppState) -> Router {
             "/api/gpt2api/*path",
             any(gpt2api_rs::proxy_public_product_api),
         )
-        .route(
-            "/admin/kiro-gateway/account-groups",
-            get(kiro_gateway::list_admin_account_groups)
-                .post(kiro_gateway::create_admin_account_group),
-        )
-        .route(
-            "/admin/kiro-gateway/account-groups/:group_id",
-            patch(kiro_gateway::patch_admin_account_group)
-                .delete(kiro_gateway::delete_admin_account_group),
-        )
-        .route(
-            "/admin/kiro-gateway/keys",
-            get(kiro_gateway::list_admin_keys).post(kiro_gateway::create_admin_key),
-        )
-        .route(
-            "/admin/kiro-gateway/keys/:key_id",
-            patch(kiro_gateway::patch_admin_key).delete(kiro_gateway::delete_admin_key),
-        )
-        .route("/admin/kiro-gateway/usage", get(kiro_gateway::list_admin_usage_events))
-        .route(
-            "/admin/kiro-gateway/usage/:event_id",
-            get(kiro_gateway::get_admin_usage_event_detail),
-        )
-        .route(
-            "/admin/kiro-gateway/accounts/statuses",
-            get(kiro_gateway::list_admin_account_statuses),
-        )
-        .route(
-            "/admin/kiro-gateway/accounts",
-            get(kiro_gateway::list_admin_accounts).post(kiro_gateway::create_manual_account),
-        )
-        .route(
-            "/admin/kiro-gateway/accounts/import-local",
-            post(kiro_gateway::import_local_account),
-        )
-        .route(
-            "/admin/kiro-gateway/accounts/:name",
-            delete(kiro_gateway::delete_account).patch(kiro_gateway::patch_account),
-        )
-        .route(
-            "/admin/kiro-gateway/accounts/:name/balance",
-            get(kiro_gateway::get_account_balance).post(kiro_gateway::refresh_account_balance_cache),
-        )
         .route("/admin/api-behavior/overview", get(handlers::admin_api_behavior_overview))
         .route("/admin/api-behavior/events", get(handlers::admin_list_api_behavior_events))
         .route("/admin/api-behavior/cleanup", post(handlers::admin_cleanup_api_behavior))
         .route("/admin/api-behavior/compact", post(handlers::admin_compact_api_behavior))
-        .merge(llm_gateway_router)
         .route("/admin/geoip/status", get(handlers::get_geoip_status))
         .route(
             "/admin/runtime/memory/overview",
@@ -688,7 +476,6 @@ pub fn create_router(state: AppState) -> Router {
         .merge(seo_router)
         .merge(gpt2api_frontend_router)
         .fallback_service(spa_fallback.fallback(get(spa_index_fallback)))
-        .layer(middleware::from_fn(llm_access_proxy::proxy_middleware))
         .layer(middleware::from_fn(request_context::request_context_middleware))
         .layer(middleware::from_fn_with_state(
             behavior_state,

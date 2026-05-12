@@ -9,10 +9,7 @@ use axum::{
 use static_flow_runtime::request_ids::{read_or_generate_id, REQUEST_ID_HEADER, TRACE_ID_HEADER};
 use tracing::Instrument;
 
-#[derive(Clone, Copy, Debug)]
-pub struct RequestReceivedAt(pub Instant);
-
-pub async fn request_context_middleware(mut request: Request, next: Next) -> Response {
+pub async fn request_context_middleware(request: Request, next: Next) -> Response {
     let request_id = read_or_generate_id(
         request
             .headers()
@@ -36,9 +33,6 @@ pub async fn request_context_middleware(mut request: Request, next: Next) -> Res
     let method = request.method().clone();
     let path = request.uri().path().to_owned();
     let started_at = Instant::now();
-    request
-        .extensions_mut()
-        .insert(RequestReceivedAt(started_at));
 
     let span = tracing::info_span!(
         "http_request",

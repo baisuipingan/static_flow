@@ -11,7 +11,7 @@ use parking_lot::RwLock;
 use static_flow_shared::{
     article_request_store, comments_store, interactive_store,
     lancedb_api::CONTENT_BACKGROUND_COMPACTION_TABLE_NAMES,
-    llm_gateway_store::LLM_GATEWAY_TABLE_NAMES,
+    llm_gateway_store::GPT2API_ACCOUNT_CONTRIBUTION_REQUESTS_TABLE,
     music_store, music_wish_store,
     optimize::{check_opened_table_and_compact, CompactAction, CompactConfig, CompactResult},
 };
@@ -33,7 +33,7 @@ enum MaintenanceDb {
     MusicWish,
     ArticleRequest,
     Interactive,
-    LlmGateway,
+    Gpt2ApiContribution,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -332,7 +332,9 @@ fn default_table_maintenance_tasks() -> Vec<TableMaintenanceTaskDefinition> {
         MaintenanceDb::Interactive,
         interactive_store::INTERACTIVE_TABLE_NAMES,
     );
-    push_generic_tasks(&mut tasks, "content", MaintenanceDb::LlmGateway, LLM_GATEWAY_TABLE_NAMES);
+    push_generic_tasks(&mut tasks, "content", MaintenanceDb::Gpt2ApiContribution, &[
+        GPT2API_ACCOUNT_CONTRIBUTION_REQUESTS_TABLE,
+    ]);
     push_generic_tasks(
         &mut tasks,
         "comments",
@@ -448,7 +450,9 @@ async fn execute_scheduled_task(
                 MaintenanceDb::MusicWish => stores.music_wish_store.connection(),
                 MaintenanceDb::ArticleRequest => stores.article_request_store.connection(),
                 MaintenanceDb::Interactive => stores.interactive_store.connection(),
-                MaintenanceDb::LlmGateway => stores.llm_gateway_store.connection(),
+                MaintenanceDb::Gpt2ApiContribution => {
+                    stores.gpt2api_contribution_store.connection()
+                },
             };
             match connection.open_table(table_name).execute().await {
                 Ok(table) => check_opened_table_and_compact(&table, &task.compact_config).await,
@@ -511,8 +515,6 @@ fn log_maintenance_result(result: &CompactResult) {
 
 #[cfg(test)]
 mod tests {
-    use static_flow_shared::llm_gateway_store::LLM_GATEWAY_USAGE_EVENTS_TABLE;
-
     use super::*;
     use crate::state::{
         CompactionRuntimeConfig, DEFAULT_TABLE_COMPACT_FRAGMENT_THRESHOLD,
@@ -530,11 +532,11 @@ mod tests {
     }
 
     #[test]
-    fn usage_event_task_inherits_global_compaction_defaults() {
+    fn gpt2api_contribution_task_inherits_global_compaction_defaults() {
         let task = default_table_maintenance_tasks()
             .into_iter()
-            .find(|task| task.table_name == LLM_GATEWAY_USAGE_EVENTS_TABLE)
-            .expect("usage event task exists");
+            .find(|task| task.table_name == GPT2API_ACCOUNT_CONTRIBUTION_REQUESTS_TABLE)
+            .expect("gpt2api account contribution task exists");
         let global = CompactionRuntimeConfig {
             scan_interval_seconds: 321,
             prune_older_than_hours: 6,

@@ -43,9 +43,6 @@ static-flow-shared = { path = "../shared" }
 static-flow-runtime = { path = "../runtime" }
 static-flow-email = { path = "../email-notifier" }
 static-flow-media-types = { path = "../media-types", optional = true }
-llm-access-core = { path = "../llm-access-core" }
-llm-access-codex = { path = "../llm-access-codex" }
-llm-access-kiro = { path = "../llm-access-kiro" }
 base64 = "0.22.1"
 bytes = "1.10"
 crc = "3.3"

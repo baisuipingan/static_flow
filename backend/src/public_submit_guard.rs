@@ -1,7 +1,7 @@
 //! Shared rate-limit helpers for low-frequency public submission endpoints.
 //!
-//! The `/llm-access` write APIs, article requests, music wishes, and similar
-//! public forms all use the same "one submission per IP per minute" guard. The
+//! Article requests, music wishes, account contributions, and similar public
+//! forms all use the same "one submission per IP per minute" guard. The
 //! helpers in this module normalize the client identity and provide a single
 //! enforcement path so every public write surface behaves consistently.
 

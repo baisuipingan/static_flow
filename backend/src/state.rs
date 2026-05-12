@@ -1,12 +1,12 @@
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::HashMap,
     env,
     path::{Path, PathBuf},
     sync::Arc,
     time::{Duration, Instant},
 };
 
-use anyhow::{anyhow, Result};
+use anyhow::Result;
 use parking_lot::RwLock;
 use serde::{Deserialize, Serialize};
 use static_flow_shared::{
@@ -16,26 +16,7 @@ use static_flow_shared::{
     lancedb_api::{
         CategoryInfo, NewApiBehaviorEventInput, StaticFlowDataStore, StatsResponse, TagInfo,
     },
-    llm_gateway_store::{
-        default_kiro_billable_model_multipliers, default_kiro_billable_model_multipliers_json,
-        default_kiro_cache_kmodels, default_kiro_cache_kmodels_json, default_kiro_cache_policy,
-        default_kiro_cache_policy_json, now_ms, parse_kiro_cache_policy_json, KiroCachePolicy,
-        LlmGatewayAccountGroupRecord, LlmGatewayStore, DEFAULT_CODEX_CLIENT_VERSION,
-        DEFAULT_CODEX_STATUS_ACCOUNT_JITTER_MAX_SECONDS,
-        DEFAULT_CODEX_STATUS_REFRESH_MAX_INTERVAL_SECONDS,
-        DEFAULT_CODEX_STATUS_REFRESH_MIN_INTERVAL_SECONDS, DEFAULT_KIRO_CHANNEL_MAX_CONCURRENCY,
-        DEFAULT_KIRO_CHANNEL_MIN_START_INTERVAL_MS, DEFAULT_KIRO_CONVERSATION_ANCHOR_MAX_ENTRIES,
-        DEFAULT_KIRO_CONVERSATION_ANCHOR_TTL_SECONDS, DEFAULT_KIRO_PREFIX_CACHE_ENTRY_TTL_SECONDS,
-        DEFAULT_KIRO_PREFIX_CACHE_MAX_TOKENS, DEFAULT_KIRO_PREFIX_CACHE_MODE,
-        DEFAULT_KIRO_STATUS_ACCOUNT_JITTER_MAX_SECONDS,
-        DEFAULT_KIRO_STATUS_REFRESH_MAX_INTERVAL_SECONDS,
-        DEFAULT_KIRO_STATUS_REFRESH_MIN_INTERVAL_SECONDS,
-        DEFAULT_LLM_GATEWAY_ACCOUNT_FAILURE_RETRY_LIMIT,
-        DEFAULT_LLM_GATEWAY_AUTH_CACHE_TTL_SECONDS, DEFAULT_LLM_GATEWAY_MAX_REQUEST_BODY_BYTES,
-        DEFAULT_LLM_GATEWAY_USAGE_EVENT_FLUSH_BATCH_SIZE,
-        DEFAULT_LLM_GATEWAY_USAGE_EVENT_FLUSH_INTERVAL_SECONDS,
-        DEFAULT_LLM_GATEWAY_USAGE_EVENT_FLUSH_MAX_BUFFER_BYTES,
-    },
+    llm_gateway_store::LlmGatewayStore as Gpt2ApiContributionStore,
     music_store::MusicDataStore,
     music_wish_store::MusicWishStore,
 };
@@ -49,12 +30,9 @@ use crate::{
     email::EmailNotifier,
     geoip::GeoIpResolver,
     gpt2api_rs::Gpt2ApiRsState,
-    kiro_gateway::KiroGatewayRuntimeState,
-    llm_gateway::LlmGatewayRuntimeState,
     music_wish_worker::{self, MusicWishWorkerConfig},
     public_submit_guard::PublicSubmitGuard,
     table_maintenance,
-    upstream_proxy::UpstreamProxyRegistry,
 };
 
 type ListCacheEntry<T> = Option<(Vec<T>, Instant)>;
@@ -196,132 +174,6 @@ impl Default for CompactionRuntimeConfig {
     }
 }
 
-/// Runtime knobs for the public LLM gateway and its in-memory auth cache.
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct LlmGatewayRuntimeConfig {
-    pub auth_cache_ttl_seconds: u64,
-    /// Maximum allowed request body size in bytes for proxied gateway calls.
-    pub max_request_body_bytes: u64,
-    /// Number of consecutive Codex refresh failures tolerated before marking
-    /// one account unavailable.
-    pub account_failure_retry_limit: u64,
-    /// Default Codex client version appended to upstream catalog requests.
-    pub codex_client_version: String,
-    /// Maximum number of concurrent Kiro upstream requests.
-    pub kiro_channel_max_concurrency: u64,
-    /// Minimum milliseconds between consecutive Kiro upstream request starts.
-    pub kiro_channel_min_start_interval_ms: u64,
-    pub codex_status_refresh_min_interval_seconds: u64,
-    pub codex_status_refresh_max_interval_seconds: u64,
-    pub codex_status_account_jitter_max_seconds: u64,
-    pub kiro_status_refresh_min_interval_seconds: u64,
-    pub kiro_status_refresh_max_interval_seconds: u64,
-    pub kiro_status_account_jitter_max_seconds: u64,
-    pub usage_event_flush_batch_size: u64,
-    pub usage_event_flush_interval_seconds: u64,
-    pub usage_event_flush_max_buffer_bytes: u64,
-    pub kiro_cache_kmodels_json: String,
-    pub kiro_cache_kmodels: BTreeMap<String, f64>,
-    pub kiro_billable_model_multipliers_json: String,
-    pub kiro_billable_model_multipliers: BTreeMap<String, f64>,
-    pub kiro_cache_policy_json: String,
-    pub kiro_cache_policy: KiroCachePolicy,
-    pub kiro_prefix_cache_mode: String,
-    pub kiro_prefix_cache_max_tokens: u64,
-    pub kiro_prefix_cache_entry_ttl_seconds: u64,
-    pub kiro_conversation_anchor_max_entries: u64,
-    pub kiro_conversation_anchor_ttl_seconds: u64,
-}
-
-impl Default for LlmGatewayRuntimeConfig {
-    fn default() -> Self {
-        Self {
-            auth_cache_ttl_seconds: DEFAULT_LLM_GATEWAY_AUTH_CACHE_TTL_SECONDS,
-            max_request_body_bytes: DEFAULT_LLM_GATEWAY_MAX_REQUEST_BODY_BYTES,
-            account_failure_retry_limit: DEFAULT_LLM_GATEWAY_ACCOUNT_FAILURE_RETRY_LIMIT,
-            codex_client_version: DEFAULT_CODEX_CLIENT_VERSION.to_string(),
-            kiro_channel_max_concurrency: DEFAULT_KIRO_CHANNEL_MAX_CONCURRENCY,
-            kiro_channel_min_start_interval_ms: DEFAULT_KIRO_CHANNEL_MIN_START_INTERVAL_MS,
-            codex_status_refresh_min_interval_seconds:
-                DEFAULT_CODEX_STATUS_REFRESH_MIN_INTERVAL_SECONDS,
-            codex_status_refresh_max_interval_seconds:
-                DEFAULT_CODEX_STATUS_REFRESH_MAX_INTERVAL_SECONDS,
-            codex_status_account_jitter_max_seconds:
-                DEFAULT_CODEX_STATUS_ACCOUNT_JITTER_MAX_SECONDS,
-            kiro_status_refresh_min_interval_seconds:
-                DEFAULT_KIRO_STATUS_REFRESH_MIN_INTERVAL_SECONDS,
-            kiro_status_refresh_max_interval_seconds:
-                DEFAULT_KIRO_STATUS_REFRESH_MAX_INTERVAL_SECONDS,
-            kiro_status_account_jitter_max_seconds: DEFAULT_KIRO_STATUS_ACCOUNT_JITTER_MAX_SECONDS,
-            usage_event_flush_batch_size: DEFAULT_LLM_GATEWAY_USAGE_EVENT_FLUSH_BATCH_SIZE,
-            usage_event_flush_interval_seconds:
-                DEFAULT_LLM_GATEWAY_USAGE_EVENT_FLUSH_INTERVAL_SECONDS,
-            usage_event_flush_max_buffer_bytes:
-                DEFAULT_LLM_GATEWAY_USAGE_EVENT_FLUSH_MAX_BUFFER_BYTES,
-            kiro_cache_kmodels_json: default_kiro_cache_kmodels_json(),
-            kiro_cache_kmodels: default_kiro_cache_kmodels(),
-            kiro_billable_model_multipliers_json: default_kiro_billable_model_multipliers_json(),
-            kiro_billable_model_multipliers: default_kiro_billable_model_multipliers(),
-            kiro_cache_policy_json: default_kiro_cache_policy_json(),
-            kiro_cache_policy: default_kiro_cache_policy(),
-            kiro_prefix_cache_mode: DEFAULT_KIRO_PREFIX_CACHE_MODE.to_string(),
-            kiro_prefix_cache_max_tokens: DEFAULT_KIRO_PREFIX_CACHE_MAX_TOKENS,
-            kiro_prefix_cache_entry_ttl_seconds: DEFAULT_KIRO_PREFIX_CACHE_ENTRY_TTL_SECONDS,
-            kiro_conversation_anchor_max_entries: DEFAULT_KIRO_CONVERSATION_ANCHOR_MAX_ENTRIES,
-            kiro_conversation_anchor_ttl_seconds: DEFAULT_KIRO_CONVERSATION_ANCHOR_TTL_SECONDS,
-        }
-    }
-}
-
-pub fn parse_kiro_cache_kmodels_json(value: &str) -> Result<BTreeMap<String, f64>> {
-    let map: BTreeMap<String, f64> =
-        serde_json::from_str(value).map_err(|err| anyhow!("invalid json: {err}"))?;
-    if map.is_empty() {
-        return Err(anyhow!("kmodel map must not be empty"));
-    }
-    for (model, coeff) in &map {
-        if model.trim().is_empty() {
-            return Err(anyhow!("kmodel entry has empty model name"));
-        }
-        if !coeff.is_finite() || *coeff <= 0.0 {
-            return Err(anyhow!("kmodel entry `{model}` must be a positive finite number"));
-        }
-    }
-    Ok(map)
-}
-
-pub fn parse_kiro_billable_model_multipliers_json(value: &str) -> Result<BTreeMap<String, f64>> {
-    let overrides: BTreeMap<String, f64> =
-        serde_json::from_str(value).map_err(|err| anyhow!("invalid json: {err}"))?;
-    let mut merged = default_kiro_billable_model_multipliers();
-    for (family, multiplier) in overrides {
-        if !matches!(family.as_str(), "opus" | "sonnet" | "haiku") {
-            return Err(anyhow!(
-                "billable multiplier family `{family}` must be one of `opus`, `sonnet`, `haiku`"
-            ));
-        }
-        if !multiplier.is_finite() || multiplier <= 0.0 {
-            return Err(anyhow!("billable multiplier `{family}` must be a positive finite number"));
-        }
-        merged.insert(family, multiplier);
-    }
-    Ok(merged)
-}
-
-fn sanitize_kiro_cache_policy_json(value: String) -> (String, KiroCachePolicy) {
-    match parse_kiro_cache_policy_json(&value) {
-        Ok(policy) => (value, policy),
-        Err(err) => {
-            tracing::warn!(
-                error = %err,
-                "invalid kiro cache policy json in runtime config; falling back to defaults"
-            );
-            let default_json = default_kiro_cache_policy_json();
-            (default_json, default_kiro_cache_policy())
-        },
-    }
-}
-
 #[derive(Debug, Clone)]
 pub struct AdminAccessConfig {
     pub local_only: bool,
@@ -337,7 +189,7 @@ pub(crate) struct TableCompactorStores {
     pub(crate) music_wish_store: Arc<MusicWishStore>,
     pub(crate) article_request_store: Arc<ArticleRequestStore>,
     pub(crate) interactive_store: Arc<InteractivePageStore>,
-    pub(crate) llm_gateway_store: Arc<LlmGatewayStore>,
+    pub(crate) gpt2api_contribution_store: Arc<Gpt2ApiContributionStore>,
 }
 
 /// Immutable runtime metadata exposed by health and diagnostics endpoints.
@@ -362,7 +214,6 @@ pub struct AppState {
     pub(crate) comment_runtime_config: Arc<RwLock<CommentRuntimeConfig>>,
     pub(crate) api_behavior_runtime_config: Arc<RwLock<ApiBehaviorRuntimeConfig>>,
     pub(crate) compaction_runtime_config: Arc<RwLock<CompactionRuntimeConfig>>,
-    pub(crate) llm_gateway_runtime_config: Arc<RwLock<LlmGatewayRuntimeConfig>>,
     pub(crate) comment_submit_guard: Arc<PublicSubmitGuard>,
     pub(crate) comment_worker_tx: mpsc::Sender<String>,
     pub(crate) admin_access: AdminAccessConfig,
@@ -376,13 +227,9 @@ pub struct AppState {
     pub(crate) article_request_store: Arc<ArticleRequestStore>,
     pub(crate) article_request_worker_tx: mpsc::Sender<String>,
     pub(crate) article_request_submit_guard: Arc<PublicSubmitGuard>,
-    pub(crate) llm_gateway_public_submit_guard: Arc<PublicSubmitGuard>,
+    pub(crate) gpt2api_public_submit_guard: Arc<PublicSubmitGuard>,
     pub(crate) interactive_store: Arc<InteractivePageStore>,
-    pub(crate) llm_gateway_store: Arc<LlmGatewayStore>,
-    pub(crate) upstream_proxy_registry: Arc<UpstreamProxyRegistry>,
-    pub(crate) llm_gateway: Arc<LlmGatewayRuntimeState>,
-    /// Kiro (Anthropic-protocol) gateway runtime state and request scheduler.
-    pub(crate) kiro_gateway: Arc<KiroGatewayRuntimeState>,
+    pub(crate) gpt2api_contribution_store: Arc<Gpt2ApiContributionStore>,
     pub(crate) email_notifier: Option<Arc<EmailNotifier>>,
     pub(crate) behavior_event_tx: mpsc::Sender<NewApiBehaviorEventInput>,
     pub(crate) shutdown_tx: watch::Sender<bool>,
@@ -413,10 +260,8 @@ impl AppState {
         let music_wish_store = Arc::new(MusicWishStore::connect(music_db_uri).await?);
         let article_request_store = Arc::new(ArticleRequestStore::connect(content_db_uri).await?);
         let interactive_store = Arc::new(InteractivePageStore::connect(content_db_uri).await?);
-        let llm_gateway_store = Arc::new(LlmGatewayStore::connect(content_db_uri).await?);
-        migrate_legacy_key_account_groups(llm_gateway_store.as_ref()).await?;
-        let upstream_proxy_registry =
-            Arc::new(UpstreamProxyRegistry::new(llm_gateway_store.clone()).await?);
+        let gpt2api_contribution_store =
+            Arc::new(Gpt2ApiContributionStore::connect(content_db_uri).await?);
         let geoip = GeoIpResolver::from_env()?;
         geoip.warmup().await;
         let gpt2api_rs = Arc::new(Gpt2ApiRsState::load_from_env().await?);
@@ -433,182 +278,7 @@ impl AppState {
             Arc::new(RwLock::new(read_api_behavior_runtime_config_from_env()));
         let compaction_runtime_config =
             Arc::new(RwLock::new(read_compaction_runtime_config_from_env()));
-        let llm_gateway_runtime_config_record =
-            llm_gateway_store.get_runtime_config_or_default().await?;
-        let llm_gateway_auth_cache_ttl_seconds =
-            llm_gateway_runtime_config_record.auth_cache_ttl_seconds;
-        let llm_gateway_max_request_body_bytes =
-            llm_gateway_runtime_config_record.max_request_body_bytes;
-        let llm_gateway_account_failure_retry_limit =
-            llm_gateway_runtime_config_record.account_failure_retry_limit;
-        let llm_gateway_codex_client_version = crate::llm_gateway::resolve_codex_client_version(
-            Some(&llm_gateway_runtime_config_record.codex_client_version),
-        );
-        let kiro_channel_max_concurrency =
-            llm_gateway_runtime_config_record.kiro_channel_max_concurrency;
-        let kiro_channel_min_start_interval_ms =
-            llm_gateway_runtime_config_record.kiro_channel_min_start_interval_ms;
-        let codex_status_refresh_min_interval_seconds =
-            llm_gateway_runtime_config_record.codex_status_refresh_min_interval_seconds;
-        let codex_status_refresh_max_interval_seconds =
-            llm_gateway_runtime_config_record.codex_status_refresh_max_interval_seconds;
-        let codex_status_account_jitter_max_seconds =
-            llm_gateway_runtime_config_record.codex_status_account_jitter_max_seconds;
-        let kiro_status_refresh_min_interval_seconds =
-            llm_gateway_runtime_config_record.kiro_status_refresh_min_interval_seconds;
-        let kiro_status_refresh_max_interval_seconds =
-            llm_gateway_runtime_config_record.kiro_status_refresh_max_interval_seconds;
-        let kiro_status_account_jitter_max_seconds =
-            llm_gateway_runtime_config_record.kiro_status_account_jitter_max_seconds;
-        let usage_event_flush_batch_size =
-            llm_gateway_runtime_config_record.usage_event_flush_batch_size;
-        let usage_event_flush_interval_seconds =
-            llm_gateway_runtime_config_record.usage_event_flush_interval_seconds;
-        let usage_event_flush_max_buffer_bytes =
-            llm_gateway_runtime_config_record.usage_event_flush_max_buffer_bytes;
-        let kiro_cache_kmodels_json = llm_gateway_runtime_config_record.kiro_cache_kmodels_json;
-        let kiro_billable_model_multipliers_json =
-            llm_gateway_runtime_config_record.kiro_billable_model_multipliers_json;
-        let (kiro_cache_policy_json, kiro_cache_policy) = sanitize_kiro_cache_policy_json(
-            llm_gateway_runtime_config_record.kiro_cache_policy_json,
-        );
-        let kiro_prefix_cache_mode = llm_gateway_runtime_config_record.kiro_prefix_cache_mode;
-        let kiro_prefix_cache_max_tokens =
-            llm_gateway_runtime_config_record.kiro_prefix_cache_max_tokens;
-        let kiro_prefix_cache_entry_ttl_seconds =
-            llm_gateway_runtime_config_record.kiro_prefix_cache_entry_ttl_seconds;
-        let kiro_conversation_anchor_max_entries =
-            llm_gateway_runtime_config_record.kiro_conversation_anchor_max_entries;
-        let kiro_conversation_anchor_ttl_seconds =
-            llm_gateway_runtime_config_record.kiro_conversation_anchor_ttl_seconds;
-        let kiro_cache_kmodels = parse_kiro_cache_kmodels_json(&kiro_cache_kmodels_json)
-            .unwrap_or_else(|err| {
-                tracing::warn!(
-                    error = %err,
-                    "invalid kiro cache kmodels json in runtime config; falling back to defaults"
-                );
-                default_kiro_cache_kmodels()
-            });
-        let kiro_billable_model_multipliers = parse_kiro_billable_model_multipliers_json(
-            &kiro_billable_model_multipliers_json,
-        )
-        .unwrap_or_else(|err| {
-            tracing::warn!(
-                error = %err,
-                "invalid kiro billable multiplier json in runtime config; falling back to defaults"
-            );
-            default_kiro_billable_model_multipliers()
-        });
-        tracing::info!(
-            auth_cache_ttl_seconds = llm_gateway_auth_cache_ttl_seconds,
-            max_request_body_bytes = llm_gateway_max_request_body_bytes,
-            account_failure_retry_limit = llm_gateway_account_failure_retry_limit,
-            codex_client_version = %llm_gateway_codex_client_version,
-            kiro_channel_max_concurrency,
-            kiro_channel_min_start_interval_ms,
-            codex_status_refresh_min_interval_seconds,
-            codex_status_refresh_max_interval_seconds,
-            codex_status_account_jitter_max_seconds,
-            kiro_status_refresh_min_interval_seconds,
-            kiro_status_refresh_max_interval_seconds,
-            kiro_status_account_jitter_max_seconds,
-            usage_event_flush_batch_size,
-            usage_event_flush_interval_seconds,
-            usage_event_flush_max_buffer_bytes,
-            kiro_cache_kmodels_json,
-            kiro_billable_model_multipliers_json,
-            kiro_cache_policy_json,
-            kiro_prefix_cache_mode,
-            kiro_prefix_cache_max_tokens,
-            kiro_prefix_cache_entry_ttl_seconds,
-            kiro_conversation_anchor_max_entries,
-            kiro_conversation_anchor_ttl_seconds,
-            "loaded llm gateway runtime config from storage"
-        );
-        let llm_gateway_runtime_config = Arc::new(RwLock::new(LlmGatewayRuntimeConfig {
-            auth_cache_ttl_seconds: llm_gateway_auth_cache_ttl_seconds,
-            max_request_body_bytes: llm_gateway_max_request_body_bytes,
-            account_failure_retry_limit: llm_gateway_account_failure_retry_limit,
-            codex_client_version: llm_gateway_codex_client_version.clone(),
-            kiro_channel_max_concurrency,
-            kiro_channel_min_start_interval_ms,
-            codex_status_refresh_min_interval_seconds,
-            codex_status_refresh_max_interval_seconds,
-            codex_status_account_jitter_max_seconds,
-            kiro_status_refresh_min_interval_seconds,
-            kiro_status_refresh_max_interval_seconds,
-            kiro_status_account_jitter_max_seconds,
-            usage_event_flush_batch_size,
-            usage_event_flush_interval_seconds,
-            usage_event_flush_max_buffer_bytes,
-            kiro_cache_kmodels_json,
-            kiro_cache_kmodels,
-            kiro_billable_model_multipliers_json,
-            kiro_billable_model_multipliers,
-            kiro_cache_policy_json,
-            kiro_cache_policy,
-            kiro_prefix_cache_mode,
-            kiro_prefix_cache_max_tokens,
-            kiro_prefix_cache_entry_ttl_seconds,
-            kiro_conversation_anchor_max_entries,
-            kiro_conversation_anchor_ttl_seconds,
-        }));
-        let auths_dir = crate::llm_gateway::resolve_auths_dir();
-        let external_llm_access = crate::llm_access_proxy::is_external_mode_enabled();
-        let account_pool = Arc::new(crate::llm_gateway::AccountPool::new(auths_dir.clone()));
-        let loaded_accounts = account_pool.load_all().await.unwrap_or_else(|err| {
-            tracing::warn!("failed to load codex accounts from {}: {err:#}", auths_dir.display());
-            0
-        });
-        tracing::info!(
-            auths_dir = %auths_dir.display(),
-            loaded_accounts,
-            external_llm_access,
-            "initialized codex account pool"
-        );
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
-        let llm_gateway = Arc::new(LlmGatewayRuntimeState::new(
-            llm_gateway_store.clone(),
-            llm_gateway_runtime_config.clone(),
-            account_pool.clone(),
-            upstream_proxy_registry.clone(),
-            shutdown_rx.clone(),
-        )?);
-        if external_llm_access {
-            tracing::info!(
-                "external llm-access mode enabled; skipping backend-local usage rollup rebuild"
-            );
-        } else {
-            llm_gateway.rebuild_usage_rollups().await?;
-            llm_gateway.rebuild_usage_event_counts().await?;
-        }
-        let kiro_gateway = Arc::new(
-            KiroGatewayRuntimeState::new(
-                llm_gateway_store.clone(),
-                llm_gateway_runtime_config.clone(),
-                upstream_proxy_registry.clone(),
-            )
-            .await?,
-        );
-        tracing::info!(
-            auth_cache_ttl_seconds = llm_gateway_auth_cache_ttl_seconds,
-            max_request_body_bytes = llm_gateway_max_request_body_bytes,
-            account_failure_retry_limit = llm_gateway_account_failure_retry_limit,
-            codex_client_version = %llm_gateway_codex_client_version,
-            kiro_channel_max_concurrency,
-            kiro_channel_min_start_interval_ms,
-            codex_status_refresh_min_interval_seconds,
-            codex_status_refresh_max_interval_seconds,
-            codex_status_account_jitter_max_seconds,
-            kiro_status_refresh_min_interval_seconds,
-            kiro_status_refresh_max_interval_seconds,
-            kiro_status_account_jitter_max_seconds,
-            usage_event_flush_batch_size,
-            usage_event_flush_interval_seconds,
-            usage_event_flush_max_buffer_bytes,
-            kiro_cache_kmodels_json = %llm_gateway_runtime_config.read().kiro_cache_kmodels_json,
-            "initialized llm gateway runtime state"
-        );
         let comment_worker_tx = comment_worker::spawn_comment_worker(
             comment_store.clone(),
             CommentAiWorkerConfig::from_env(content_db_uri.to_string()),
@@ -643,71 +313,6 @@ impl AppState {
         );
         #[cfg(feature = "local-media")]
         let media_proxy = MediaProxyState::from_env()?;
-        if external_llm_access {
-            tracing::info!(
-                "external llm-access mode enabled; skipping backend-local Codex/Kiro refresh tasks"
-            );
-        } else {
-            let llm_gateway_warmup = llm_gateway.clone();
-            let llm_gateway_warmup_runtime_config = llm_gateway_runtime_config.clone();
-            let llm_gateway_warmup_proxy_registry = upstream_proxy_registry.clone();
-            let mut llm_gateway_warmup_shutdown_rx = shutdown_rx.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = llm_gateway_warmup_shutdown_rx.changed() => {
-                        if *llm_gateway_warmup_shutdown_rx.borrow() {
-                            tracing::info!("Initial LLM gateway warmup cancelled during shutdown");
-                        }
-                    }
-                    _ = async {
-                        if let Err(err) = crate::llm_gateway::token_refresh::refresh_all_accounts_once(
-                            llm_gateway_warmup.account_pool.as_ref(),
-                            llm_gateway_warmup_proxy_registry.as_ref(),
-                            llm_gateway_warmup_runtime_config.as_ref(),
-                        )
-                        .await
-                        {
-                            tracing::warn!("Initial Codex account usage refresh failed: {err:#}");
-                        }
-                        if let Err(err) =
-                            crate::llm_gateway::refresh_public_rate_limit_status(&llm_gateway_warmup)
-                                .await
-                        {
-                            tracing::warn!("Initial LLM gateway rate-limit refresh failed: {err:#}");
-                        }
-                    } => {}
-                }
-            });
-            crate::llm_gateway::spawn_public_rate_limit_refresher(
-                llm_gateway.clone(),
-                shutdown_rx.clone(),
-            );
-            let kiro_gateway_warmup = kiro_gateway.clone();
-            let mut kiro_gateway_warmup_shutdown_rx = shutdown_rx.clone();
-            tokio::spawn(async move {
-                tokio::select! {
-                    _ = kiro_gateway_warmup_shutdown_rx.changed() => {
-                        if *kiro_gateway_warmup_shutdown_rx.borrow() {
-                            tracing::info!("Initial Kiro warmup cancelled during shutdown");
-                        }
-                    }
-                    _ = async {
-                        if let Err(err) =
-                            crate::kiro_gateway::refresh_cached_status(&kiro_gateway_warmup).await
-                        {
-                            tracing::warn!("Initial Kiro cached status refresh failed: {err:#}");
-                        }
-                    } => {}
-                }
-            });
-            crate::kiro_gateway::spawn_status_refresher(kiro_gateway.clone(), shutdown_rx.clone());
-            crate::llm_gateway::spawn_account_refresh_task(
-                account_pool,
-                upstream_proxy_registry.clone(),
-                llm_gateway_runtime_config.clone(),
-                shutdown_rx.clone(),
-            );
-        }
 
         table_maintenance::spawn_table_maintenance_loop(
             TableCompactorStores {
@@ -717,7 +322,7 @@ impl AppState {
                 music_wish_store: music_wish_store.clone(),
                 article_request_store: article_request_store.clone(),
                 interactive_store: interactive_store.clone(),
-                llm_gateway_store: llm_gateway_store.clone(),
+                gpt2api_contribution_store: gpt2api_contribution_store.clone(),
             },
             compaction_runtime_config.clone(),
             shutdown_rx,
@@ -737,7 +342,6 @@ impl AppState {
             comment_runtime_config,
             api_behavior_runtime_config,
             compaction_runtime_config,
-            llm_gateway_runtime_config,
             comment_submit_guard: Arc::new(RwLock::new(HashMap::new())),
             comment_worker_tx,
             admin_access,
@@ -751,12 +355,9 @@ impl AppState {
             article_request_store,
             article_request_worker_tx,
             article_request_submit_guard: Arc::new(RwLock::new(HashMap::new())),
-            llm_gateway_public_submit_guard: Arc::new(RwLock::new(HashMap::new())),
+            gpt2api_public_submit_guard: Arc::new(RwLock::new(HashMap::new())),
             interactive_store,
-            llm_gateway_store,
-            upstream_proxy_registry,
-            llm_gateway,
-            kiro_gateway,
+            gpt2api_contribution_store,
             email_notifier,
             behavior_event_tx,
             shutdown_tx,
@@ -778,14 +379,6 @@ impl AppState {
     }
 }
 
-fn generate_account_group_id(prefix: &str) -> String {
-    format!("{prefix}-{}", uuid::Uuid::new_v4().simple())
-}
-
-fn migrated_group_name(key_name: &str, key_id: &str) -> String {
-    format!("Migrated {} {}", key_name, &key_id[..key_id.len().min(8)])
-}
-
 pub(crate) async fn load_frontend_index_html(frontend_dist_dir: &Path) -> String {
     let index_html_path = frontend_dist_dir.join("index.html");
     match tokio::fs::read_to_string(&index_html_path).await {
@@ -798,72 +391,6 @@ pub(crate) async fn load_frontend_index_html(frontend_dist_dir: &Path) -> String
             String::new()
         },
     }
-}
-
-async fn migrate_legacy_key_account_groups(store: &LlmGatewayStore) -> Result<()> {
-    let keys = store.list_keys().await?;
-    let mut migrated_count = 0usize;
-    let mut cleaned_count = 0usize;
-
-    for mut key in keys {
-        let had_legacy_fields =
-            key.fixed_account_name.is_some() || key.auto_account_names.is_some();
-
-        if key.account_group_id.is_some() {
-            if had_legacy_fields {
-                key.fixed_account_name = None;
-                key.auto_account_names = None;
-                key.updated_at = now_ms();
-                store.replace_key(&key).await?;
-                cleaned_count += 1;
-            }
-            continue;
-        }
-
-        let account_names = match key.route_strategy.as_deref() {
-            Some("fixed") => key
-                .fixed_account_name
-                .as_ref()
-                .map(|name| vec![name.clone()])
-                .filter(|names| !names.is_empty()),
-            Some("auto") | None => key
-                .auto_account_names
-                .clone()
-                .filter(|names| !names.is_empty()),
-            Some(_) => None,
-        };
-
-        let Some(account_names) = account_names else {
-            continue;
-        };
-
-        let now = now_ms();
-        let group = LlmGatewayAccountGroupRecord {
-            id: generate_account_group_id("llm-group"),
-            provider_type: key.provider_type.clone(),
-            name: migrated_group_name(&key.name, &key.id),
-            account_names,
-            created_at: now,
-            updated_at: now,
-        };
-        store.create_account_group(&group).await?;
-        key.account_group_id = Some(group.id);
-        key.fixed_account_name = None;
-        key.auto_account_names = None;
-        key.updated_at = now;
-        store.replace_key(&key).await?;
-        migrated_count += 1;
-    }
-
-    if migrated_count > 0 || cleaned_count > 0 {
-        tracing::info!(
-            migrated_count,
-            cleaned_count,
-            "migrated legacy llm gateway key account selections into account groups"
-        );
-    }
-
-    Ok(())
 }
 
 /// Parse common boolean environment variable spellings with a fallback value.
@@ -1152,34 +679,6 @@ mod tests {
     fn compaction_runtime_config_defaults_prune_to_zero_hours() {
         let config = CompactionRuntimeConfig::default();
         assert_eq!(config.prune_older_than_hours, 0);
-    }
-
-    #[test]
-    fn sanitize_kiro_cache_policy_json_falls_back_to_default_values() {
-        let (json, policy) = sanitize_kiro_cache_policy_json(r#"{"unexpected":true}"#.to_string());
-
-        assert_eq!(json, default_kiro_cache_policy_json());
-        assert_eq!(policy, default_kiro_cache_policy());
-    }
-
-    #[test]
-    fn parse_kiro_billable_model_multipliers_json_merges_partial_overrides() {
-        let parsed = parse_kiro_billable_model_multipliers_json(r#"{"opus":1.6,"haiku":0.8}"#)
-            .expect("partial overrides should parse");
-
-        assert_eq!(parsed.get("opus"), Some(&1.6));
-        assert_eq!(parsed.get("haiku"), Some(&0.8));
-        assert_eq!(parsed.get("sonnet"), Some(&1.0));
-    }
-
-    #[test]
-    fn parse_kiro_billable_model_multipliers_json_rejects_unknown_family() {
-        let err = parse_kiro_billable_model_multipliers_json(r#"{"gpt":1.2}"#)
-            .expect_err("unknown family should be rejected");
-
-        assert!(err
-            .to_string()
-            .contains("must be one of `opus`, `sonnet`, `haiku`"));
     }
 
     #[tokio::test]

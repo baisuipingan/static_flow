@@ -19,8 +19,10 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use static_flow_shared::llm_gateway_store::{
     now_ms, Gpt2ApiAccountContributionRequestRecord, NewGpt2ApiAccountContributionRequestInput,
-    LLM_GATEWAY_TOKEN_REQUEST_STATUS_FAILED, LLM_GATEWAY_TOKEN_REQUEST_STATUS_ISSUED,
-    LLM_GATEWAY_TOKEN_REQUEST_STATUS_PENDING, LLM_GATEWAY_TOKEN_REQUEST_STATUS_REJECTED,
+    LLM_GATEWAY_TOKEN_REQUEST_STATUS_FAILED as ACCOUNT_CONTRIBUTION_STATUS_FAILED,
+    LLM_GATEWAY_TOKEN_REQUEST_STATUS_ISSUED as ACCOUNT_CONTRIBUTION_STATUS_ISSUED,
+    LLM_GATEWAY_TOKEN_REQUEST_STATUS_PENDING as ACCOUNT_CONTRIBUTION_STATUS_PENDING,
+    LLM_GATEWAY_TOKEN_REQUEST_STATUS_REJECTED as ACCOUNT_CONTRIBUTION_STATUS_REJECTED,
 };
 
 use crate::{
@@ -336,7 +338,7 @@ pub async fn submit_public_account_contribution_request(
     let fingerprint = build_client_fingerprint(&headers);
     let rate_limit_key = build_submit_rate_limit_key(&headers, &fingerprint);
     enforce_public_submit_rate_limit(
-        state.llm_gateway_public_submit_guard.as_ref(),
+        state.gpt2api_public_submit_guard.as_ref(),
         &rate_limit_key,
         now_ms(),
         60,
@@ -346,7 +348,7 @@ pub async fn submit_public_account_contribution_request(
     let request_id = generate_task_id("gptacct");
     let ip_region = state.geoip.resolve_region(&client_ip).await;
     let record = state
-        .llm_gateway_store
+        .gpt2api_contribution_store
         .create_gpt2api_account_contribution_request(NewGpt2ApiAccountContributionRequestInput {
             request_id: request_id.clone(),
             account_name,
@@ -382,7 +384,7 @@ pub async fn submit_public_account_contribution_request(
 
     Ok(Json(SubmitGpt2ApiAccountContributionRequestResponse {
         request_id,
-        status: LLM_GATEWAY_TOKEN_REQUEST_STATUS_PENDING.to_string(),
+        status: ACCOUNT_CONTRIBUTION_STATUS_PENDING.to_string(),
     }))
 }
 
@@ -395,7 +397,7 @@ pub async fn list_admin_account_contribution_requests(
     let limit = query.limit.unwrap_or(25).clamp(1, 100);
     let offset = query.offset.unwrap_or(0);
     let total = state
-        .llm_gateway_store
+        .gpt2api_contribution_store
         .count_gpt2api_account_contribution_requests(query.status.as_deref())
         .await
         .map_err(internal_error)?;
@@ -410,7 +412,7 @@ pub async fn list_admin_account_contribution_requests(
         }));
     }
     let requests = state
-        .llm_gateway_store
+        .gpt2api_contribution_store
         .list_gpt2api_account_contribution_requests_page(query.status.as_deref(), limit, offset)
         .await
         .map_err(internal_error)?;
@@ -436,14 +438,14 @@ pub async fn approve_and_issue_account_contribution_request(
     ensure_admin_access(&state, &headers)?;
 
     let mut contribution_request = state
-        .llm_gateway_store
+        .gpt2api_contribution_store
         .get_gpt2api_account_contribution_request(&request_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| not_found("gpt2api account contribution request not found"))?;
 
     match contribution_request.status.as_str() {
-        LLM_GATEWAY_TOKEN_REQUEST_STATUS_ISSUED | LLM_GATEWAY_TOKEN_REQUEST_STATUS_REJECTED => {
+        ACCOUNT_CONTRIBUTION_STATUS_ISSUED | ACCOUNT_CONTRIBUTION_STATUS_REJECTED => {
             return Err(conflict_error("gpt2api account contribution request is finalized"));
         },
         _ => {},
@@ -508,7 +510,7 @@ pub async fn approve_and_issue_account_contribution_request(
     contribution_request.updated_at = now;
     contribution_request.processed_at = Some(now);
     let mut issued_request = contribution_request.clone();
-    issued_request.status = LLM_GATEWAY_TOKEN_REQUEST_STATUS_ISSUED.to_string();
+    issued_request.status = ACCOUNT_CONTRIBUTION_STATUS_ISSUED.to_string();
 
     match notifier
         .send_user_gpt2api_account_contribution_issued_notification(
@@ -523,7 +525,7 @@ pub async fn approve_and_issue_account_contribution_request(
         Ok(()) => {
             contribution_request = issued_request;
             state
-                .llm_gateway_store
+                .gpt2api_contribution_store
                 .upsert_gpt2api_account_contribution_request(&contribution_request)
                 .await
                 .map_err(internal_error)?;
@@ -545,18 +547,18 @@ pub async fn reject_account_contribution_request(
 ) -> HandlerResult<Json<AdminGpt2ApiAccountContributionRequestView>> {
     ensure_admin_access(&state, &headers)?;
     let mut contribution_request = state
-        .llm_gateway_store
+        .gpt2api_contribution_store
         .get_gpt2api_account_contribution_request(&request_id)
         .await
         .map_err(internal_error)?
         .ok_or_else(|| not_found("gpt2api account contribution request not found"))?;
 
-    if contribution_request.status == LLM_GATEWAY_TOKEN_REQUEST_STATUS_ISSUED {
+    if contribution_request.status == ACCOUNT_CONTRIBUTION_STATUS_ISSUED {
         return Err(conflict_error(
             "issued gpt2api account contribution request cannot be rejected",
         ));
     }
-    if contribution_request.status == LLM_GATEWAY_TOKEN_REQUEST_STATUS_REJECTED {
+    if contribution_request.status == ACCOUNT_CONTRIBUTION_STATUS_REJECTED {
         return Err(conflict_error("gpt2api account contribution request is already rejected"));
     }
 
@@ -570,13 +572,13 @@ pub async fn reject_account_contribution_request(
     }
 
     let now = now_ms();
-    contribution_request.status = LLM_GATEWAY_TOKEN_REQUEST_STATUS_REJECTED.to_string();
+    contribution_request.status = ACCOUNT_CONTRIBUTION_STATUS_REJECTED.to_string();
     contribution_request.admin_note = request.admin_note.clone();
     contribution_request.failure_reason = None;
     contribution_request.updated_at = now;
     contribution_request.processed_at = Some(now);
     state
-        .llm_gateway_store
+        .gpt2api_contribution_store
         .upsert_gpt2api_account_contribution_request(&contribution_request)
         .await
         .map_err(internal_error)?;
@@ -1551,12 +1553,12 @@ async fn mark_gpt2api_contribution_failed(
     request: &mut Gpt2ApiAccountContributionRequestRecord,
     reason: String,
 ) -> HandlerResult<()> {
-    request.status = LLM_GATEWAY_TOKEN_REQUEST_STATUS_FAILED.to_string();
+    request.status = ACCOUNT_CONTRIBUTION_STATUS_FAILED.to_string();
     request.failure_reason = Some(reason);
     request.updated_at = now_ms();
     request.processed_at = Some(now_ms());
     state
-        .llm_gateway_store
+        .gpt2api_contribution_store
         .upsert_gpt2api_account_contribution_request(request)
         .await
         .map_err(internal_error)
