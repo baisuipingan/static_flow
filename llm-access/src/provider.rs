@@ -9125,6 +9125,7 @@ mod tests {
                     r#"{
                         "model": "gpt-5.3-codex",
                         "input": [{"type":"message","role":"user","content":[{"type":"input_text","text":"hello"}]}],
+                        "max_output_tokens": 64,
                         "stream": false
                     }"#,
                 ))
@@ -9155,6 +9156,7 @@ mod tests {
                     json!({
                         "model": "gpt-5.3-codex",
                         "previous_response_id": previous_response_id,
+                        "max_output_tokens": 64,
                         "input": [{
                             "type":"message",
                             "role":"user",
@@ -9177,6 +9179,7 @@ mod tests {
             requests[1].body.get("previous_response_id"),
             Some(&json!(previous_response_id))
         );
+        assert_eq!(requests[1].body.get("max_output_tokens"), None);
         assert_eq!(requests[1].body.get("store"), Some(&json!(false)));
         let input = requests[1].body["input"]
             .as_array()
@@ -9217,7 +9220,8 @@ mod tests {
                 .body(Body::from(
                     r#"{
                         "model": "gpt-5.3-codex",
-                        "input": "hello compact"
+                        "input": "hello compact",
+                        "max_output_tokens": 64
                     }"#,
                 ))
                 .expect("request"),
@@ -9248,7 +9252,11 @@ mod tests {
                         "model": "gpt-5.3-codex",
                         "previous_response_id": previous_response_id,
                         "input": "next compact",
-                        "store": true
+                        "max_output_tokens": 64,
+                        "store": true,
+                        "include": ["reasoning.encrypted_content"],
+                        "client_metadata": {"source": "test"},
+                        "tool_choice": "required"
                     })
                     .to_string(),
                 ))
@@ -9266,7 +9274,11 @@ mod tests {
             Some(&json!(previous_response_id))
         );
         assert_eq!(requests[1].body["input"], json!("next compact"));
+        assert_eq!(requests[1].body.get("max_output_tokens"), None);
         assert_eq!(requests[1].body.get("store"), None);
+        assert_eq!(requests[1].body.get("include"), None);
+        assert_eq!(requests[1].body.get("client_metadata"), None);
+        assert_eq!(requests[1].body.get("tool_choice"), None);
     }
 
 

@@ -173,6 +173,7 @@ pub fn prepare_gateway_request_from_bytes(
                 thread_anchor = Some(prompt_cache_key.to_string());
             }
             inject_default_instructions_when_missing(root);
+            normalize_native_responses_request(gateway_path, root);
         }
     }
 
@@ -629,6 +630,31 @@ fn inject_default_instructions_when_missing(root: &mut Map<String, Value>) {
             Value::String(codex_default_instructions().to_string()),
         );
     }
+}
+
+fn normalize_native_responses_request(path: &str, root: &mut Map<String, Value>) {
+    root.remove("max_output_tokens");
+    if path == "/v1/responses/compact" {
+        retain_native_compact_fields(root);
+    }
+}
+
+fn retain_native_compact_fields(root: &mut Map<String, Value>) {
+    root.retain(|key, _| {
+        matches!(
+            key.as_str(),
+            "model"
+                | "instructions"
+                | "previous_response_id"
+                | "input"
+                | "tools"
+                | "parallel_tool_calls"
+                | "reasoning"
+                | "service_tier"
+                | "prompt_cache_key"
+                | "text"
+        )
+    });
 }
 
 /// Rewrite chat/completions requests onto the upstream responses endpoint.
@@ -2256,7 +2282,7 @@ mod tests {
         assert_eq!(upstream["store"], json!(true));
         assert_eq!(upstream["client_metadata"], json!({"source":"test"}));
         assert_eq!(upstream["previous_response_id"], json!("resp_123"));
-        assert_eq!(upstream["max_output_tokens"], json!(64));
+        assert!(upstream.get("max_output_tokens").is_none());
         assert_eq!(upstream["max_completion_tokens"], json!(32));
         assert_eq!(upstream["max_tokens"], json!(16));
         assert_eq!(upstream["verbosity"], json!("high"));
@@ -2964,12 +2990,12 @@ mod tests {
         assert_eq!(upstream["parallel_tool_calls"], json!(true));
         assert_eq!(upstream["reasoning"], json!({"effort":"high","summary":"auto"}));
         assert_eq!(upstream["text"], json!({"verbosity":"low"}));
-        assert_eq!(upstream["max_output_tokens"], json!(64));
+        assert!(upstream.get("max_output_tokens").is_none());
         assert_eq!(upstream["instructions"].as_str(), Some(codex_default_instructions()));
-        assert_eq!(upstream["store"], json!(true));
-        assert_eq!(upstream["include"], json!(["reasoning.encrypted_content"]));
-        assert_eq!(upstream["client_metadata"], json!({"source":"test"}));
-        assert_eq!(upstream["tool_choice"], json!("required"));
+        assert!(upstream.get("store").is_none());
+        assert!(upstream.get("include").is_none());
+        assert!(upstream.get("client_metadata").is_none());
+        assert!(upstream.get("tool_choice").is_none());
     }
 
     #[tokio::test]
