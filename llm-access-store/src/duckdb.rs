@@ -35,6 +35,9 @@ use crate::KeyUsageRollupSummary;
 #[cfg(feature = "duckdb-runtime")]
 static TIERED_SEGMENT_SEALER_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+#[cfg(feature = "duckdb-runtime")]
+const DETAILS_SQLITE_FILE_NAME: &str = "usage-event-details.sqlite3";
+
 /// One row for the DuckDB `usage_events` wide fact table.
 #[derive(Debug, Clone, PartialEq)]
 pub struct UsageEventRow {
@@ -709,6 +712,145 @@ pub struct DuckDbUsageWriter {
 }
 
 #[cfg(feature = "duckdb-runtime")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct UsageEventDetailRow {
+    event_id: String,
+    request_headers_json: String,
+    routing_diagnostics_json: Option<String>,
+    last_message_content: Option<String>,
+    client_request_body_json: Option<String>,
+    upstream_request_body_json: Option<String>,
+    full_request_json: Option<String>,
+}
+
+#[cfg(feature = "duckdb-runtime")]
+impl UsageEventDetailRow {
+    fn from_usage_event_row(row: &UsageEventRow) -> Self {
+        Self {
+            event_id: row.event_id.clone(),
+            request_headers_json: row.request_headers_json.clone(),
+            routing_diagnostics_json: row.routing_diagnostics_json.clone(),
+            last_message_content: row.last_message_content.clone(),
+            client_request_body_json: row.client_request_body_json.clone(),
+            upstream_request_body_json: row.upstream_request_body_json.clone(),
+            full_request_json: row.full_request_json.clone(),
+        }
+    }
+}
+
+#[cfg(feature = "duckdb-runtime")]
+#[derive(Debug)]
+struct UsageEventDetailStore {
+    conn: rusqlite::Connection,
+}
+
+#[cfg(feature = "duckdb-runtime")]
+impl UsageEventDetailStore {
+    fn open(path: &Path) -> anyhow::Result<Self> {
+        if let Some(parent) = path
+            .parent()
+            .filter(|parent| !parent.as_os_str().is_empty())
+        {
+            fs::create_dir_all(parent).with_context(|| {
+                format!(
+                    "failed to create usage-event-details sqlite parent directory `{}`",
+                    parent.display()
+                )
+            })?;
+        }
+        let conn = rusqlite::Connection::open(path).with_context(|| {
+            format!("failed to open usage-event-details sqlite database `{}`", path.display())
+        })?;
+        conn.pragma_update(None, "journal_mode", "WAL")
+            .context("failed to enable sqlite WAL for usage-event-details")?;
+        conn.pragma_update(None, "synchronous", "NORMAL")
+            .context("failed to set sqlite synchronous mode for usage-event-details")?;
+        conn.busy_timeout(Duration::from_secs(5))
+            .context("failed to configure usage-event-details sqlite busy timeout")?;
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS usage_event_details (
+                event_id TEXT PRIMARY KEY,
+                request_headers_json TEXT NOT NULL,
+                routing_diagnostics_json TEXT,
+                last_message_content TEXT,
+                client_request_body_json TEXT,
+                upstream_request_body_json TEXT,
+                full_request_json TEXT
+            ) STRICT, WITHOUT ROWID;",
+        )
+        .context("failed to initialize usage-event-details sqlite schema")?;
+        Ok(Self {
+            conn,
+        })
+    }
+
+    fn insert_usage_event_details(&mut self, rows: &[UsageEventDetailRow]) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut stmt = tx.prepare(
+                "INSERT INTO usage_event_details (
+                    event_id, request_headers_json, routing_diagnostics_json,
+                    last_message_content, client_request_body_json,
+                    upstream_request_body_json, full_request_json
+                ) VALUES (
+                    ?1, ?2, ?3, ?4, ?5, ?6, ?7
+                )
+                ON CONFLICT(event_id) DO NOTHING",
+            )?;
+            for row in rows {
+                stmt.execute(rusqlite::params![
+                    &row.event_id,
+                    &row.request_headers_json,
+                    row.routing_diagnostics_json.as_deref(),
+                    row.last_message_content.as_deref(),
+                    row.client_request_body_json.as_deref(),
+                    row.upstream_request_body_json.as_deref(),
+                    row.full_request_json.as_deref(),
+                ])?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
+    }
+
+    fn get_usage_event_detail(
+        &self,
+        event_id: &str,
+    ) -> anyhow::Result<Option<UsageEventDetailRow>> {
+        self.conn
+            .query_row(
+                "SELECT
+                    event_id,
+                    request_headers_json,
+                    routing_diagnostics_json,
+                    last_message_content,
+                    client_request_body_json,
+                    upstream_request_body_json,
+                    full_request_json
+                 FROM usage_event_details
+                 WHERE event_id = ?1",
+                rusqlite::params![event_id],
+                |row| {
+                    Ok(UsageEventDetailRow {
+                        event_id: row.get(0)?,
+                        request_headers_json: row.get(1)?,
+                        routing_diagnostics_json: row.get(2)?,
+                        last_message_content: row.get(3)?,
+                        client_request_body_json: row.get(4)?,
+                        upstream_request_body_json: row.get(5)?,
+                        full_request_json: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .context("query usage-event-details sqlite row")
+    }
+}
+
+#[cfg(feature = "duckdb-runtime")]
 impl DuckDbUsageWriter {
     /// Create a writer from an opened DuckDB connection.
     pub fn new(conn: duckdb::Connection) -> anyhow::Result<Self> {
@@ -721,6 +863,21 @@ impl DuckDbUsageWriter {
     /// Insert one usage event row.
     pub fn insert_usage_event(&mut self, row: &UsageEventRow) -> anyhow::Result<()> {
         self.insert_usage_events(std::slice::from_ref(row))
+    }
+
+    fn insert_usage_event_summaries(&mut self, rows: &[UsageEventRow]) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let tx = self.conn.transaction()?;
+        {
+            let mut summary_stmt = tx.prepare(insert_usage_event_sql())?;
+            for row in rows {
+                execute_usage_event_insert(&mut summary_stmt, row)?;
+            }
+        }
+        tx.commit()?;
+        Ok(())
     }
 
     /// Insert a batch of usage event rows in one transaction.
@@ -744,8 +901,45 @@ impl DuckDbUsageWriter {
 
 #[cfg(feature = "duckdb-runtime")]
 #[derive(Debug)]
+struct HybridUsageWriter {
+    summary: DuckDbUsageWriter,
+    detail: UsageEventDetailStore,
+}
+
+#[cfg(feature = "duckdb-runtime")]
+impl HybridUsageWriter {
+    fn open(
+        duckdb_path: &Path,
+        detail_path: &Path,
+        connection_config: DuckDbUsageConnectionConfig,
+    ) -> anyhow::Result<Self> {
+        let summary =
+            DuckDbUsageWriter::new(DuckDbUsageRepository::open_conn_with_connection_config(
+                duckdb_path,
+                connection_config,
+            )?)?;
+        let detail = UsageEventDetailStore::open(detail_path)?;
+        Ok(Self {
+            summary,
+            detail,
+        })
+    }
+
+    fn insert_usage_events(&mut self, rows: &[UsageEventRow]) -> anyhow::Result<()> {
+        self.summary.insert_usage_event_summaries(rows)?;
+        let detail_rows = rows
+            .iter()
+            .map(UsageEventDetailRow::from_usage_event_row)
+            .collect::<Vec<_>>();
+        self.detail.insert_usage_event_details(&detail_rows)?;
+        Ok(())
+    }
+}
+
+#[cfg(feature = "duckdb-runtime")]
+#[derive(Debug)]
 struct PersistentUsageWriter {
-    writer: DuckDbUsageWriter,
+    writer: HybridUsageWriter,
     connection_config: DuckDbUsageConnectionConfig,
 }
 
@@ -753,8 +947,10 @@ struct PersistentUsageWriter {
 impl PersistentUsageWriter {
     fn open(path: &Path, connection_config: DuckDbUsageConnectionConfig) -> anyhow::Result<Self> {
         Ok(Self {
-            writer: DuckDbUsageWriter::new(
-                DuckDbUsageRepository::open_conn_with_connection_config(path, connection_config)?,
+            writer: HybridUsageWriter::open(
+                path,
+                &details_sqlite_path_for_duckdb(path),
+                connection_config,
             )?,
             connection_config,
         })
@@ -1001,6 +1197,17 @@ struct SegmentStats {
     row_count: usize,
     event_id_count: usize,
     rollups: Vec<SegmentKeyRollup>,
+}
+
+#[cfg(feature = "duckdb-runtime")]
+#[derive(Debug, Clone)]
+struct ArchivedSegmentPaths {
+    pending_duckdb: PathBuf,
+    pending_details: PathBuf,
+    compact_duckdb: PathBuf,
+    uploading_duckdb: PathBuf,
+    archive_duckdb: PathBuf,
+    archive_details: PathBuf,
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -1503,15 +1710,18 @@ fn publish_pending_segment(
     let uploading_path = uploading_archive_segment_path(config, segment_id);
     let archive_path = archive_segment_path(config, segment_id);
     let compact_path = compacting_segment_path(config, segment_id);
+    let pending_detail_path = pending_path.with_file_name(format!("{segment_id}.details.sqlite3"));
+    let archive_detail_path = archive_path.with_file_name(format!("{segment_id}.details.sqlite3"));
+    let paths = ArchivedSegmentPaths {
+        pending_duckdb: pending_path.to_path_buf(),
+        pending_details: pending_detail_path.clone(),
+        compact_duckdb: compact_path.clone(),
+        uploading_duckdb: uploading_path.clone(),
+        archive_duckdb: archive_path.clone(),
+        archive_details: archive_detail_path.clone(),
+    };
     if archive_path.exists() {
-        return finalize_archived_segment(
-            config,
-            pending_path,
-            &compact_path,
-            &uploading_path,
-            &archive_path,
-            segment_id,
-        );
+        return finalize_archived_segment(config, &paths, segment_id);
     }
     let compact_path =
         compact_pending_segment_to_local_file(config, pending_path, segment_id, connection_config)?;
@@ -1535,6 +1745,16 @@ fn publish_pending_segment(
         .with_context(|| format!("failed to stat archived segment `{}`", archive_path.display()))?
         .len();
     publish_segment_catalog(config, segment_id, &archive_path, &stats, size_bytes)?;
+    if pending_detail_path.exists() {
+        remove_file_if_exists(&archive_detail_path)?;
+        fs::rename(&pending_detail_path, &archive_detail_path).with_context(|| {
+            format!(
+                "failed to publish usage-event-details sqlite `{}` to `{}`",
+                pending_detail_path.display(),
+                archive_detail_path.display()
+            )
+        })?;
+    }
     remove_file_if_exists(pending_path)?;
     remove_file_if_exists(&compact_path)?;
     Ok(())
@@ -1543,20 +1763,29 @@ fn publish_pending_segment(
 #[cfg(feature = "duckdb-runtime")]
 fn finalize_archived_segment(
     config: &TieredDuckDbUsageConfig,
-    pending_path: &Path,
-    compact_path: &Path,
-    uploading_path: &Path,
-    archive_path: &Path,
+    paths: &ArchivedSegmentPaths,
     segment_id: &str,
 ) -> anyhow::Result<()> {
-    let stats = collect_segment_stats(archive_path)?;
-    let size_bytes = fs::metadata(archive_path)
-        .with_context(|| format!("failed to stat archived segment `{}`", archive_path.display()))?
+    let stats = collect_segment_stats(&paths.archive_duckdb)?;
+    let size_bytes = fs::metadata(&paths.archive_duckdb)
+        .with_context(|| {
+            format!("failed to stat archived segment `{}`", paths.archive_duckdb.display())
+        })?
         .len();
-    publish_segment_catalog(config, segment_id, archive_path, &stats, size_bytes)?;
-    remove_file_if_exists(uploading_path)?;
-    remove_file_if_exists(pending_path)?;
-    remove_file_if_exists(compact_path)?;
+    publish_segment_catalog(config, segment_id, &paths.archive_duckdb, &stats, size_bytes)?;
+    remove_file_if_exists(&paths.uploading_duckdb)?;
+    remove_file_if_exists(&paths.pending_duckdb)?;
+    if paths.pending_details.exists() && !paths.archive_details.exists() {
+        fs::rename(&paths.pending_details, &paths.archive_details).with_context(|| {
+            format!(
+                "failed to finalize usage-event-details sqlite `{}` to `{}`",
+                paths.pending_details.display(),
+                paths.archive_details.display()
+            )
+        })?;
+    }
+    remove_file_if_exists(&paths.pending_details)?;
+    remove_file_if_exists(&paths.compact_duckdb)?;
     Ok(())
 }
 
@@ -1965,8 +2194,7 @@ fn append_usage_events_to_tiered(
     connection_config: &SharedDuckDbUsageConnectionConfig,
     rows: &[UsageEventRow],
 ) -> anyhow::Result<()> {
-    let connection_config_snapshot =
-        active_writer_connection_config(config, connection_config_snapshot(connection_config));
+    let connection_config_snapshot = connection_config_snapshot(connection_config);
     let mut state = state
         .lock()
         .map_err(|_| anyhow!("tiered duckdb state lock poisoned"))?;
@@ -2012,6 +2240,15 @@ fn duckdb_wal_path(path: &Path) -> PathBuf {
 }
 
 #[cfg(feature = "duckdb-runtime")]
+fn details_sqlite_path_for_duckdb(path: &Path) -> PathBuf {
+    let stem = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .unwrap_or("usage");
+    path.with_file_name(format!("{stem}.{DETAILS_SQLITE_FILE_NAME}"))
+}
+
+#[cfg(feature = "duckdb-runtime")]
 fn rollover_active_segment(
     config: &TieredDuckDbUsageConfig,
     state: &mut TieredDuckDbUsageState,
@@ -2022,6 +2259,8 @@ fn rollover_active_segment(
     let sequence = parse_segment_sequence(&state.active_path).unwrap_or(state.next_sequence);
     let segment_id = format!("usage-{}-{sequence:012}", now_ms());
     let pending_path = tiered_pending_dir(config).join(format!("{segment_id}.duckdb"));
+    let pending_detail_path =
+        tiered_pending_dir(config).join(format!("{segment_id}.details.sqlite3"));
     fs::rename(&state.active_path, &pending_path).with_context(|| {
         format!(
             "failed to move active duckdb segment `{}` to pending `{}`",
@@ -2029,6 +2268,16 @@ fn rollover_active_segment(
             pending_path.display()
         )
     })?;
+    let active_detail_path = details_sqlite_path_for_duckdb(&state.active_path);
+    if active_detail_path.exists() {
+        fs::rename(&active_detail_path, &pending_detail_path).with_context(|| {
+            format!(
+                "failed to move active usage-event-details sqlite `{}` to pending `{}`",
+                active_detail_path.display(),
+                pending_detail_path.display()
+            )
+        })?;
+    }
     let new_active_path = active_segment_path(config, state.next_sequence);
     state.next_sequence = state.next_sequence.saturating_add(1);
     initialize_duckdb_target_path(&new_active_path)?;
@@ -2092,27 +2341,6 @@ fn ensure_active_tiered_writer(
         .active_writer
         .as_mut()
         .ok_or_else(|| anyhow!("tiered active writer missing after initialization"))
-}
-
-#[cfg(feature = "duckdb-runtime")]
-const MAX_ACTIVE_WRITER_CHECKPOINT_THRESHOLD_MIB: u64 = 1_048_576;
-
-#[cfg(feature = "duckdb-runtime")]
-fn active_writer_connection_config(
-    config: &TieredDuckDbUsageConfig,
-    base: DuckDbUsageConnectionConfig,
-) -> DuckDbUsageConnectionConfig {
-    let rollover_threshold_mib = config
-        .rollover_bytes
-        .saturating_add((1024 * 1024) - 1)
-        .checked_div(1024 * 1024)
-        .unwrap_or(u64::MAX)
-        .saturating_add(1)
-        .min(MAX_ACTIVE_WRITER_CHECKPOINT_THRESHOLD_MIB);
-    DuckDbUsageConnectionConfig {
-        memory_limit_mib: base.memory_limit_mib,
-        checkpoint_threshold_mib: base.checkpoint_threshold_mib.max(rollover_threshold_mib),
-    }
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -2595,8 +2823,7 @@ fn segment_fully_inside(segment: &ArchivedUsageSegment, query: &UsageEventQuery)
 
 #[cfg(feature = "duckdb-runtime")]
 fn get_usage_event_from_path(path: &Path, event_id: &str) -> anyhow::Result<Option<UsageEvent>> {
-    let conn = DuckDbUsageRepository::open_read_only_conn(path)?;
-    get_usage_event_from_conn(&conn, event_id)
+    get_usage_event_from_active_paths(path, event_id)
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -2616,6 +2843,37 @@ fn get_usage_event_from_conn(
 }
 
 #[cfg(feature = "duckdb-runtime")]
+fn merge_usage_event_detail_payloads(event: &mut UsageEvent, detail: &UsageEventDetailRow) {
+    event.request_headers_json = detail.request_headers_json.clone();
+    event.routing_diagnostics_json = detail.routing_diagnostics_json.clone();
+    event.last_message_content = detail.last_message_content.clone();
+    event.client_request_body_json = detail.client_request_body_json.clone();
+    event.upstream_request_body_json = detail.upstream_request_body_json.clone();
+    event.full_request_json = detail.full_request_json.clone();
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn get_usage_event_from_active_paths(
+    path: &Path,
+    event_id: &str,
+) -> anyhow::Result<Option<UsageEvent>> {
+    let conn = DuckDbUsageRepository::open_read_only_conn(path)?;
+    let mut event = match get_usage_event_from_conn(&conn, event_id)? {
+        Some(event) => event,
+        None => return Ok(None),
+    };
+    let detail_path = details_sqlite_path_for_duckdb(path);
+    if detail_path.exists() {
+        if let Some(detail) =
+            UsageEventDetailStore::open(&detail_path)?.get_usage_event_detail(event_id)?
+        {
+            merge_usage_event_detail_payloads(&mut event, &detail);
+        }
+    }
+    Ok(Some(event))
+}
+
+#[cfg(feature = "duckdb-runtime")]
 fn get_usage_event_from_tiered(
     config: &TieredDuckDbUsageConfig,
     state: &Mutex<TieredDuckDbUsageState>,
@@ -2625,16 +2883,40 @@ fn get_usage_event_from_tiered(
         let state = state
             .lock()
             .map_err(|_| anyhow!("tiered duckdb state lock poisoned"))?;
-        let conn = DuckDbUsageRepository::open_read_only_conn(&state.active_path)?;
-        if let Some(event) = get_usage_event_from_conn(&conn, event_id)? {
+        if let Some(event) = get_usage_event_from_active_paths(&state.active_path, event_id)? {
             return Ok(Some(event));
         }
     }
     let Some(segment) = locate_archived_segment(config, event_id)? else {
         return Ok(None);
     };
-    let conn = DuckDbUsageRepository::open_read_only_conn(&segment.archive_path)?;
-    get_usage_event_from_conn(&conn, event_id)
+    get_usage_event_from_archived_paths(&segment.archive_path, event_id)
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn get_usage_event_from_archived_paths(
+    path: &Path,
+    event_id: &str,
+) -> anyhow::Result<Option<UsageEvent>> {
+    let conn = DuckDbUsageRepository::open_read_only_conn(path)?;
+    let mut event = match get_usage_event_from_conn(&conn, event_id)? {
+        Some(event) => event,
+        None => return Ok(None),
+    };
+    let detail_path = path.with_file_name(format!(
+        "{}.details.sqlite3",
+        path.file_stem()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or("usage")
+    ));
+    if detail_path.exists() {
+        if let Some(detail) =
+            UsageEventDetailStore::open(&detail_path)?.get_usage_event_detail(event_id)?
+        {
+            merge_usage_event_detail_payloads(&mut event, &detail);
+        }
+    }
+    Ok(Some(event))
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -3278,24 +3560,13 @@ mod tests {
 
     #[cfg(feature = "duckdb-runtime")]
     #[test]
-    fn tiered_active_writer_checkpoint_threshold_outgrows_rollover_threshold() {
-        let config = super::TieredDuckDbUsageConfig {
-            active_dir: std::path::PathBuf::from("/tmp/active"),
-            archive_dir: std::path::PathBuf::from("/tmp/archive"),
-            catalog_dir: std::path::PathBuf::from("/tmp/catalog"),
-            rollover_bytes: 16 * 1024 * 1024,
+    fn tiered_active_writer_uses_runtime_checkpoint_threshold_directly() {
+        let config = super::DuckDbUsageConnectionConfig {
+            memory_limit_mib: 1024,
+            checkpoint_threshold_mib: 8,
         };
-        let effective =
-            super::active_writer_connection_config(&config, super::DuckDbUsageConnectionConfig {
-                memory_limit_mib: 1024,
-                checkpoint_threshold_mib: 8,
-            });
-
-        assert_eq!(effective.memory_limit_mib, 1024);
-        assert!(
-            effective.checkpoint_threshold_mib > 16,
-            "active writer checkpoint threshold should exceed the active rollover size"
-        );
+        assert_eq!(config.memory_limit_mib, 1024);
+        assert_eq!(config.checkpoint_threshold_mib, 8);
     }
 
     #[cfg(feature = "duckdb-runtime")]
@@ -3428,30 +3699,31 @@ mod tests {
         assert_eq!(fact_row.4, None);
         assert_eq!(fact_row.5, None);
 
-        let detail_row = conn
-            .query_row(
-                "SELECT request_headers_json, routing_diagnostics_json, last_message_content,
-                        client_request_body_json, upstream_request_body_json, full_request_json
-                 FROM usage_event_details WHERE event_id = ?1",
-                [&event.event_id],
-                |row| {
-                    Ok((
-                        row.get::<_, Option<String>>(0)?,
-                        row.get::<_, Option<String>>(1)?,
-                        row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
-                    ))
-                },
-            )
-            .expect("read detail row");
-        assert_eq!(detail_row.0.as_deref(), Some(event.request_headers_json.as_str()));
-        assert_eq!(detail_row.1.as_deref(), event.routing_diagnostics_json.as_deref());
-        assert_eq!(detail_row.2.as_deref(), event.last_message_content.as_deref());
-        assert_eq!(detail_row.3.as_deref(), event.client_request_body_json.as_deref());
-        assert_eq!(detail_row.4.as_deref(), event.upstream_request_body_json.as_deref());
-        assert_eq!(detail_row.5.as_deref(), event.full_request_json.as_deref());
+        let detail_store =
+            super::UsageEventDetailStore::open(&super::details_sqlite_path_for_duckdb(&db_path))
+                .expect("open detail sqlite");
+        let detail_row = detail_store
+            .get_usage_event_detail(&event.event_id)
+            .expect("query detail sqlite")
+            .expect("detail row exists");
+        assert_eq!(detail_row.request_headers_json, event.request_headers_json);
+        assert_eq!(
+            detail_row.routing_diagnostics_json.as_deref(),
+            event.routing_diagnostics_json.as_deref()
+        );
+        assert_eq!(
+            detail_row.last_message_content.as_deref(),
+            event.last_message_content.as_deref()
+        );
+        assert_eq!(
+            detail_row.client_request_body_json.as_deref(),
+            event.client_request_body_json.as_deref()
+        );
+        assert_eq!(
+            detail_row.upstream_request_body_json.as_deref(),
+            event.upstream_request_body_json.as_deref()
+        );
+        assert_eq!(detail_row.full_request_json.as_deref(), event.full_request_json.as_deref());
 
         let detail = repo
             .get_usage_event(&event.event_id)

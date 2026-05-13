@@ -36,6 +36,7 @@ grep -F -- '--usage-journal-dir ${LLM_ACCESS_USAGE_JOURNAL_DIR}' "$OUT_DIR/llm-a
 grep -F 'ExecStartPre=/usr/local/bin/staticflow-wait-llm-access-state analytics' "$OUT_DIR/llm-access-usage-worker.service"
 grep -F 'Environment=STATICFLOW_LOG_SERVICE=llm-access-usage-worker' "$OUT_DIR/llm-access-usage-worker.service"
 grep -F 'Environment=LLM_ACCESS_USAGE_JOURNAL_DIR=/var/lib/staticflow/llm-access/usage-journal' "$OUT_DIR/llm-access-usage-worker.service"
+grep -F 'Environment=LLM_ACCESS_DUCKDB_ROLLOVER_BYTES=67108864' "$OUT_DIR/llm-access-usage-worker.service"
 grep -F 'MemoryHigh=2200M' "$OUT_DIR/llm-access-usage-worker.service"
 grep -F 'MemoryMax=3072M' "$OUT_DIR/llm-access-usage-worker.service"
 grep -F 'MemorySwapMax=1024M' "$OUT_DIR/llm-access-usage-worker.service"

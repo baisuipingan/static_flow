@@ -8,7 +8,7 @@ use std::{
 
 use anyhow::{anyhow, Context};
 
-const DEFAULT_TIERED_DUCKDB_ROLLOVER_BYTES: u64 = 256 * 1024 * 1024;
+const DEFAULT_TIERED_DUCKDB_ROLLOVER_BYTES: u64 = 64 * 1024 * 1024;
 
 /// Storage paths used by `llm-access`.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -329,6 +329,31 @@ mod tests {
         assert_eq!(tiered.archive_dir, PathBuf::from("/mnt/llm-access/analytics/segments"));
         assert_eq!(tiered.catalog_dir, PathBuf::from("/mnt/llm-access/analytics/catalog"));
         assert_eq!(tiered.rollover_bytes, 536_870_912);
+    }
+
+    #[test]
+    fn defaults_tiered_rollover_bytes_to_64_mib() {
+        let command = super::CliCommand::parse([
+            "llm-access",
+            "serve",
+            "--state-root",
+            "/mnt/llm-access",
+            "--sqlite-control",
+            "/mnt/llm-access/control/llm-access.sqlite3",
+            "--duckdb-active-dir",
+            "/var/lib/staticflow/llm-access/analytics-active",
+            "--duckdb-archive-dir",
+            "/mnt/llm-access/analytics/segments",
+            "--duckdb-catalog-dir",
+            "/mnt/llm-access/analytics/catalog",
+        ])
+        .expect("parse tiered serve command");
+
+        let super::CliCommand::Serve(config) = command else {
+            panic!("expected serve command");
+        };
+        let tiered = config.storage.duckdb_tiered.expect("tiered config");
+        assert_eq!(tiered.rollover_bytes, 64 * 1024 * 1024);
     }
 
     #[test]
