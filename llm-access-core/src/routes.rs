@@ -225,6 +225,18 @@ pub const ADMIN_ROUTES: &[RouteSpec] = &[
         path: "/admin/llm-gateway/accounts/:name/refresh",
     },
     RouteSpec {
+        method: "POST",
+        path: "/admin/llm-gateway/accounts/:name/refresh-auth",
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/admin/llm-gateway/accounts/:name/refresh-usage",
+    },
+    RouteSpec {
+        method: "POST",
+        path: "/admin/llm-gateway/accounts/:name/probe-models",
+    },
+    RouteSpec {
         method: "GET",
         path: "/admin/llm-access/usage-journal/status",
     },
@@ -349,6 +361,9 @@ mod tests {
         assert!(paths.contains(&"/admin/llm-gateway/accounts/import-jobs"));
         assert!(paths.contains(&"/admin/llm-gateway/accounts/import-jobs/:job_id"));
         assert!(paths.contains(&"/admin/llm-gateway/accounts/:name/refresh"));
+        assert!(paths.contains(&"/admin/llm-gateway/accounts/:name/refresh-auth"));
+        assert!(paths.contains(&"/admin/llm-gateway/accounts/:name/refresh-usage"));
+        assert!(paths.contains(&"/admin/llm-gateway/accounts/:name/probe-models"));
         assert!(paths.contains(&"/admin/llm-access/usage-journal/status"));
         assert!(paths.contains(&"/admin/kiro-gateway/keys/:key_id"));
         assert!(paths.contains(&"/admin/kiro-gateway/accounts/:name/balance"));

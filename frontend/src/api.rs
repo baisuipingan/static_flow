@@ -9283,7 +9283,107 @@ pub async fn refresh_admin_llm_gateway_account(name: &str) -> Result<AccountSumm
     #[cfg(not(feature = "mock"))]
     {
         let url = format!(
-            "{}/admin/llm-gateway/accounts/{}/refresh",
+            "{}/admin/llm-gateway/accounts/{}/refresh-usage",
+            admin_base(),
+            urlencoding::encode(name)
+        );
+        let response = api_post(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {:?}", e))?;
+        if !response.ok() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed: {text}"));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Parse error: {:?}", e))
+    }
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct AdminLlmGatewayAccountModelsProbeView {
+    pub ok: bool,
+    pub message: String,
+    pub checked_at: i64,
+}
+
+pub async fn refresh_admin_llm_gateway_account_auth(
+    name: &str,
+) -> Result<AccountSummaryView, String> {
+    #[cfg(feature = "mock")]
+    {
+        Ok(AccountSummaryView {
+            name: name.to_string(),
+            status: "active".to_string(),
+            account_id: None,
+            plan_type: Some("Pro".to_string()),
+            primary_remaining_percent: Some(100.0),
+            secondary_remaining_percent: Some(100.0),
+            map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+            proxy_mode: "inherit".to_string(),
+            proxy_config_id: None,
+            effective_proxy_source: "binding".to_string(),
+            effective_proxy_url: Some("http://127.0.0.1:11111".to_string()),
+            effective_proxy_config_name: None,
+            last_refresh: None,
+            access_token_expires_at: None,
+            auth_refresh_error_message: None,
+            last_usage_checked_at: None,
+            last_usage_success_at: None,
+            usage_error_message: None,
+        })
+    }
+
+    #[cfg(not(feature = "mock"))]
+    {
+        let url = format!(
+            "{}/admin/llm-gateway/accounts/{}/refresh-auth",
+            admin_base(),
+            urlencoding::encode(name)
+        );
+        let response = api_post(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {:?}", e))?;
+        if !response.ok() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed: {text}"));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Parse error: {:?}", e))
+    }
+}
+
+pub async fn refresh_admin_llm_gateway_account_usage(
+    name: &str,
+) -> Result<AccountSummaryView, String> {
+    refresh_admin_llm_gateway_account(name).await
+}
+
+pub async fn probe_admin_llm_gateway_account_models(
+    name: &str,
+) -> Result<AdminLlmGatewayAccountModelsProbeView, String> {
+    #[cfg(feature = "mock")]
+    {
+        Ok(AdminLlmGatewayAccountModelsProbeView {
+            ok: true,
+            message: "Codex models probe succeeded".to_string(),
+            checked_at: 0,
+        })
+    }
+
+    #[cfg(not(feature = "mock"))]
+    {
+        let url = format!(
+            "{}/admin/llm-gateway/accounts/{}/probe-models",
             admin_base(),
             urlencoding::encode(name)
         );

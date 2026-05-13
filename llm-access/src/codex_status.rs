@@ -187,6 +187,63 @@ pub(crate) async fn refresh_single_codex_account_status(
     .await
 }
 
+pub(crate) async fn refresh_single_codex_account_usage_only(
+    config_store: &Arc<dyn AdminConfigStore>,
+    account_store: &Arc<dyn AdminCodexAccountStore>,
+    route_store: &Arc<dyn ProviderRouteStore>,
+    status_store: &Arc<dyn PublicStatusStore>,
+    account_name: &str,
+) -> anyhow::Result<CodexPublicAccountStatus> {
+    let config = config_store
+        .get_admin_runtime_config()
+        .await
+        .context("load Codex status refresh config")?;
+    let accounts = account_store
+        .list_admin_codex_accounts()
+        .await
+        .context("list Codex accounts for status refresh")?;
+    let account = accounts
+        .iter()
+        .find(|account| account.name == account_name)
+        .ok_or_else(|| anyhow::anyhow!("Codex account `{account_name}` not found"))?;
+    let source_url = compute_usage_url(&provider::codex_upstream_base_url());
+    let refreshed = refresh_account_status_with_current_access_token_only(
+        account,
+        account_store.as_ref(),
+        route_store.as_ref(),
+        &config,
+    )
+    .await;
+    let snapshot = merge_account_status_refresh(
+        &accounts,
+        status_store.codex_rate_limit_status().await.ok(),
+        account_name,
+        refreshed.clone(),
+        &source_url,
+        config.codex_status_refresh_max_interval_seconds,
+    );
+    status_store
+        .save_codex_rate_limit_status(snapshot)
+        .await
+        .context("persist manual Codex usage-only public status refresh")?;
+    match refreshed {
+        AccountStatusRefresh::Ready {
+            account, ..
+        }
+        | AccountStatusRefresh::Skipped {
+            account,
+        } => Ok(account),
+        AccountStatusRefresh::Error {
+            account,
+        } => anyhow::bail!(
+            "{}",
+            account
+                .usage_error_message
+                .unwrap_or_else(|| "Codex usage refresh failed".to_string())
+        ),
+    }
+}
+
 pub(crate) async fn prime_single_codex_account_status(
     config_store: &Arc<dyn AdminConfigStore>,
     account_store: &Arc<dyn AdminCodexAccountStore>,
@@ -453,6 +510,48 @@ async fn refresh_account_status(
     }
 }
 
+async fn refresh_account_status_with_current_access_token_only(
+    account: &AdminCodexAccount,
+    account_store: &dyn AdminCodexAccountStore,
+    route_store: &dyn ProviderRouteStore,
+    config: &AdminRuntimeConfig,
+) -> AccountStatusRefresh {
+    let now = now_ms();
+    if account.status != KEY_STATUS_ACTIVE {
+        return AccountStatusRefresh::Skipped {
+            account: CodexPublicAccountStatus {
+                name: account.name.clone(),
+                status: account.status.clone(),
+                plan_type: account.plan_type.clone(),
+                primary_remaining_percent: account.primary_remaining_percent,
+                secondary_remaining_percent: account.secondary_remaining_percent,
+                last_usage_checked_at: Some(now),
+                last_usage_success_at: account.last_usage_success_at,
+                usage_error_message: account.usage_error_message.clone(),
+            },
+        };
+    }
+    let Some(route) = account_store
+        .resolve_admin_codex_account_route(&account.name)
+        .await
+        .ok()
+        .flatten()
+    else {
+        return AccountStatusRefresh::Error {
+            account: account_error_status(account, now, "active Codex route is not configured"),
+        };
+    };
+    match fetch_route_usage_with_current_access_token_only(&route, route_store, config).await {
+        Ok(buckets) => AccountStatusRefresh::Ready {
+            account: account_ready_status(account, now, &buckets),
+            buckets,
+        },
+        Err(err) => AccountStatusRefresh::Error {
+            account: account_error_status(account, now, &format!("{err:#}")),
+        },
+    }
+}
+
 fn merge_background_refresh_result(
     previous: AccountStatusRefresh,
     refreshed: AccountStatusRefresh,
@@ -643,6 +742,30 @@ async fn fetch_route_usage(
                 anyhow::bail!("Codex usage status returned 401 Unauthorized: {body}");
             },
         }
+    }
+}
+
+async fn fetch_route_usage_with_current_access_token_only(
+    route: &ProviderCodexRoute,
+    route_store: &dyn ProviderRouteStore,
+    config: &AdminRuntimeConfig,
+) -> anyhow::Result<Vec<CodexRateLimitBucket>> {
+    let Some(context) = codex_refresh::current_unexpired_context_for_route(route, route_store)
+        .await
+        .context("load current Codex access token context")?
+    else {
+        anyhow::bail!("Codex current access token is missing or expired");
+    };
+    match fetch_route_usage_once(route, config, &context).await? {
+        FetchRouteUsageOutcome::Ready(mut buckets) => {
+            for bucket in &mut buckets {
+                bucket.account_name = Some(route.account_name.clone());
+            }
+            Ok(buckets)
+        },
+        FetchRouteUsageOutcome::Unauthorized {
+            body,
+        } => anyhow::bail!("Codex usage status returned 401 Unauthorized: {body}"),
     }
 }
 

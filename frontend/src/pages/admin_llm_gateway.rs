@@ -31,7 +31,8 @@ use crate::{
         import_admin_legacy_kiro_proxy_configs, import_admin_llm_gateway_account,
         patch_admin_llm_gateway_account, patch_admin_llm_gateway_account_group,
         patch_admin_llm_gateway_key, patch_admin_llm_gateway_proxy_config,
-        refresh_admin_llm_gateway_account, update_admin_llm_gateway_config,
+        probe_admin_llm_gateway_account_models, refresh_admin_llm_gateway_account_auth,
+        refresh_admin_llm_gateway_account_usage, update_admin_llm_gateway_config,
         update_admin_llm_gateway_proxy_binding, AccountSummaryView, AdminAccountGroupView,
         AdminLlmGatewayAccountContributionRequestView,
         AdminLlmGatewayAccountContributionRequestsQuery, AdminLlmGatewayKeyView,
@@ -4129,22 +4130,24 @@ pub fn admin_llm_gateway_page() -> Html {
         })
     };
 
-    let on_refresh_account = {
+    let on_refresh_account_auth = {
         let account_action_inflight = account_action_inflight.clone();
         let account_proxy_inputs = account_proxy_inputs.clone();
         let accounts = accounts.clone();
+        let flash = flash.clone();
         let load_error = load_error.clone();
         Callback::from(move |account_name: String| {
             let account_action_inflight = account_action_inflight.clone();
             let account_proxy_inputs = account_proxy_inputs.clone();
             let accounts = accounts.clone();
+            let flash = flash.clone();
             let load_error = load_error.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 let mut inflight = (*account_action_inflight).clone();
                 inflight.insert(account_name.clone());
                 account_action_inflight.set(inflight);
 
-                match refresh_admin_llm_gateway_account(&account_name).await {
+                match refresh_admin_llm_gateway_account_auth(&account_name).await {
                     Ok(updated) => {
                         let mut items = (*accounts).clone();
                         if let Some(item) = items.iter_mut().find(|item| item.name == updated.name)
@@ -4158,8 +4161,98 @@ pub fn admin_llm_gateway_page() -> Html {
                             .insert(updated.name.clone(), account_proxy_select_value(&updated));
                         account_proxy_inputs.set(next_inputs);
                         load_error.set(None);
+                        flash.emit((format!("已刷新账号 `{}` 的 token", updated.name), false));
                     },
-                    Err(err) => load_error.set(Some(err)),
+                    Err(err) => {
+                        load_error.set(Some(err.clone()));
+                        flash.emit((
+                            format!("刷新账号 `{}` 的 token 失败\n{err}", account_name),
+                            true,
+                        ));
+                    },
+                }
+
+                let mut inflight = (*account_action_inflight).clone();
+                inflight.remove(&account_name);
+                account_action_inflight.set(inflight);
+            });
+        })
+    };
+
+    let on_refresh_account_usage = {
+        let account_action_inflight = account_action_inflight.clone();
+        let account_proxy_inputs = account_proxy_inputs.clone();
+        let accounts = accounts.clone();
+        let flash = flash.clone();
+        let load_error = load_error.clone();
+        Callback::from(move |account_name: String| {
+            let account_action_inflight = account_action_inflight.clone();
+            let account_proxy_inputs = account_proxy_inputs.clone();
+            let accounts = accounts.clone();
+            let flash = flash.clone();
+            let load_error = load_error.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut inflight = (*account_action_inflight).clone();
+                inflight.insert(account_name.clone());
+                account_action_inflight.set(inflight);
+
+                match refresh_admin_llm_gateway_account_usage(&account_name).await {
+                    Ok(updated) => {
+                        let mut items = (*accounts).clone();
+                        if let Some(item) = items.iter_mut().find(|item| item.name == updated.name)
+                        {
+                            *item = updated.clone();
+                        }
+                        accounts.set(items);
+
+                        let mut next_inputs = (*account_proxy_inputs).clone();
+                        next_inputs
+                            .insert(updated.name.clone(), account_proxy_select_value(&updated));
+                        account_proxy_inputs.set(next_inputs);
+                        load_error.set(None);
+                        flash.emit((format!("已刷新账号 `{}` 的 usage", updated.name), false));
+                    },
+                    Err(err) => {
+                        load_error.set(Some(err.clone()));
+                        flash.emit((
+                            format!("刷新账号 `{}` 的 usage 失败\n{err}", account_name),
+                            true,
+                        ));
+                    },
+                }
+
+                let mut inflight = (*account_action_inflight).clone();
+                inflight.remove(&account_name);
+                account_action_inflight.set(inflight);
+            });
+        })
+    };
+
+    let on_probe_account_models = {
+        let account_action_inflight = account_action_inflight.clone();
+        let flash = flash.clone();
+        let load_error = load_error.clone();
+        Callback::from(move |account_name: String| {
+            let account_action_inflight = account_action_inflight.clone();
+            let flash = flash.clone();
+            let load_error = load_error.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut inflight = (*account_action_inflight).clone();
+                inflight.insert(account_name.clone());
+                account_action_inflight.set(inflight);
+
+                match probe_admin_llm_gateway_account_models(&account_name).await {
+                    Ok(result) => {
+                        load_error.set(None);
+                        flash.emit((format!("账号 `{}` {}", account_name, result.message), false));
+                    },
+                    Err(err) => {
+                        load_error.set(Some(err.clone()));
+                        flash.emit((
+                            format!("检查账号 `{}` 的 models 失败\n{err}", account_name),
+                            true,
+                        ));
+                    },
                 }
 
                 let mut inflight = (*account_action_inflight).clone();
@@ -6744,7 +6837,9 @@ pub fn admin_llm_gateway_page() -> Html {
                                 let acc_name_for_auto_refresh_toggle = acc.name.clone();
                                 let acc_name_for_status_toggle = acc.name.clone();
                                 let acc_name_for_delete = acc.name.clone();
-                                let acc_name_for_refresh = acc.name.clone();
+                                let acc_name_for_auth_refresh = acc.name.clone();
+                                let acc_name_for_usage_refresh = acc.name.clone();
+                                let acc_name_for_models_probe = acc.name.clone();
                                 let acc_name_for_proxy_change = acc.name.clone();
                                 let acc_name_for_settings_save = acc.name.clone();
                                 let acc_name_for_request_max_change = acc.name.clone();
@@ -6813,7 +6908,9 @@ pub fn admin_llm_gateway_page() -> Html {
                                     .map(format_ms)
                                     .unwrap_or_else(|| "-".to_string());
                                 let on_delete = on_delete_account.clone();
-                                let on_refresh_account = on_refresh_account.clone();
+                                let on_probe_account_models = on_probe_account_models.clone();
+                                let on_refresh_account_auth = on_refresh_account_auth.clone();
+                                let on_refresh_account_usage = on_refresh_account_usage.clone();
                                 let on_toggle_account_status = on_toggle_account_status.clone();
                                 let on_toggle_account_spark_mapping =
                                     on_toggle_account_spark_mapping.clone();
@@ -6950,10 +7047,24 @@ pub fn admin_llm_gateway_page() -> Html {
                                                 </button>
                                                 <button
                                                     class={classes!("btn-terminal")}
-                                                    onclick={Callback::from(move |_| on_refresh_account.emit(acc_name_for_refresh.clone()))}
+                                                    onclick={Callback::from(move |_| on_refresh_account_auth.emit(acc_name_for_auth_refresh.clone()))}
                                                     disabled={account_busy}
                                                 >
-                                                    { if account_busy { "处理中..." } else { "刷新状态" } }
+                                                    { if account_busy { "处理中..." } else { "刷新 Token" } }
+                                                </button>
+                                                <button
+                                                    class={classes!("btn-terminal")}
+                                                    onclick={Callback::from(move |_| on_refresh_account_usage.emit(acc_name_for_usage_refresh.clone()))}
+                                                    disabled={account_busy}
+                                                >
+                                                    { if account_busy { "处理中..." } else { "刷新 Usage" } }
+                                                </button>
+                                                <button
+                                                    class={classes!("btn-terminal")}
+                                                    onclick={Callback::from(move |_| on_probe_account_models.emit(acc_name_for_models_probe.clone()))}
+                                                    disabled={account_busy}
+                                                >
+                                                    { if account_busy { "处理中..." } else { "测试 Models" } }
                                                 </button>
                                                 <button
                                                     class={classes!(

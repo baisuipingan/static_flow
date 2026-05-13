@@ -235,6 +235,18 @@ pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
             "/admin/llm-gateway/accounts/:name/refresh",
             post(admin::refresh_llm_gateway_account),
         )
+        .route(
+            "/admin/llm-gateway/accounts/:name/refresh-auth",
+            post(admin::refresh_llm_gateway_account_auth),
+        )
+        .route(
+            "/admin/llm-gateway/accounts/:name/refresh-usage",
+            post(admin::refresh_llm_gateway_account_usage),
+        )
+        .route(
+            "/admin/llm-gateway/accounts/:name/probe-models",
+            post(admin::probe_llm_gateway_account_models),
+        )
         .route("/admin/llm-gateway/usage", get(admin::list_llm_gateway_usage_events))
         .route("/admin/llm-gateway/usage/:event_id", get(admin::get_llm_gateway_usage_event))
         .route("/admin/llm-access/usage-journal/status", get(admin::get_usage_journal_status))
@@ -711,6 +723,53 @@ mod tests {
             axum::serve(listener, app)
                 .await
                 .expect("serve fake Codex upstream");
+        });
+        upstream_base
+    }
+
+    async fn fake_codex_usage_status_unauthorized() -> (StatusCode, Json<serde_json::Value>) {
+        (
+            StatusCode::UNAUTHORIZED,
+            Json(json!({
+                "error": "access token rejected"
+            })),
+        )
+    }
+
+    async fn spawn_fake_codex_usage_unauthorized_upstream() -> String {
+        let app = Router::new()
+            .route("/api/codex/usage", get(fake_codex_usage_status_unauthorized))
+            .route("/backend-api/wham/usage", get(fake_codex_usage_status_unauthorized));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Codex upstream");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake Codex upstream");
+        });
+        upstream_base
+    }
+
+    async fn fake_codex_models() -> Json<serde_json::Value> {
+        Json(json!({
+            "models": [{"slug": "gpt-5.5"}]
+        }))
+    }
+
+    async fn spawn_fake_codex_models_upstream() -> String {
+        let app = Router::new()
+            .route("/v1/models", get(fake_codex_models))
+            .route("/backend-api/codex/v1/models", get(fake_codex_models));
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake Codex models upstream");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake Codex models upstream");
         });
         upstream_base
     }
@@ -1538,6 +1597,155 @@ mod tests {
         assert_eq!(value["name"], "codex_short");
         assert!(value["last_usage_success_at"].is_number());
         assert!(value["usage_error_message"].is_null());
+    }
+
+    #[tokio::test]
+    async fn router_refresh_auth_requires_refresh_token() {
+        let (router, root) =
+            persistent_test_router("codex-auth-refresh-missing-refresh-token").await;
+        let repo = llm_access_store::repository::SqliteControlRepository::open_path(
+            root.join("control/llm-access.sqlite3"),
+        )
+        .expect("open sqlite control repository");
+        repo.create_admin_codex_account(NewAdminCodexAccount {
+            name: "codex_auth_only".to_string(),
+            account_id: Some("acct-auth-only".to_string()),
+            auth_json: serde_json::json!({
+                "access_token": "short-lived-access-token",
+                "account_id": "acct-auth-only"
+            })
+            .to_string(),
+            map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
+            created_at_ms: 100,
+        })
+        .await
+        .expect("create codex account");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-gateway/accounts/codex_auth_only/refresh-auth")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("refresh response");
+
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("refresh body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body.contains("no codex refresh_token available"));
+    }
+
+    #[tokio::test]
+    async fn router_refreshes_codex_usage_without_auth_refresh_fallback() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("Codex upstream env lock");
+        let upstream_base = spawn_fake_codex_usage_unauthorized_upstream().await;
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+        let (router, root) = persistent_test_router("codex-usage-refresh-no-auth-fallback").await;
+        let repo = llm_access_store::repository::SqliteControlRepository::open_path(
+            root.join("control/llm-access.sqlite3"),
+        )
+        .expect("open sqlite control repository");
+        repo.create_admin_codex_account(NewAdminCodexAccount {
+            name: "codex_usage_only".to_string(),
+            account_id: Some("acct-usage-only".to_string()),
+            auth_json: serde_json::json!({
+                "access_token": "short-lived-access-token",
+                "account_id": "acct-usage-only"
+            })
+            .to_string(),
+            map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
+            created_at_ms: 100,
+        })
+        .await
+        .expect("create codex account");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-gateway/accounts/codex_usage_only/refresh-usage")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("refresh response");
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
+
+        assert_eq!(response.status(), StatusCode::BAD_GATEWAY);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("refresh body");
+        let body = String::from_utf8(body.to_vec()).expect("utf8 body");
+        assert!(body.contains("401 Unauthorized"));
+        assert!(!body.contains("refresh_token"));
+    }
+
+    #[tokio::test]
+    async fn router_probes_codex_models_for_local_account() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("Codex upstream env lock");
+        let upstream_base = spawn_fake_codex_models_upstream().await;
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+        let (router, root) = persistent_test_router("codex-models-probe").await;
+        let repo = llm_access_store::repository::SqliteControlRepository::open_path(
+            root.join("control/llm-access.sqlite3"),
+        )
+        .expect("open sqlite control repository");
+        repo.create_admin_codex_account(NewAdminCodexAccount {
+            name: "codex_models".to_string(),
+            account_id: Some("acct-models".to_string()),
+            auth_json: serde_json::json!({
+                "access_token": "models-access-token",
+                "account_id": "acct-models"
+            })
+            .to_string(),
+            map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
+            created_at_ms: 100,
+        })
+        .await
+        .expect("create codex account");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-gateway/accounts/codex_models/probe-models")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("probe response");
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("probe body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("probe json");
+        assert_eq!(value["ok"], true);
+        assert!(value["message"]
+            .as_str()
+            .is_some_and(|message| message.contains("models")));
     }
 
     #[tokio::test]

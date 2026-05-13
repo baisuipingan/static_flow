@@ -139,6 +139,13 @@ struct AdminAccountsResponse {
 }
 
 #[derive(Debug, Serialize)]
+struct AdminCodexModelsProbeResponse {
+    ok: bool,
+    message: String,
+    checked_at: i64,
+}
+
+#[derive(Debug, Serialize)]
 struct AdminCodexImportJobsResponse {
     jobs: Vec<core_store::AdminCodexImportJobSummary>,
     generated_at: i64,
@@ -1644,6 +1651,174 @@ pub(crate) async fn refresh_llm_gateway_account(
         },
         Ok(None) => not_found("LLM gateway account not found").into_response(),
         Err(_) => internal_error("Failed to refresh llm gateway account").into_response(),
+    }
+}
+
+pub(crate) async fn refresh_llm_gateway_account_auth(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(response) = ensure_admin_access(&headers) {
+        return response.into_response();
+    }
+    let name = match normalize_account_name(&name) {
+        Ok(name) => name,
+        Err(response) => return response.into_response(),
+    };
+    let route = match state
+        .admin_codex_account_store
+        .resolve_admin_codex_account_route(&name)
+        .await
+    {
+        Ok(Some(route)) => route,
+        Ok(None) => return not_found("LLM gateway account not found").into_response(),
+        Err(_) => return internal_error("Failed to load llm gateway account").into_response(),
+    };
+    let refreshed = match codex_refresh::refresh_auth_json_for_route(&route).await {
+        Ok(refreshed) => refreshed,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse {
+                    error: format!("Failed to refresh llm gateway account auth: {err}"),
+                    code: StatusCode::BAD_GATEWAY.as_u16(),
+                }),
+            )
+                .into_response();
+        },
+    };
+    if let Err(err) = state
+        .provider_state
+        .route_store()
+        .save_codex_auth_update(refreshed)
+        .await
+    {
+        return (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse {
+                error: format!("Failed to persist llm gateway account auth refresh: {err}"),
+                code: StatusCode::BAD_GATEWAY.as_u16(),
+            }),
+        )
+            .into_response();
+    }
+    match state
+        .admin_codex_account_store
+        .get_admin_codex_account(&name)
+        .await
+    {
+        Ok(Some(account)) => Json(account).into_response(),
+        Ok(None) => not_found("LLM gateway account not found").into_response(),
+        Err(_) => internal_error("Failed to load refreshed llm gateway account").into_response(),
+    }
+}
+
+pub(crate) async fn refresh_llm_gateway_account_usage(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(response) = ensure_admin_access(&headers) {
+        return response.into_response();
+    }
+    let name = match normalize_account_name(&name) {
+        Ok(name) => name,
+        Err(response) => return response.into_response(),
+    };
+    let route_store = state.provider_state.route_store();
+    let refreshed_status = match codex_status::refresh_single_codex_account_usage_only(
+        &state.admin_config_store,
+        &state.admin_codex_account_store,
+        &route_store,
+        &state.public_status_store,
+        &name,
+    )
+    .await
+    {
+        Ok(status) => status,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse {
+                    error: format!("Failed to refresh llm gateway account usage: {err}"),
+                    code: StatusCode::BAD_GATEWAY.as_u16(),
+                }),
+            )
+                .into_response();
+        },
+    };
+    match state
+        .admin_codex_account_store
+        .get_admin_codex_account(&name)
+        .await
+    {
+        Ok(Some(mut account)) => {
+            apply_codex_public_status_to_admin_account(&mut account, refreshed_status, None);
+            Json(account).into_response()
+        },
+        Ok(None) => not_found("LLM gateway account not found").into_response(),
+        Err(_) => internal_error("Failed to refresh llm gateway account usage").into_response(),
+    }
+}
+
+pub(crate) async fn probe_llm_gateway_account_models(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(name): Path<String>,
+) -> Response {
+    if let Err(response) = ensure_admin_access(&headers) {
+        return response.into_response();
+    }
+    let name = match normalize_account_name(&name) {
+        Ok(name) => name,
+        Err(response) => return response.into_response(),
+    };
+    let route = match state
+        .admin_codex_account_store
+        .resolve_admin_codex_account_route(&name)
+        .await
+    {
+        Ok(Some(route)) => route,
+        Ok(None) => return not_found("LLM gateway account not found").into_response(),
+        Err(_) => return internal_error("Failed to load llm gateway account").into_response(),
+    };
+    let auth = match normalize_codex_auth_json(&route.auth_json) {
+        Ok(auth) => auth,
+        Err(err) => {
+            return (
+                StatusCode::BAD_GATEWAY,
+                Json(ErrorResponse {
+                    error: format!("Failed to parse llm gateway account auth: {}", err.message),
+                    code: StatusCode::BAD_GATEWAY.as_u16(),
+                }),
+            )
+                .into_response();
+        },
+    };
+    let config = match state.admin_config_store.get_admin_runtime_config().await {
+        Ok(config) => config,
+        Err(_) => return internal_error("Failed to load llm gateway config").into_response(),
+    };
+    let client_version =
+        crate::provider::resolve_codex_client_version(Some(&config.codex_client_version));
+    match validate_codex_access_token_for_import_with_client_version(&route, &auth, &client_version)
+        .await
+    {
+        Ok(()) => Json(AdminCodexModelsProbeResponse {
+            ok: true,
+            message: "Codex models probe succeeded".to_string(),
+            checked_at: now_ms(),
+        })
+        .into_response(),
+        Err(err) => (
+            StatusCode::BAD_GATEWAY,
+            Json(ErrorResponse {
+                error: format!("Failed to probe llm gateway account models: {err}"),
+                code: StatusCode::BAD_GATEWAY.as_u16(),
+            }),
+        )
+            .into_response(),
     }
 }
 
@@ -4086,6 +4261,19 @@ async fn validate_codex_access_token_for_import(
     route: &core_store::ProviderCodexRoute,
     auth: &NormalizedCodexAuth,
 ) -> anyhow::Result<()> {
+    validate_codex_access_token_for_import_with_client_version(
+        route,
+        auth,
+        core_store::DEFAULT_CODEX_CLIENT_VERSION,
+    )
+    .await
+}
+
+async fn validate_codex_access_token_for_import_with_client_version(
+    route: &core_store::ProviderCodexRoute,
+    auth: &NormalizedCodexAuth,
+    client_version: &str,
+) -> anyhow::Result<()> {
     let access_token = auth
         .access_token
         .as_deref()
@@ -4097,7 +4285,7 @@ async fn validate_codex_access_token_for_import(
             &crate::provider::codex_upstream_base_url(),
             "/v1/models",
         ),
-        core_store::DEFAULT_CODEX_CLIENT_VERSION,
+        client_version,
     );
     let client = codex_refresh::provider_client(route.proxy.as_ref())?;
     let mut request = client
