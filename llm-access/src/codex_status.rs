@@ -129,8 +129,11 @@ async fn refresh_codex_status(
     let existing = status_store.codex_rate_limit_status().await.ok();
     let mut refreshed = seed_full_refresh_statuses(&accounts, existing);
     status_store
-        .save_codex_rate_limit_status(build_status_snapshot(
-            refreshed.clone(),
+        .save_codex_rate_limit_status(build_background_refresh_snapshot(
+            &accounts,
+            &refreshed,
+            None,
+            None,
             &source_url,
             config.codex_status_refresh_max_interval_seconds,
         ))
@@ -157,9 +160,17 @@ async fn refresh_codex_status(
         )
         .await;
         refreshed[index] = merge_background_refresh_result(previous, next);
+        let latest_accounts = account_store
+            .list_admin_codex_accounts()
+            .await
+            .context("reload Codex accounts during status refresh")?;
+        let latest_snapshot = status_store.codex_rate_limit_status().await.ok();
         status_store
-            .save_codex_rate_limit_status(build_status_snapshot(
-                refreshed.clone(),
+            .save_codex_rate_limit_status(build_background_refresh_snapshot(
+                &latest_accounts,
+                &refreshed,
+                latest_snapshot,
+                Some(&account.name),
                 &source_url,
                 config.codex_status_refresh_max_interval_seconds,
             ))
@@ -664,6 +675,92 @@ fn merge_account_status_refresh(
         }
     }
     build_status_snapshot(merged, source_url, refresh_interval_seconds)
+}
+
+fn build_background_refresh_snapshot(
+    accounts: &[AdminCodexAccount],
+    refreshed: &[AccountStatusRefresh],
+    existing: Option<CodexRateLimitStatus>,
+    preserved_name: Option<&str>,
+    source_url: &str,
+    refresh_interval_seconds: u64,
+) -> CodexRateLimitStatus {
+    let refreshed_by_name = refreshed
+        .iter()
+        .cloned()
+        .map(|status| (account_status_refresh_name(&status).to_string(), status))
+        .collect::<BTreeMap<_, _>>();
+    let merged =
+        merge_background_refresh_accounts(accounts, refreshed_by_name, existing, preserved_name);
+    build_status_snapshot(merged, source_url, refresh_interval_seconds)
+}
+
+fn merge_background_refresh_accounts(
+    accounts: &[AdminCodexAccount],
+    mut refreshed_by_name: BTreeMap<String, AccountStatusRefresh>,
+    existing: Option<CodexRateLimitStatus>,
+    preserved_name: Option<&str>,
+) -> Vec<AccountStatusRefresh> {
+    let mut existing_accounts = existing
+        .as_ref()
+        .map(|status| {
+            status
+                .accounts
+                .iter()
+                .cloned()
+                .map(|account| (account.name.clone(), account))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    let mut existing_buckets = existing
+        .map(|status| {
+            status
+                .buckets
+                .into_iter()
+                .filter_map(|bucket| bucket.account_name.clone().map(|name| (name, bucket)))
+                .fold(
+                    BTreeMap::<String, Vec<CodexRateLimitBucket>>::new(),
+                    |mut grouped, (name, bucket)| {
+                        grouped.entry(name).or_default().push(bucket);
+                        grouped
+                    },
+                )
+        })
+        .unwrap_or_default();
+    accounts
+        .iter()
+        .map(|account| {
+            if preserved_name == Some(account.name.as_str()) {
+                if let Some(status) = refreshed_by_name.remove(&account.name) {
+                    return status;
+                }
+            }
+            if let Some(status) = account_status_refresh_from_cached_snapshot(
+                account,
+                &mut existing_accounts,
+                &mut existing_buckets,
+            ) {
+                return status;
+            }
+            refreshed_by_name
+                .remove(&account.name)
+                .unwrap_or_else(|| initial_account_status(account))
+        })
+        .collect()
+}
+
+fn account_status_refresh_name(refresh: &AccountStatusRefresh) -> &str {
+    match refresh {
+        AccountStatusRefresh::Ready {
+            account, ..
+        }
+        | AccountStatusRefresh::Error {
+            account,
+        }
+        | AccountStatusRefresh::Skipped {
+            account,
+        } => &account.name,
+    }
 }
 
 async fn fetch_route_usage(
@@ -1368,6 +1465,100 @@ mod tests {
             },
             _ => panic!("expected rebased ready status"),
         }
+    }
+
+    #[test]
+    fn background_snapshot_preserves_new_accounts_from_latest_snapshot() {
+        let original_accounts = vec![sample_admin_account("alpha"), sample_admin_account("beta")];
+        let current_accounts = vec![
+            sample_admin_account("alpha"),
+            sample_admin_account("beta"),
+            sample_admin_account("gamma"),
+        ];
+        let alpha_old_bucket = sample_bucket("alpha", 70.0, 80.0);
+        let alpha_new_bucket = sample_bucket("alpha", 55.0, 66.0);
+        let beta_bucket = sample_bucket("beta", 99.0, 100.0);
+        let gamma_bucket = sample_bucket("gamma", 88.0, 77.0);
+        let refreshed = vec![
+            AccountStatusRefresh::Ready {
+                account: account_ready_status(
+                    &original_accounts[0],
+                    900,
+                    std::slice::from_ref(&alpha_old_bucket),
+                ),
+                buckets: vec![alpha_old_bucket],
+            },
+            AccountStatusRefresh::Error {
+                account: account_error_status(
+                    &original_accounts[1],
+                    910,
+                    "usage refresh pending for standalone llm-access",
+                ),
+            },
+        ];
+        let latest = CodexRateLimitStatus {
+            status: "ready".to_string(),
+            refresh_interval_seconds: 300,
+            last_checked_at: Some(1200),
+            last_success_at: Some(1200),
+            source_url: "https://chatgpt.com/backend-api/wham/usage".to_string(),
+            error_message: None,
+            accounts: vec![
+                CodexPublicAccountStatus {
+                    name: "alpha".to_string(),
+                    status: KEY_STATUS_ACTIVE.to_string(),
+                    plan_type: Some("Pro".to_string()),
+                    primary_remaining_percent: Some(55.0),
+                    secondary_remaining_percent: Some(66.0),
+                    last_usage_checked_at: Some(1200),
+                    last_usage_success_at: Some(1200),
+                    usage_error_message: None,
+                },
+                CodexPublicAccountStatus {
+                    name: "beta".to_string(),
+                    status: KEY_STATUS_ACTIVE.to_string(),
+                    plan_type: Some("Plus".to_string()),
+                    primary_remaining_percent: Some(99.0),
+                    secondary_remaining_percent: Some(100.0),
+                    last_usage_checked_at: Some(1200),
+                    last_usage_success_at: Some(1200),
+                    usage_error_message: None,
+                },
+                CodexPublicAccountStatus {
+                    name: "gamma".to_string(),
+                    status: KEY_STATUS_ACTIVE.to_string(),
+                    plan_type: Some("Plus".to_string()),
+                    primary_remaining_percent: Some(88.0),
+                    secondary_remaining_percent: Some(77.0),
+                    last_usage_checked_at: Some(1200),
+                    last_usage_success_at: Some(1200),
+                    usage_error_message: None,
+                },
+            ],
+            buckets: vec![alpha_new_bucket, beta_bucket, gamma_bucket],
+        };
+
+        let snapshot = build_background_refresh_snapshot(
+            &current_accounts,
+            &refreshed,
+            Some(latest),
+            Some("alpha"),
+            "https://chatgpt.com/backend-api/wham/usage",
+            300,
+        );
+
+        assert_eq!(snapshot.accounts.len(), 3);
+        assert_eq!(snapshot.accounts[0].name, "alpha");
+        assert_eq!(snapshot.accounts[0].primary_remaining_percent, Some(70.0));
+        assert_eq!(snapshot.accounts[1].name, "beta");
+        assert_eq!(snapshot.accounts[1].primary_remaining_percent, Some(99.0));
+        assert_eq!(snapshot.accounts[2].name, "gamma");
+        assert_eq!(snapshot.accounts[2].primary_remaining_percent, Some(88.0));
+        assert_eq!(snapshot.buckets.len(), 3);
+        assert!(snapshot
+            .buckets
+            .iter()
+            .any(|bucket| bucket.account_name.as_deref() == Some("gamma")));
     }
 
     #[test]
