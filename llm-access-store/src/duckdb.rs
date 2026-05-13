@@ -18,6 +18,8 @@ use async_trait::async_trait;
 #[cfg(feature = "duckdb-runtime")]
 use bytes::Bytes;
 #[cfg(feature = "duckdb-runtime")]
+use duckdb::OptionalExt;
+#[cfg(feature = "duckdb-runtime")]
 use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 #[cfg(feature = "duckdb-runtime")]
 use llm_access_core::{
@@ -146,6 +148,8 @@ pub struct UsageEventRow {
     pub upstream_request_body_json: Option<String>,
     /// Full request JSON when captured.
     pub full_request_json: Option<String>,
+    /// Whether heavyweight request payload details were externalized.
+    pub detail_object_payload_present: bool,
 }
 
 impl UsageEventRow {
@@ -210,8 +214,24 @@ impl UsageEventRow {
             client_request_body_json: event.client_request_body_json.clone(),
             upstream_request_body_json: event.upstream_request_body_json.clone(),
             full_request_json: event.full_request_json.clone(),
+            detail_object_payload_present: has_external_detail_payloads(
+                event.client_request_body_json.as_deref(),
+                event.upstream_request_body_json.as_deref(),
+                event.full_request_json.as_deref(),
+            ),
         }
     }
+}
+
+fn has_external_detail_payloads(
+    client_request_body_json: Option<&str>,
+    upstream_request_body_json: Option<&str>,
+    full_request_json: Option<&str>,
+) -> bool {
+    [client_request_body_json, upstream_request_body_json, full_request_json]
+        .into_iter()
+        .flatten()
+        .any(|value| !value.trim().is_empty())
 }
 
 /// Return the insert statement for the DuckDB `usage_events` fact table.
@@ -228,14 +248,15 @@ pub fn insert_usage_event_sql() -> &'static str {
         final_event_type, bytes_streamed, request_body_bytes,
         quota_failover_count, input_uncached_tokens, input_cached_tokens,
         output_tokens, billable_tokens, credit_usage, usage_missing,
-        credit_usage_missing, client_ip, ip_region
+        credit_usage_missing, client_ip, ip_region, request_headers_json,
+        routing_diagnostics_json, last_message_content, detail_object_payload_present
      ) VALUES (
         ?1, ?2, ?3, ?4, to_timestamp(?4 / 1000.0),
         CAST(to_timestamp(?4 / 1000.0) AS DATE),
         date_trunc('hour', to_timestamp(?4 / 1000.0)),
         ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
         ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
-        ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42
+        ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46
      )
      ON CONFLICT DO NOTHING"
 }
@@ -364,6 +385,10 @@ fn compact_copy_usage_events_sql(columns: &HashSet<String>) -> String {
         compact_source_column_expr(columns, "credit_usage_missing", "true"),
         compact_source_column_expr(columns, "client_ip", "CAST(NULL AS VARCHAR)"),
         compact_source_column_expr(columns, "ip_region", "CAST(NULL AS VARCHAR)"),
+        compact_source_column_expr(columns, "request_headers_json", "'{}'"),
+        compact_source_column_expr(columns, "routing_diagnostics_json", "CAST(NULL AS VARCHAR)"),
+        compact_source_column_expr(columns, "last_message_content", "CAST(NULL AS VARCHAR)"),
+        compact_detail_object_payload_present_expr(columns),
     ]
     .join(",\n        ");
 
@@ -380,12 +405,33 @@ fn compact_copy_usage_events_sql(columns: &HashSet<String>) -> String {
         final_event_type, bytes_streamed, request_body_bytes,
         quota_failover_count, input_uncached_tokens, input_cached_tokens,
         output_tokens, billable_tokens, credit_usage, usage_missing,
-        credit_usage_missing, client_ip, ip_region
+        credit_usage_missing, client_ip, ip_region, request_headers_json,
+        routing_diagnostics_json, last_message_content, detail_object_payload_present
     )
     SELECT
         {select}
     FROM pending_segment.usage_events e;"
     )
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn compact_detail_object_payload_present_expr(columns: &HashSet<String>) -> String {
+    if columns.contains("detail_object_payload_present") {
+        return "COALESCE(e.detail_object_payload_present, false) AS detail_object_payload_present"
+            .to_string();
+    }
+    let mut payload_checks = Vec::new();
+    for column in ["client_request_body_json", "upstream_request_body_json", "full_request_json"] {
+        if columns.contains(column) {
+            payload_checks
+                .push(format!("length(trim(COALESCE(CAST(e.{column} AS VARCHAR), ''))) > 0"));
+        }
+    }
+    if payload_checks.is_empty() {
+        "CAST(false AS BOOLEAN) AS detail_object_payload_present".to_string()
+    } else {
+        format!("({}) AS detail_object_payload_present", payload_checks.join(" OR "))
+    }
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -665,6 +711,14 @@ impl UsageEventDetailRow {
         }
     }
 
+    fn has_object_store_payloads(&self) -> bool {
+        has_external_detail_payloads(
+            self.client_request_body_json.as_deref(),
+            self.upstream_request_body_json.as_deref(),
+            self.full_request_json.as_deref(),
+        )
+    }
+
     fn has_meaningful_payloads(&self) -> bool {
         self.request_headers_json.trim() != "{}"
             || self
@@ -675,18 +729,7 @@ impl UsageEventDetailRow {
                 .last_message_content
                 .as_deref()
                 .is_some_and(|value| !value.trim().is_empty())
-            || self
-                .client_request_body_json
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-            || self
-                .upstream_request_body_json
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
-            || self
-                .full_request_json
-                .as_deref()
-                .is_some_and(|value| !value.trim().is_empty())
+            || self.has_object_store_payloads()
     }
 }
 
@@ -982,9 +1025,14 @@ impl HotUsageWriter {
             let detail_rows = rows
                 .iter()
                 .map(UsageEventDetailRow::from_usage_event_row)
+                .filter(UsageEventDetailRow::has_object_store_payloads)
                 .collect::<Vec<_>>();
+            if detail_rows.is_empty() {
+                return Ok(());
+            }
             let row_lookup = rows
                 .iter()
+                .filter(|row| row.detail_object_payload_present)
                 .cloned()
                 .map(|row| (row.event_id.clone(), row))
                 .collect::<BTreeMap<_, _>>();
@@ -1065,6 +1113,10 @@ fn execute_usage_event_insert(
         row.credit_usage_missing,
         row.client_ip.as_deref(),
         row.ip_region.as_deref(),
+        &row.request_headers_json,
+        row.routing_diagnostics_json.as_deref(),
+        row.last_message_content.as_deref(),
+        row.detail_object_payload_present,
     ])?;
     Ok(())
 }
@@ -2359,13 +2411,20 @@ async fn publish_pending_segment_details_if_configured(
         return Ok(());
     };
     let conn = DuckDbUsageRepository::open_read_only_conn(pending_path)?;
+    let event_columns = duckdb_table_columns(&conn, "usage_events")?;
+    let legacy_fact_embeds_heavy_payloads = event_columns.contains("client_request_body_json")
+        || event_columns.contains("upstream_request_body_json")
+        || event_columns.contains("full_request_json");
     let detail_rows = collect_usage_event_detail_rows_from_conn(&conn)?;
     if detail_rows.is_empty() {
         return Ok(());
     }
     let filtered = detail_rows
         .into_iter()
-        .filter(|(_, detail)| detail.has_meaningful_payloads())
+        .filter(|(_, detail)| {
+            detail.has_object_store_payloads()
+                || (legacy_fact_embeds_heavy_payloads && detail.has_meaningful_payloads())
+        })
         .collect::<Vec<_>>();
     if filtered.is_empty() {
         return Ok(());
@@ -2967,7 +3026,7 @@ fn segment_fully_inside(segment: &ArchivedUsageSegment, query: &UsageEventQuery)
 
 #[cfg(feature = "duckdb-runtime")]
 fn get_usage_event_from_path(path: &Path, event_id: &str) -> anyhow::Result<Option<UsageEvent>> {
-    get_usage_event_from_active_paths(path, event_id)
+    Ok(get_usage_event_from_active_paths(path, event_id)?.map(|(event, _)| event))
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -2987,6 +3046,29 @@ fn get_usage_event_from_conn(
 }
 
 #[cfg(feature = "duckdb-runtime")]
+fn usage_event_has_object_store_payloads(
+    conn: &duckdb::Connection,
+    event_id: &str,
+) -> anyhow::Result<bool> {
+    let columns = duckdb_table_columns(conn, "usage_events")?;
+    if !columns.contains("detail_object_payload_present") {
+        return Ok(false);
+    }
+    let flag = conn
+        .query_row(
+            "SELECT COALESCE(detail_object_payload_present, false)
+             FROM usage_events
+             WHERE event_id = ?1",
+            duckdb::params![event_id],
+            |row| row.get::<_, bool>(0),
+        )
+        .optional()
+        .context("query duckdb usage event detail object flag")?
+        .unwrap_or(false);
+    Ok(flag)
+}
+
+#[cfg(feature = "duckdb-runtime")]
 fn merge_usage_event_detail_payloads(event: &mut UsageEvent, detail: &UsageEventDetailRow) {
     event.request_headers_json = detail.request_headers_json.clone();
     event.routing_diagnostics_json = detail.routing_diagnostics_json.clone();
@@ -3000,13 +3082,14 @@ fn merge_usage_event_detail_payloads(event: &mut UsageEvent, detail: &UsageEvent
 fn get_usage_event_from_active_paths(
     path: &Path,
     event_id: &str,
-) -> anyhow::Result<Option<UsageEvent>> {
+) -> anyhow::Result<Option<(UsageEvent, bool)>> {
     let conn = DuckDbUsageRepository::open_read_only_conn(path)?;
     let event = match get_usage_event_from_conn(&conn, event_id)? {
         Some(event) => event,
         None => return Ok(None),
     };
-    Ok(Some(event))
+    let has_object_store_payloads = usage_event_has_object_store_payloads(&conn, event_id)?;
+    Ok(Some((event, has_object_store_payloads)))
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -3021,10 +3104,14 @@ async fn get_usage_event_from_tiered(
             .map_err(|_| anyhow!("tiered duckdb state lock poisoned"))?;
         (state.detail_object_store.clone(), state.active_path.clone())
     };
-    if let Some(mut event) = get_usage_event_from_active_paths(&active_path, event_id)? {
-        if let Some(detail_store) = detail_object_store.as_ref() {
-            if let Some(detail) = detail_store.get_row_for_event(&event).await? {
-                merge_usage_event_detail_payloads(&mut event, &detail);
+    if let Some((mut event, has_object_store_payloads)) =
+        get_usage_event_from_active_paths(&active_path, event_id)?
+    {
+        if has_object_store_payloads {
+            if let Some(detail_store) = detail_object_store.as_ref() {
+                if let Some(detail) = detail_store.get_row_for_event(&event).await? {
+                    merge_usage_event_detail_payloads(&mut event, &detail);
+                }
             }
         }
         return Ok(Some(event));
@@ -3032,13 +3119,16 @@ async fn get_usage_event_from_tiered(
     let Some(segment) = locate_archived_segment(config, event_id)? else {
         return Ok(None);
     };
-    let mut event = match get_usage_event_from_archived_paths(&segment.archive_path, event_id)? {
-        Some(event) => event,
-        None => return Ok(None),
-    };
-    if let Some(detail_store) = detail_object_store.as_ref() {
-        if let Some(detail) = detail_store.get_row_for_event(&event).await? {
-            merge_usage_event_detail_payloads(&mut event, &detail);
+    let (mut event, has_object_store_payloads) =
+        match get_usage_event_from_archived_paths(&segment.archive_path, event_id)? {
+            Some(event) => event,
+            None => return Ok(None),
+        };
+    if has_object_store_payloads {
+        if let Some(detail_store) = detail_object_store.as_ref() {
+            if let Some(detail) = detail_store.get_row_for_event(&event).await? {
+                merge_usage_event_detail_payloads(&mut event, &detail);
+            }
         }
     }
     Ok(Some(event))
@@ -3048,13 +3138,14 @@ async fn get_usage_event_from_tiered(
 fn get_usage_event_from_archived_paths(
     path: &Path,
     event_id: &str,
-) -> anyhow::Result<Option<UsageEvent>> {
+) -> anyhow::Result<Option<(UsageEvent, bool)>> {
     let conn = DuckDbUsageRepository::open_read_only_conn(path)?;
     let event = match get_usage_event_from_conn(&conn, event_id)? {
         Some(event) => event,
         None => return Ok(None),
     };
-    Ok(Some(event))
+    let has_object_store_payloads = usage_event_has_object_store_payloads(&conn, event_id)?;
+    Ok(Some((event, has_object_store_payloads)))
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -3411,6 +3502,15 @@ mod tests {
     }
 
     #[cfg(feature = "duckdb-runtime")]
+    fn assert_usage_event_light_detail_round_trips(actual: &UsageEvent, expected: &UsageEvent) {
+        let mut expected_summary = expected.clone();
+        expected_summary.client_request_body_json = None;
+        expected_summary.upstream_request_body_json = None;
+        expected_summary.full_request_json = None;
+        assert_usage_event_round_trips(actual, &expected_summary);
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
     fn assert_usage_event_detail_payloads(actual: &UsageEvent, expected: &UsageEvent) {
         assert_eq!(actual.request_headers_json, expected.request_headers_json);
         assert_eq!(actual.routing_diagnostics_json, expected.routing_diagnostics_json);
@@ -3427,6 +3527,18 @@ mod tests {
             .expect("usage details directory url")
             .to_string();
         url.trim_end_matches('/').to_string()
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
+    fn details_store_object_path(root: &std::path::Path, event: &UsageEvent) -> std::path::PathBuf {
+        let ts = chrono::DateTime::from_timestamp_millis(event.created_at_ms)
+            .expect("valid usage event timestamp");
+        root.join("usage-details")
+            .join(event.provider_type.as_storage_str())
+            .join(ts.format("%Y").to_string())
+            .join(ts.format("%m").to_string())
+            .join(ts.format("%d").to_string())
+            .join(format!("{}.json.gz", event.event_id))
     }
 
     #[cfg(feature = "duckdb-runtime")]
@@ -3819,7 +3931,10 @@ mod tests {
             details_object_store_url: Some(details_store_url(&root)),
         })
         .expect("open tiered duckdb usage db");
-        let event = test_usage_event();
+        let mut event = test_usage_event();
+        event.client_request_body_json = None;
+        event.upstream_request_body_json = None;
+        event.full_request_json = None;
 
         repo.append_usage_event(&event)
             .await
@@ -3837,7 +3952,7 @@ mod tests {
         let fact_row = conn
             .query_row(
                 "SELECT request_headers_json, routing_diagnostics_json, last_message_content,
-                        client_request_body_json, upstream_request_body_json, full_request_json
+                        detail_object_payload_present
                  FROM usage_events WHERE event_id = ?1",
                 [&event.event_id],
                 |row| {
@@ -3845,27 +3960,41 @@ mod tests {
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, bool>(3)?,
                     ))
                 },
             )
             .expect("read fact row");
-        assert_eq!(fact_row.0, "{}");
-        assert_eq!(fact_row.1, None);
-        assert_eq!(fact_row.2, None);
-        assert_eq!(fact_row.3, None);
-        assert_eq!(fact_row.4, None);
-        assert_eq!(fact_row.5, None);
+        assert_eq!(fact_row.0, event.request_headers_json);
+        assert_eq!(fact_row.1, event.routing_diagnostics_json);
+        assert_eq!(fact_row.2, event.last_message_content);
+        assert!(!fact_row.3);
+        assert!(!details_store_object_path(&root, &event).exists());
 
         let detail = repo
             .get_usage_event(&event.event_id)
             .await
             .expect("get usage event detail")
             .expect("usage event exists");
-        assert_usage_event_round_trips(&detail, &event);
-        assert_usage_event_detail_payloads(&detail, &event);
+        assert_usage_event_light_detail_round_trips(&detail, &event);
+
+        let mut heavy = event.clone();
+        heavy.event_id = "duckdb-test-event-heavy".to_string();
+        heavy.client_request_body_json = Some(r#"{"client":true}"#.to_string());
+        heavy.upstream_request_body_json = Some(r#"{"upstream":true}"#.to_string());
+        heavy.full_request_json = Some(r#"{"full":true}"#.to_string());
+        repo.append_usage_event(&heavy)
+            .await
+            .expect("append heavy duckdb usage event");
+        assert!(details_store_object_path(&root, &heavy).exists());
+
+        let heavy_detail = repo
+            .get_usage_event(&heavy.event_id)
+            .await
+            .expect("get heavy usage event detail")
+            .expect("heavy usage event exists");
+        assert_usage_event_round_trips(&heavy_detail, &heavy);
+        assert_usage_event_detail_payloads(&heavy_detail, &heavy);
 
         std::fs::remove_dir_all(&root).expect("cleanup duckdb test directory");
     }
@@ -4093,6 +4222,9 @@ mod tests {
         first.event_id = "tiered-archived-first".to_string();
         first.created_at_ms = 1_700_000_000_000;
         first.last_message_content = Some("archived detail".repeat(128));
+        first.client_request_body_json = None;
+        first.upstream_request_body_json = None;
+        first.full_request_json = None;
         let mut second = test_usage_event();
         second.event_id = "tiered-active-second".to_string();
         second.created_at_ms = 1_700_000_060_000;
@@ -4145,8 +4277,8 @@ mod tests {
             .await
             .expect("get archived tiered usage event")
             .expect("archived tiered event exists");
-        assert_usage_event_round_trips(&archived_detail, &first);
-        assert_usage_event_detail_payloads(&archived_detail, &first);
+        assert_usage_event_light_detail_round_trips(&archived_detail, &first);
+        assert!(!details_store_object_path(&root, &first).exists());
 
         std::fs::remove_dir_all(&root).expect("cleanup tiered duckdb test directory");
     }
@@ -4773,7 +4905,7 @@ mod tests {
                     input_uncached_tokens, input_cached_tokens, output_tokens,
                     billable_tokens, credit_usage, usage_missing, credit_usage_missing,
                     ip_region, request_headers_json, last_message_content,
-                    client_request_body_json, upstream_request_body_json, full_request_json
+                    detail_object_payload_present
                 FROM usage_events;
                 DROP TABLE usage_events;
                 ALTER TABLE usage_events_reordered RENAME TO usage_events;
@@ -4848,7 +4980,7 @@ mod tests {
         let fact_row = archived
             .query_row(
                 "SELECT request_headers_json, routing_diagnostics_json, last_message_content,
-                        client_request_body_json, upstream_request_body_json, full_request_json
+                        detail_object_payload_present
                  FROM usage_events WHERE event_id = 'legacy-archive-event'",
                 [],
                 |row| {
@@ -4856,19 +4988,15 @@ mod tests {
                         row.get::<_, String>(0)?,
                         row.get::<_, Option<String>>(1)?,
                         row.get::<_, Option<String>>(2)?,
-                        row.get::<_, Option<String>>(3)?,
-                        row.get::<_, Option<String>>(4)?,
-                        row.get::<_, Option<String>>(5)?,
+                        row.get::<_, bool>(3)?,
                     ))
                 },
             )
             .expect("read archived fact row");
-        assert_eq!(fact_row.0, "{}");
-        assert_eq!(fact_row.1, None);
-        assert_eq!(fact_row.2, None);
-        assert_eq!(fact_row.3, None);
-        assert_eq!(fact_row.4, None);
-        assert_eq!(fact_row.5, None);
+        assert_eq!(fact_row.0, r#"{"host":["example.test"]}"#);
+        assert_eq!(fact_row.1, Some(r#"{"route":"legacy"}"#.to_string()));
+        assert_eq!(fact_row.2, Some("hello".to_string()));
+        assert!(fact_row.3);
 
         let repo = super::DuckDbUsageRepository::open_tiered(config.clone())
             .expect("open tiered duckdb usage db");

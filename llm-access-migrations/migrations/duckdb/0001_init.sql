@@ -47,9 +47,7 @@ CREATE TABLE IF NOT EXISTS usage_events (
     ip_region VARCHAR,
     request_headers_json VARCHAR NOT NULL DEFAULT '{}',
     last_message_content VARCHAR,
-    client_request_body_json VARCHAR,
-    upstream_request_body_json VARCHAR,
-    full_request_json VARCHAR
+    detail_object_payload_present BOOLEAN NOT NULL DEFAULT false
 );
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS request_method VARCHAR DEFAULT 'POST';
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS request_url VARCHAR DEFAULT '';
@@ -64,9 +62,7 @@ ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS quota_failover_count BIGINT DE
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS routing_diagnostics_json VARCHAR;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS request_headers_json VARCHAR DEFAULT '{}';
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS last_message_content VARCHAR;
-ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS client_request_body_json VARCHAR;
-ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS upstream_request_body_json VARCHAR;
-ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS full_request_json VARCHAR;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS detail_object_payload_present BOOLEAN DEFAULT false;
 
 CREATE TABLE IF NOT EXISTS usage_event_details (
     event_id VARCHAR PRIMARY KEY,
