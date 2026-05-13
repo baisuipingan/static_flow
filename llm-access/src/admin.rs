@@ -528,6 +528,8 @@ pub(crate) struct PatchLlmGatewayAccountRequest {
     #[serde(default)]
     status: Option<String>,
     #[serde(default)]
+    route_weight_tier: Option<String>,
+    #[serde(default)]
     proxy_mode: Option<String>,
     #[serde(default)]
     proxy_config_id: Option<String>,
@@ -1401,6 +1403,7 @@ pub(crate) async fn import_llm_gateway_account(
         auth_json: auth.auth_json,
         map_gpt53_codex_to_spark: false,
         auto_refresh_enabled: true,
+        route_weight_tier: None,
         created_at_ms: now_ms(),
     };
     match state
@@ -2704,6 +2707,7 @@ pub(crate) async fn approve_and_issue_llm_gateway_account_contribution_request(
             auth_json: auth.auth_json,
             map_gpt53_codex_to_spark: false,
             auto_refresh_enabled: true,
+            route_weight_tier: None,
             created_at_ms: action.updated_at_ms,
         })
     } else {
@@ -3153,6 +3157,22 @@ fn apply_runtime_config_update(
         codex_status_account_jitter_max_seconds,
         MAX_RUNTIME_STATUS_ACCOUNT_JITTER_SECONDS,
     )?;
+    let codex_weight_free = request
+        .codex_weight_free
+        .unwrap_or(current.codex_weight_free);
+    let codex_weight_plus = request
+        .codex_weight_plus
+        .unwrap_or(current.codex_weight_plus);
+    let codex_weight_pro5x = request
+        .codex_weight_pro5x
+        .unwrap_or(current.codex_weight_pro5x);
+    let codex_weight_pro20x = request
+        .codex_weight_pro20x
+        .unwrap_or(current.codex_weight_pro20x);
+    validate_max("codex_weight_free", codex_weight_free, u64::MAX)?;
+    validate_max("codex_weight_plus", codex_weight_plus, u64::MAX)?;
+    validate_max("codex_weight_pro5x", codex_weight_pro5x, u64::MAX)?;
+    validate_max("codex_weight_pro20x", codex_weight_pro20x, u64::MAX)?;
 
     let kiro_status_refresh_min_interval_seconds = request
         .kiro_status_refresh_min_interval_seconds
@@ -3364,6 +3384,10 @@ fn apply_runtime_config_update(
         codex_status_refresh_min_interval_seconds,
         codex_status_refresh_max_interval_seconds,
         codex_status_account_jitter_max_seconds,
+        codex_weight_free,
+        codex_weight_plus,
+        codex_weight_pro5x,
+        codex_weight_pro20x,
         kiro_status_refresh_min_interval_seconds,
         kiro_status_refresh_max_interval_seconds,
         kiro_status_account_jitter_max_seconds,
@@ -4157,6 +4181,7 @@ async fn run_codex_batch_import_job(
                 auth_json: auth.auth_json.clone(),
                 map_gpt53_codex_to_spark: false,
                 auto_refresh_enabled: true,
+                route_weight_tier: None,
                 created_at_ms: imported_at_ms,
             })
             .await
@@ -5016,6 +5041,11 @@ fn normalize_account_patch(
     {
         return Err(bad_request("fixed proxy_mode requires proxy_config_id"));
     }
+    let route_weight_tier = request
+        .route_weight_tier
+        .as_deref()
+        .map(normalize_codex_route_weight_tier)
+        .transpose()?;
     let request_max_concurrency = if request.request_max_concurrency_unlimited {
         Some(None)
     } else {
@@ -5034,12 +5064,23 @@ fn normalize_account_patch(
         status,
         map_gpt53_codex_to_spark: request.map_gpt53_codex_to_spark,
         auto_refresh_enabled: request.auto_refresh_enabled,
+        route_weight_tier,
         proxy_mode,
         proxy_config_id,
         request_max_concurrency,
         request_min_start_interval_ms,
         updated_at_ms: now_ms(),
     })
+}
+
+fn normalize_codex_route_weight_tier(raw: &str) -> Result<String, AdminHttpError> {
+    let Some(value) = normalize_optional_string(raw) else {
+        return Err(bad_request("route_weight_tier cannot be empty"));
+    };
+    match value.to_ascii_lowercase().as_str() {
+        "auto" | "free" | "plus" | "pro5x" | "pro20x" => Ok(value.to_ascii_lowercase()),
+        _ => Err(bad_request("route_weight_tier must be one of auto, free, plus, pro5x, pro20x")),
+    }
 }
 
 fn kiro_auth_from_manual_request(
@@ -5686,6 +5727,7 @@ mod tests {
     fn normalize_account_patch_accepts_auto_refresh_toggle() {
         let patch = normalize_account_patch(PatchLlmGatewayAccountRequest {
             status: None,
+            route_weight_tier: None,
             proxy_mode: None,
             proxy_config_id: None,
             map_gpt53_codex_to_spark: None,
@@ -5889,6 +5931,7 @@ mod tests {
             status: "active".to_string(),
             account_id: Some("acct-alpha".to_string()),
             plan_type: None,
+            route_weight_tier: "auto".to_string(),
             primary_remaining_percent: None,
             secondary_remaining_percent: None,
             map_gpt53_codex_to_spark: false,
@@ -5945,6 +5988,7 @@ mod tests {
             status: "disabled".to_string(),
             account_id: Some("acct-alpha".to_string()),
             plan_type: None,
+            route_weight_tier: "auto".to_string(),
             primary_remaining_percent: None,
             secondary_remaining_percent: None,
             map_gpt53_codex_to_spark: false,
@@ -5998,6 +6042,7 @@ mod tests {
             status: "active".to_string(),
             account_id: Some("acct-alpha".to_string()),
             plan_type: None,
+            route_weight_tier: "auto".to_string(),
             primary_remaining_percent: None,
             secondary_remaining_percent: None,
             map_gpt53_codex_to_spark: false,

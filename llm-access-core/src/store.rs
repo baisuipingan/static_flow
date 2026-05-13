@@ -26,6 +26,14 @@ pub const DEFAULT_CODEX_STATUS_REFRESH_MIN_INTERVAL_SECONDS: u64 = 240;
 pub const DEFAULT_CODEX_STATUS_REFRESH_MAX_INTERVAL_SECONDS: u64 = 300;
 /// Default maximum Codex account refresh jitter.
 pub const DEFAULT_CODEX_STATUS_ACCOUNT_JITTER_MAX_SECONDS: u64 = 10;
+/// Default weighted auto-routing multiplier for Free Codex accounts.
+pub const DEFAULT_CODEX_WEIGHT_FREE: u64 = 1;
+/// Default weighted auto-routing multiplier for Plus Codex accounts.
+pub const DEFAULT_CODEX_WEIGHT_PLUS: u64 = 10;
+/// Default weighted auto-routing multiplier for Pro 5x Codex accounts.
+pub const DEFAULT_CODEX_WEIGHT_PRO5X: u64 = 50;
+/// Default weighted auto-routing multiplier for Pro 20x Codex accounts.
+pub const DEFAULT_CODEX_WEIGHT_PRO20X: u64 = 200;
 /// Default lower bound for randomized Kiro status refresh.
 pub const DEFAULT_KIRO_STATUS_REFRESH_MIN_INTERVAL_SECONDS: u64 = 240;
 /// Default upper bound for randomized Kiro status refresh.
@@ -127,6 +135,14 @@ pub struct AdminRuntimeConfig {
     pub codex_status_refresh_max_interval_seconds: u64,
     /// Codex per-account refresh jitter.
     pub codex_status_account_jitter_max_seconds: u64,
+    /// Weight multiplier applied to Free Codex accounts during auto routing.
+    pub codex_weight_free: u64,
+    /// Weight multiplier applied to Plus Codex accounts during auto routing.
+    pub codex_weight_plus: u64,
+    /// Weight multiplier applied to Pro 5x Codex accounts during auto routing.
+    pub codex_weight_pro5x: u64,
+    /// Weight multiplier applied to Pro 20x Codex accounts during auto routing.
+    pub codex_weight_pro20x: u64,
     /// Kiro minimum status refresh interval.
     pub kiro_status_refresh_min_interval_seconds: u64,
     /// Kiro maximum status refresh interval.
@@ -198,6 +214,10 @@ impl Default for AdminRuntimeConfig {
                 DEFAULT_CODEX_STATUS_REFRESH_MAX_INTERVAL_SECONDS,
             codex_status_account_jitter_max_seconds:
                 DEFAULT_CODEX_STATUS_ACCOUNT_JITTER_MAX_SECONDS,
+            codex_weight_free: DEFAULT_CODEX_WEIGHT_FREE,
+            codex_weight_plus: DEFAULT_CODEX_WEIGHT_PLUS,
+            codex_weight_pro5x: DEFAULT_CODEX_WEIGHT_PRO5X,
+            codex_weight_pro20x: DEFAULT_CODEX_WEIGHT_PRO20X,
             kiro_status_refresh_min_interval_seconds:
                 DEFAULT_KIRO_STATUS_REFRESH_MIN_INTERVAL_SECONDS,
             kiro_status_refresh_max_interval_seconds:
@@ -257,6 +277,18 @@ pub struct UpdateAdminRuntimeConfig {
     /// Codex per-account refresh jitter.
     #[serde(default)]
     pub codex_status_account_jitter_max_seconds: Option<u64>,
+    /// Free Codex routing weight.
+    #[serde(default)]
+    pub codex_weight_free: Option<u64>,
+    /// Plus Codex routing weight.
+    #[serde(default)]
+    pub codex_weight_plus: Option<u64>,
+    /// Pro 5x Codex routing weight.
+    #[serde(default)]
+    pub codex_weight_pro5x: Option<u64>,
+    /// Pro 20x Codex routing weight.
+    #[serde(default)]
+    pub codex_weight_pro20x: Option<u64>,
     /// Kiro minimum status refresh interval.
     #[serde(default)]
     pub kiro_status_refresh_min_interval_seconds: Option<u64>,
@@ -714,6 +746,8 @@ pub struct AdminCodexAccount {
     pub account_id: Option<String>,
     /// Upstream plan type, when known.
     pub plan_type: Option<String>,
+    /// Manual routing tier override used for weighted auto routing.
+    pub route_weight_tier: String,
     /// Primary rate-limit remaining percentage, when known.
     pub primary_remaining_percent: Option<f64>,
     /// Secondary rate-limit remaining percentage, when known.
@@ -763,6 +797,8 @@ pub struct NewAdminCodexAccount {
     pub map_gpt53_codex_to_spark: bool,
     /// Whether this account may participate in automatic auth refresh.
     pub auto_refresh_enabled: bool,
+    /// Manual routing tier override used for weighted auto routing.
+    pub route_weight_tier: Option<String>,
     /// Creation timestamp.
     pub created_at_ms: i64,
 }
@@ -776,6 +812,8 @@ pub struct AdminCodexAccountPatch {
     pub map_gpt53_codex_to_spark: Option<bool>,
     /// New automatic auth refresh toggle.
     pub auto_refresh_enabled: Option<bool>,
+    /// New routing weight tier override.
+    pub route_weight_tier: Option<String>,
     /// New proxy selection mode.
     pub proxy_mode: Option<String>,
     /// New proxy config id.
@@ -2711,6 +2749,9 @@ impl AdminCodexAccountStore for EmptyAdminCodexAccountStore {
             status: KEY_STATUS_ACTIVE.to_string(),
             account_id: account.account_id,
             plan_type: None,
+            route_weight_tier: account
+                .route_weight_tier
+                .unwrap_or_else(|| "auto".to_string()),
             primary_remaining_percent: None,
             secondary_remaining_percent: None,
             map_gpt53_codex_to_spark: account.map_gpt53_codex_to_spark,

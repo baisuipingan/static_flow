@@ -2139,6 +2139,10 @@ pub fn admin_llm_gateway_page() -> Html {
     let codex_refresh_min_input = use_state(|| "240".to_string());
     let codex_refresh_max_input = use_state(|| "300".to_string());
     let codex_account_jitter_max_input = use_state(|| "10".to_string());
+    let codex_weight_free_input = use_state(|| "1".to_string());
+    let codex_weight_plus_input = use_state(|| "10".to_string());
+    let codex_weight_pro5x_input = use_state(|| "50".to_string());
+    let codex_weight_pro20x_input = use_state(|| "200".to_string());
     let kiro_refresh_min_input = use_state(|| "240".to_string());
     let kiro_refresh_max_input = use_state(|| "300".to_string());
     let kiro_account_jitter_max_input = use_state(|| "10".to_string());
@@ -2222,6 +2226,7 @@ pub fn admin_llm_gateway_page() -> Html {
     let active_import_job = use_state(|| None::<CodexAccountImportJobDetailView>);
     let account_action_inflight = use_state(HashSet::<String>::new);
     let account_proxy_inputs = use_state(BTreeMap::<String, String>::new);
+    let account_route_weight_tier_inputs = use_state(BTreeMap::<String, String>::new);
     let account_request_max_inputs = use_state(BTreeMap::<String, String>::new);
     let account_request_min_inputs = use_state(BTreeMap::<String, String>::new);
     let show_import_form = use_state(|| false);
@@ -2468,6 +2473,10 @@ pub fn admin_llm_gateway_page() -> Html {
         let codex_refresh_min_input = codex_refresh_min_input.clone();
         let codex_refresh_max_input = codex_refresh_max_input.clone();
         let codex_account_jitter_max_input = codex_account_jitter_max_input.clone();
+        let codex_weight_free_input = codex_weight_free_input.clone();
+        let codex_weight_plus_input = codex_weight_plus_input.clone();
+        let codex_weight_pro5x_input = codex_weight_pro5x_input.clone();
+        let codex_weight_pro20x_input = codex_weight_pro20x_input.clone();
         let kiro_refresh_min_input = kiro_refresh_min_input.clone();
         let kiro_refresh_max_input = kiro_refresh_max_input.clone();
         let kiro_account_jitter_max_input = kiro_account_jitter_max_input.clone();
@@ -2484,6 +2493,7 @@ pub fn admin_llm_gateway_page() -> Html {
         let accounts = accounts.clone();
         let recent_import_jobs = recent_import_jobs.clone();
         let account_proxy_inputs = account_proxy_inputs.clone();
+        let account_route_weight_tier_inputs = account_route_weight_tier_inputs.clone();
         let account_request_max_inputs = account_request_max_inputs.clone();
         let account_request_min_inputs = account_request_min_inputs.clone();
         let reload_usage = reload_usage.clone();
@@ -2502,6 +2512,10 @@ pub fn admin_llm_gateway_page() -> Html {
             let codex_refresh_min_input = codex_refresh_min_input.clone();
             let codex_refresh_max_input = codex_refresh_max_input.clone();
             let codex_account_jitter_max_input = codex_account_jitter_max_input.clone();
+            let codex_weight_free_input = codex_weight_free_input.clone();
+            let codex_weight_plus_input = codex_weight_plus_input.clone();
+            let codex_weight_pro5x_input = codex_weight_pro5x_input.clone();
+            let codex_weight_pro20x_input = codex_weight_pro20x_input.clone();
             let kiro_refresh_min_input = kiro_refresh_min_input.clone();
             let kiro_refresh_max_input = kiro_refresh_max_input.clone();
             let kiro_account_jitter_max_input = kiro_account_jitter_max_input.clone();
@@ -2518,6 +2532,7 @@ pub fn admin_llm_gateway_page() -> Html {
             let accounts = accounts.clone();
             let recent_import_jobs = recent_import_jobs.clone();
             let account_proxy_inputs = account_proxy_inputs.clone();
+            let account_route_weight_tier_inputs = account_route_weight_tier_inputs.clone();
             let account_request_max_inputs = account_request_max_inputs.clone();
             let account_request_min_inputs = account_request_min_inputs.clone();
             let reload_usage = reload_usage.clone();
@@ -2598,6 +2613,10 @@ pub fn admin_llm_gateway_page() -> Html {
                             .set(cfg.codex_status_refresh_max_interval_seconds.to_string());
                         codex_account_jitter_max_input
                             .set(cfg.codex_status_account_jitter_max_seconds.to_string());
+                        codex_weight_free_input.set(cfg.codex_weight_free.to_string());
+                        codex_weight_plus_input.set(cfg.codex_weight_plus.to_string());
+                        codex_weight_pro5x_input.set(cfg.codex_weight_pro5x.to_string());
+                        codex_weight_pro20x_input.set(cfg.codex_weight_pro20x.to_string());
                         kiro_refresh_min_input
                             .set(cfg.kiro_status_refresh_min_interval_seconds.to_string());
                         kiro_refresh_max_input
@@ -2639,6 +2658,20 @@ pub fn admin_llm_gateway_page() -> Html {
                                 (account.name.clone(), account_proxy_select_value(account))
                             })
                             .collect::<BTreeMap<_, _>>();
+                        let next_route_weight_tier_inputs = accounts_resp
+                            .accounts
+                            .iter()
+                            .map(|account| {
+                                (
+                                    account.name.clone(),
+                                    if account.route_weight_tier.trim().is_empty() {
+                                        "auto".to_string()
+                                    } else {
+                                        account.route_weight_tier.clone()
+                                    },
+                                )
+                            })
+                            .collect::<BTreeMap<_, _>>();
                         let next_request_max_inputs = accounts_resp
                             .accounts
                             .iter()
@@ -2668,6 +2701,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         accounts.set(accounts_resp.accounts);
                         recent_import_jobs.set(import_jobs);
                         account_proxy_inputs.set(next_proxy_inputs);
+                        account_route_weight_tier_inputs.set(next_route_weight_tier_inputs);
                         account_request_max_inputs.set(next_request_max_inputs);
                         account_request_min_inputs.set(next_request_min_inputs);
                         load_error.set(None);
@@ -2764,6 +2798,10 @@ pub fn admin_llm_gateway_page() -> Html {
         let codex_refresh_min_input = codex_refresh_min_input.clone();
         let codex_refresh_max_input = codex_refresh_max_input.clone();
         let codex_account_jitter_max_input = codex_account_jitter_max_input.clone();
+        let codex_weight_free_input = codex_weight_free_input.clone();
+        let codex_weight_plus_input = codex_weight_plus_input.clone();
+        let codex_weight_pro5x_input = codex_weight_pro5x_input.clone();
+        let codex_weight_pro20x_input = codex_weight_pro20x_input.clone();
         let kiro_refresh_min_input = kiro_refresh_min_input.clone();
         let kiro_refresh_max_input = kiro_refresh_max_input.clone();
         let kiro_account_jitter_max_input = kiro_account_jitter_max_input.clone();
@@ -2789,6 +2827,10 @@ pub fn admin_llm_gateway_page() -> Html {
                 (*codex_refresh_max_input).trim().parse::<u64>();
             let codex_status_account_jitter_max_seconds =
                 (*codex_account_jitter_max_input).trim().parse::<u64>();
+            let codex_weight_free = (*codex_weight_free_input).trim().parse::<u64>();
+            let codex_weight_plus = (*codex_weight_plus_input).trim().parse::<u64>();
+            let codex_weight_pro5x = (*codex_weight_pro5x_input).trim().parse::<u64>();
+            let codex_weight_pro20x = (*codex_weight_pro20x_input).trim().parse::<u64>();
             let kiro_status_refresh_min_interval_seconds =
                 (*kiro_refresh_min_input).trim().parse::<u64>();
             let kiro_status_refresh_max_interval_seconds =
@@ -2845,6 +2887,22 @@ pub fn admin_llm_gateway_page() -> Html {
                     load_error.set(Some("Codex 单账号抖动上限必须是非负整数".to_string()));
                     return;
                 };
+                let Ok(codex_weight_free) = codex_weight_free else {
+                    load_error.set(Some("Codex free 权重必须是非负整数".to_string()));
+                    return;
+                };
+                let Ok(codex_weight_plus) = codex_weight_plus else {
+                    load_error.set(Some("Codex plus 权重必须是非负整数".to_string()));
+                    return;
+                };
+                let Ok(codex_weight_pro5x) = codex_weight_pro5x else {
+                    load_error.set(Some("Codex pro5x 权重必须是非负整数".to_string()));
+                    return;
+                };
+                let Ok(codex_weight_pro20x) = codex_weight_pro20x else {
+                    load_error.set(Some("Codex pro20x 权重必须是非负整数".to_string()));
+                    return;
+                };
                 let Ok(kiro_status_refresh_min_interval_seconds) =
                     kiro_status_refresh_min_interval_seconds
                 else {
@@ -2896,6 +2954,10 @@ pub fn admin_llm_gateway_page() -> Html {
                     codex_status_refresh_min_interval_seconds,
                     codex_status_refresh_max_interval_seconds,
                     codex_status_account_jitter_max_seconds,
+                    codex_weight_free,
+                    codex_weight_plus,
+                    codex_weight_pro5x,
+                    codex_weight_pro20x,
                     kiro_status_refresh_min_interval_seconds,
                     kiro_status_refresh_max_interval_seconds,
                     kiro_status_account_jitter_max_seconds,
@@ -3882,6 +3944,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         status: None,
                         map_gpt53_codex_to_spark: Some(enabled),
                         auto_refresh_enabled: None,
+                        route_weight_tier: None,
                         proxy_mode: None,
                         proxy_config_id: None,
                         request_max_concurrency: None,
@@ -3930,6 +3993,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         status: None,
                         map_gpt53_codex_to_spark: None,
                         auto_refresh_enabled: Some(enabled),
+                        route_weight_tier: None,
                         proxy_mode: None,
                         proxy_config_id: None,
                         request_max_concurrency: None,
@@ -3978,6 +4042,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         status: Some(status),
                         map_gpt53_codex_to_spark: None,
                         auto_refresh_enabled: None,
+                        route_weight_tier: None,
                         proxy_mode: None,
                         proxy_config_id: None,
                         request_max_concurrency: None,
@@ -4010,6 +4075,7 @@ pub fn admin_llm_gateway_page() -> Html {
     let on_save_account_settings = {
         let account_action_inflight = account_action_inflight.clone();
         let account_proxy_inputs = account_proxy_inputs.clone();
+        let account_route_weight_tier_inputs = account_route_weight_tier_inputs.clone();
         let account_request_max_inputs = account_request_max_inputs.clone();
         let account_request_min_inputs = account_request_min_inputs.clone();
         let accounts = accounts.clone();
@@ -4017,6 +4083,7 @@ pub fn admin_llm_gateway_page() -> Html {
         Callback::from(move |account_name: String| {
             let account_action_inflight = account_action_inflight.clone();
             let account_proxy_inputs = account_proxy_inputs.clone();
+            let account_route_weight_tier_inputs = account_route_weight_tier_inputs.clone();
             let account_request_max_inputs = account_request_max_inputs.clone();
             let account_request_min_inputs = account_request_min_inputs.clone();
             let accounts = accounts.clone();
@@ -4026,6 +4093,10 @@ pub fn admin_llm_gateway_page() -> Html {
                     .get(&account_name)
                     .cloned()
                     .unwrap_or_else(|| "inherit".to_string());
+                let route_weight_tier = (*account_route_weight_tier_inputs)
+                    .get(&account_name)
+                    .cloned()
+                    .unwrap_or_else(|| "auto".to_string());
                 let request_max_raw = (*account_request_max_inputs)
                     .get(&account_name)
                     .cloned()
@@ -4077,6 +4148,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         status: None,
                         map_gpt53_codex_to_spark: None,
                         auto_refresh_enabled: None,
+                        route_weight_tier: Some(route_weight_tier),
                         proxy_mode,
                         proxy_config_id,
                         request_max_concurrency,
@@ -4100,6 +4172,11 @@ pub fn admin_llm_gateway_page() -> Html {
                         next_inputs
                             .insert(updated.name.clone(), account_proxy_select_value(&updated));
                         account_proxy_inputs.set(next_inputs);
+                        let mut next_route_weight_tier_inputs =
+                            (*account_route_weight_tier_inputs).clone();
+                        next_route_weight_tier_inputs
+                            .insert(updated.name.clone(), updated.route_weight_tier.clone());
+                        account_route_weight_tier_inputs.set(next_route_weight_tier_inputs);
                         let mut next_request_max_inputs = (*account_request_max_inputs).clone();
                         next_request_max_inputs.insert(
                             updated.name.clone(),
@@ -5677,6 +5754,74 @@ pub fn admin_llm_gateway_page() -> Html {
                                 />
                             </label>
                             <label class={classes!("text-sm")}>
+                                <span class={classes!("text-[var(--muted)]")}>{ "codex_weight_free" }</span>
+                                <input
+                                    type="number"
+                                    min="0"
+                                    class={classes!("mt-1", "w-full", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2")}
+                                    value={(*codex_weight_free_input).clone()}
+                                    oninput={{
+                                        let codex_weight_free_input = codex_weight_free_input.clone();
+                                        Callback::from(move |event: InputEvent| {
+                                            if let Some(target) = event.target_dyn_into::<HtmlInputElement>() {
+                                                codex_weight_free_input.set(target.value());
+                                            }
+                                        })
+                                    }}
+                                />
+                            </label>
+                            <label class={classes!("text-sm")}>
+                                <span class={classes!("text-[var(--muted)]")}>{ "codex_weight_plus" }</span>
+                                <input
+                                    type="number"
+                                    min="0"
+                                    class={classes!("mt-1", "w-full", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2")}
+                                    value={(*codex_weight_plus_input).clone()}
+                                    oninput={{
+                                        let codex_weight_plus_input = codex_weight_plus_input.clone();
+                                        Callback::from(move |event: InputEvent| {
+                                            if let Some(target) = event.target_dyn_into::<HtmlInputElement>() {
+                                                codex_weight_plus_input.set(target.value());
+                                            }
+                                        })
+                                    }}
+                                />
+                            </label>
+                            <label class={classes!("text-sm")}>
+                                <span class={classes!("text-[var(--muted)]")}>{ "codex_weight_pro5x" }</span>
+                                <input
+                                    type="number"
+                                    min="0"
+                                    class={classes!("mt-1", "w-full", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2")}
+                                    value={(*codex_weight_pro5x_input).clone()}
+                                    oninput={{
+                                        let codex_weight_pro5x_input = codex_weight_pro5x_input.clone();
+                                        Callback::from(move |event: InputEvent| {
+                                            if let Some(target) = event.target_dyn_into::<HtmlInputElement>() {
+                                                codex_weight_pro5x_input.set(target.value());
+                                            }
+                                        })
+                                    }}
+                                />
+                            </label>
+                            <label class={classes!("text-sm")}>
+                                <span class={classes!("text-[var(--muted)]")}>{ "codex_weight_pro20x" }</span>
+                                <input
+                                    type="number"
+                                    min="0"
+                                    class={classes!("mt-1", "w-full", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2")}
+                                    value={(*codex_weight_pro20x_input).clone()}
+                                    oninput={{
+                                        let codex_weight_pro20x_input = codex_weight_pro20x_input.clone();
+                                        Callback::from(move |event: InputEvent| {
+                                            if let Some(target) = event.target_dyn_into::<HtmlInputElement>() {
+                                                codex_weight_pro20x_input.set(target.value());
+                                            }
+                                        })
+                                    }}
+                                />
+                            </label>
+                            <label class={classes!("text-sm")}>
                                 <span class={classes!("text-[var(--muted)]")}>{ "kiro_status_refresh_min_interval_seconds" }</span>
                                 <input
                                     type="number"
@@ -5820,6 +5965,9 @@ pub fn admin_llm_gateway_page() -> Html {
                                 </p>
                                 <p class={classes!("m-0", "mt-1")}>
                                     { "默认轮询窗口：Codex / Kiro 都是 240-300 秒；每个账号请求之间插入 0-10 秒随机抖动。" }
+                                </p>
+                                <p class={classes!("m-0", "mt-1")}>
+                                    { "Codex 自动选号会按 bottleneck remaining * weight 比较；默认倍率是 free=1, plus=10, pro5x=50, pro20x=200。" }
                                 </p>
                                 <p class={classes!("m-0", "mt-1")}>
                                     { "默认 usage flush：256 条、15 秒、8 MiB；DuckDB writer 默认 memory_limit=1024 MiB、checkpoint_threshold=16 MiB。" }
@@ -6841,6 +6989,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                 let acc_name_for_usage_refresh = acc.name.clone();
                                 let acc_name_for_models_probe = acc.name.clone();
                                 let acc_name_for_proxy_change = acc.name.clone();
+                                let acc_name_for_route_weight_tier_change = acc.name.clone();
                                 let acc_name_for_settings_save = acc.name.clone();
                                 let acc_name_for_request_max_change = acc.name.clone();
                                 let acc_name_for_request_min_change = acc.name.clone();
@@ -6860,6 +7009,16 @@ pub fn admin_llm_gateway_page() -> Html {
                                     .get(&acc_name)
                                     .cloned()
                                     .unwrap_or_else(|| account_proxy_select_value(acc));
+                                let selected_route_weight_tier = (*account_route_weight_tier_inputs)
+                                    .get(&acc_name)
+                                    .cloned()
+                                    .unwrap_or_else(|| {
+                                        if acc.route_weight_tier.trim().is_empty() {
+                                            "auto".to_string()
+                                        } else {
+                                            acc.route_weight_tier.clone()
+                                        }
+                                    });
                                 let selected_request_max_value = (*account_request_max_inputs)
                                     .get(&acc_name)
                                     .cloned()
@@ -6955,6 +7114,9 @@ pub fn admin_llm_gateway_page() -> Html {
                                                 <div class={classes!("mt-1", "text-xs", "font-mono", "text-[var(--muted)]")}>
                                                     { scheduler_line.clone() }
                                                 </div>
+                                                <div class={classes!("mt-1", "text-xs", "font-mono", "text-[var(--muted)]")}>
+                                                    { format!("route weight tier: {}", acc.route_weight_tier) }
+                                                </div>
                                                 <div class={classes!("mt-1", "text-xs", "font-mono", "text-[var(--muted)]", "flex", "gap-3", "flex-wrap")}>
                                                     <span>{ if auto_refresh_enabled { "auto refresh on" } else { "auto refresh off" } }</span>
                                                     <span>{ format!("token refresh {}", last_refresh_line) }</span>
@@ -7037,6 +7199,26 @@ pub fn admin_llm_gateway_page() -> Html {
                                                             </option>
                                                         }
                                                     }) }
+                                                </select>
+                                                <select
+                                                    class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2", "text-xs")}
+                                                    value={selected_route_weight_tier.clone()}
+                                                    onchange={{
+                                                        let account_route_weight_tier_inputs = account_route_weight_tier_inputs.clone();
+                                                        Callback::from(move |event: Event| {
+                                                            if let Some(target) = event.target_dyn_into::<HtmlSelectElement>() {
+                                                                let mut next = (*account_route_weight_tier_inputs).clone();
+                                                                next.insert(acc_name_for_route_weight_tier_change.clone(), target.value());
+                                                                account_route_weight_tier_inputs.set(next);
+                                                            }
+                                                        })
+                                                    }}
+                                                >
+                                                    <option value="auto" selected={selected_route_weight_tier == "auto"}>{ "权重 Auto" }</option>
+                                                    <option value="free" selected={selected_route_weight_tier == "free"}>{ "Free" }</option>
+                                                    <option value="plus" selected={selected_route_weight_tier == "plus"}>{ "Plus" }</option>
+                                                    <option value="pro5x" selected={selected_route_weight_tier == "pro5x"}>{ "Pro 5x" }</option>
+                                                    <option value="pro20x" selected={selected_route_weight_tier == "pro20x"}>{ "Pro 20x" }</option>
                                                 </select>
                                                 <button
                                                     class={classes!("btn-terminal")}

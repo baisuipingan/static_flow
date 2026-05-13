@@ -1195,6 +1195,7 @@ mod tests {
             status: KEY_STATUS_ACTIVE.to_string(),
             account_id: Some(format!("acct-{name}")),
             plan_type: None,
+            route_weight_tier: "auto".to_string(),
             primary_remaining_percent: None,
             secondary_remaining_percent: None,
             map_gpt53_codex_to_spark: false,

@@ -27,6 +27,22 @@ fn default_duckdb_usage_checkpoint_threshold_mib() -> u64 {
     16
 }
 
+fn default_codex_weight_free() -> u64 {
+    1
+}
+
+fn default_codex_weight_plus() -> u64 {
+    10
+}
+
+fn default_codex_weight_pro5x() -> u64 {
+    50
+}
+
+fn default_codex_weight_pro20x() -> u64 {
+    200
+}
+
 fn default_usage_journal_max_file_bytes() -> u64 {
     64 * 1024 * 1024
 }
@@ -6551,6 +6567,14 @@ pub struct LlmGatewayRuntimeConfig {
     pub codex_status_refresh_min_interval_seconds: u64,
     pub codex_status_refresh_max_interval_seconds: u64,
     pub codex_status_account_jitter_max_seconds: u64,
+    #[serde(default = "default_codex_weight_free")]
+    pub codex_weight_free: u64,
+    #[serde(default = "default_codex_weight_plus")]
+    pub codex_weight_plus: u64,
+    #[serde(default = "default_codex_weight_pro5x")]
+    pub codex_weight_pro5x: u64,
+    #[serde(default = "default_codex_weight_pro20x")]
+    pub codex_weight_pro20x: u64,
     pub kiro_status_refresh_min_interval_seconds: u64,
     pub kiro_status_refresh_max_interval_seconds: u64,
     pub kiro_status_account_jitter_max_seconds: u64,
@@ -7375,6 +7399,10 @@ pub async fn fetch_admin_llm_gateway_config() -> Result<LlmGatewayRuntimeConfig,
             codex_status_refresh_min_interval_seconds: 240,
             codex_status_refresh_max_interval_seconds: 300,
             codex_status_account_jitter_max_seconds: 10,
+            codex_weight_free: default_codex_weight_free(),
+            codex_weight_plus: default_codex_weight_plus(),
+            codex_weight_pro5x: default_codex_weight_pro5x(),
+            codex_weight_pro20x: default_codex_weight_pro20x(),
             kiro_status_refresh_min_interval_seconds: 240,
             kiro_status_refresh_max_interval_seconds: 300,
             kiro_status_account_jitter_max_seconds: 10,
@@ -8799,6 +8827,7 @@ pub struct AccountSummaryView {
     pub status: String,
     pub account_id: Option<String>,
     pub plan_type: Option<String>,
+    pub route_weight_tier: String,
     pub primary_remaining_percent: Option<f64>,
     pub secondary_remaining_percent: Option<f64>,
     pub map_gpt53_codex_to_spark: bool,
@@ -8825,6 +8854,7 @@ impl Default for AccountSummaryView {
             status: String::new(),
             account_id: None,
             plan_type: None,
+            route_weight_tier: "auto".to_string(),
             primary_remaining_percent: None,
             secondary_remaining_percent: None,
             map_gpt53_codex_to_spark: false,
@@ -9092,6 +9122,7 @@ pub async fn import_admin_llm_gateway_account(
             status: "active".to_string(),
             account_id: account_id.map(str::to_string),
             plan_type: Some("Pro".to_string()),
+            route_weight_tier: "auto".to_string(),
             primary_remaining_percent: Some(100.0),
             secondary_remaining_percent: Some(100.0),
             map_gpt53_codex_to_spark: false,
@@ -9189,6 +9220,7 @@ pub struct PatchAdminLlmGatewayAccountInput {
     pub status: Option<String>,
     pub map_gpt53_codex_to_spark: Option<bool>,
     pub auto_refresh_enabled: Option<bool>,
+    pub route_weight_tier: Option<String>,
     pub proxy_mode: Option<String>,
     pub proxy_config_id: Option<String>,
     pub request_max_concurrency: Option<u64>,
@@ -9208,6 +9240,10 @@ pub async fn patch_admin_llm_gateway_account(
             status: input.status.clone().unwrap_or_else(|| "active".to_string()),
             account_id: None,
             plan_type: Some("Pro".to_string()),
+            route_weight_tier: input
+                .route_weight_tier
+                .clone()
+                .unwrap_or_else(|| "auto".to_string()),
             primary_remaining_percent: Some(100.0),
             secondary_remaining_percent: Some(100.0),
             map_gpt53_codex_to_spark: input.map_gpt53_codex_to_spark.unwrap_or(false),
@@ -9260,6 +9296,7 @@ pub async fn refresh_admin_llm_gateway_account(name: &str) -> Result<AccountSumm
             status: "active".to_string(),
             account_id: None,
             plan_type: Some("Pro".to_string()),
+            route_weight_tier: "auto".to_string(),
             primary_remaining_percent: Some(100.0),
             secondary_remaining_percent: Some(100.0),
             map_gpt53_codex_to_spark: false,
@@ -9320,6 +9357,7 @@ pub async fn refresh_admin_llm_gateway_account_auth(
             status: "active".to_string(),
             account_id: None,
             plan_type: Some("Pro".to_string()),
+            route_weight_tier: "auto".to_string(),
             primary_remaining_percent: Some(100.0),
             secondary_remaining_percent: Some(100.0),
             map_gpt53_codex_to_spark: false,

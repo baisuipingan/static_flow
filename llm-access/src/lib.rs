@@ -1570,6 +1570,7 @@ mod tests {
             .to_string(),
             map_gpt53_codex_to_spark: false,
             auto_refresh_enabled: true,
+            route_weight_tier: None,
             created_at_ms: 100,
         })
         .await
@@ -1618,6 +1619,7 @@ mod tests {
             .to_string(),
             map_gpt53_codex_to_spark: false,
             auto_refresh_enabled: true,
+            route_weight_tier: None,
             created_at_ms: 100,
         })
         .await
@@ -1667,6 +1669,7 @@ mod tests {
             .to_string(),
             map_gpt53_codex_to_spark: false,
             auto_refresh_enabled: true,
+            route_weight_tier: None,
             created_at_ms: 100,
         })
         .await
@@ -1718,6 +1721,7 @@ mod tests {
             .to_string(),
             map_gpt53_codex_to_spark: false,
             auto_refresh_enabled: true,
+            route_weight_tier: None,
             created_at_ms: 100,
         })
         .await
@@ -2473,6 +2477,7 @@ mod tests {
             .to_string(),
             map_gpt53_codex_to_spark: false,
             auto_refresh_enabled: true,
+            route_weight_tier: None,
             created_at_ms: 100,
         })
         .await
@@ -2595,6 +2600,7 @@ mod tests {
             .to_string(),
             map_gpt53_codex_to_spark: false,
             auto_refresh_enabled: true,
+            route_weight_tier: None,
             created_at_ms: 100,
         })
         .await

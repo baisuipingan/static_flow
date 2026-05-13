@@ -1734,6 +1734,7 @@ mod tests {
                 .to_string(),
                 map_gpt53_codex_to_spark: false,
                 auto_refresh_enabled: true,
+                route_weight_tier: None,
                 created_at_ms: 100,
             })
             .await
@@ -1752,6 +1753,7 @@ mod tests {
             .patch_admin_codex_account("codex_primary", AdminCodexAccountPatch {
                 map_gpt53_codex_to_spark: Some(true),
                 auto_refresh_enabled: Some(false),
+                route_weight_tier: None,
                 proxy_mode: Some("none".to_string()),
                 request_max_concurrency: Some(Some(2)),
                 request_min_start_interval_ms: Some(Some(50)),

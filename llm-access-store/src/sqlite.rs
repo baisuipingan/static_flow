@@ -170,6 +170,14 @@ pub struct RuntimeConfigRecord {
     pub codex_status_refresh_max_interval_seconds: i64,
     /// Codex per-account refresh jitter.
     pub codex_status_account_jitter_max_seconds: i64,
+    /// Free Codex routing weight.
+    pub codex_weight_free: i64,
+    /// Plus Codex routing weight.
+    pub codex_weight_plus: i64,
+    /// Pro 5x Codex routing weight.
+    pub codex_weight_pro5x: i64,
+    /// Pro 20x Codex routing weight.
+    pub codex_weight_pro20x: i64,
     /// Kiro minimum status refresh interval.
     pub kiro_status_refresh_min_interval_seconds: i64,
     /// Kiro maximum status refresh interval.
@@ -299,6 +307,7 @@ pub struct KiroAccountRecord {
 struct CodexAccountSettings {
     map_gpt53_codex_to_spark: bool,
     auth_refresh_enabled: bool,
+    route_weight_tier: Option<String>,
     proxy_mode: String,
     proxy_config_id: Option<String>,
     request_max_concurrency: Option<u64>,
@@ -310,6 +319,7 @@ impl Default for CodexAccountSettings {
         Self {
             map_gpt53_codex_to_spark: false,
             auth_refresh_enabled: true,
+            route_weight_tier: None,
             proxy_mode: "inherit".to_string(),
             proxy_config_id: None,
             request_max_concurrency: None,
@@ -627,6 +637,7 @@ impl SqliteControlStore {
             return Ok(Vec::new());
         }
 
+        let runtime_config = self.get_runtime_config_or_default()?;
         let records = self.list_codex_accounts()?;
         let account_names = self.resolve_route_account_names(
             core_store::PROVIDER_CODEX,
@@ -655,6 +666,13 @@ impl SqliteControlStore {
             .unwrap_or_default();
         let proxy_context =
             self.load_provider_proxy_resolution_context(core_store::PROVIDER_CODEX)?;
+        let route_weight_tiers = records_by_name
+            .iter()
+            .map(|(name, record)| {
+                let settings = decode_codex_account_settings(&record.settings_json)?;
+                Ok((name.clone(), settings.route_weight_tier))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
         let mut routes = Vec::new();
         for account_name in account_names {
             let Some(record) = records_by_name.get(&account_name).cloned() else {
@@ -699,7 +717,12 @@ impl SqliteControlStore {
             });
         }
         let codex_status = self.get_codex_rate_limit_status()?;
-        sort_codex_routes_by_cached_quota(&mut routes, codex_status.as_ref());
+        sort_codex_routes_by_cached_quota(
+            &mut routes,
+            codex_status.as_ref(),
+            &runtime_config,
+            &route_weight_tiers,
+        );
         Ok(routes)
     }
 
@@ -1632,6 +1655,7 @@ impl SqliteControlStore {
         let settings = CodexAccountSettings {
             map_gpt53_codex_to_spark: account.map_gpt53_codex_to_spark,
             auth_refresh_enabled: account.auto_refresh_enabled,
+            route_weight_tier: account.route_weight_tier.clone(),
             ..CodexAccountSettings::default()
         };
         let record = CodexAccountRecord {
@@ -1671,6 +1695,9 @@ impl SqliteControlStore {
         }
         if let Some(value) = patch.auto_refresh_enabled {
             settings.auth_refresh_enabled = value;
+        }
+        if let Some(value) = patch.route_weight_tier.as_ref() {
+            settings.route_weight_tier = Some(value.clone());
         }
         if let Some(value) = patch.proxy_mode.as_ref() {
             settings.proxy_mode = value.clone();
@@ -2132,6 +2159,10 @@ impl SqliteControlStore {
             status: record.status.clone(),
             account_id: record.account_id.clone(),
             plan_type: None,
+            route_weight_tier: settings
+                .route_weight_tier
+                .clone()
+                .unwrap_or_else(|| "auto".to_string()),
             primary_remaining_percent: None,
             secondary_remaining_percent: None,
             map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
@@ -2897,6 +2928,10 @@ impl SqliteControlStore {
                     codex_status_refresh_min_interval_seconds,
                     codex_status_refresh_max_interval_seconds,
                     codex_status_account_jitter_max_seconds,
+                    codex_weight_free,
+                    codex_weight_plus,
+                    codex_weight_pro5x,
+                    codex_weight_pro20x,
                     kiro_status_refresh_min_interval_seconds,
                     kiro_status_refresh_max_interval_seconds,
                     kiro_status_account_jitter_max_seconds,
@@ -2933,7 +2968,7 @@ impl SqliteControlStore {
                     ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13,
                     ?14, ?15, ?16, ?17, ?18, ?19, ?20, ?21, ?22, ?23, ?24,
                     ?25, ?26, ?27, ?28, ?29, ?30, ?31, ?32, ?33, ?34, ?35,
-                    ?36, ?37, ?38, ?39, ?40, ?41, ?42
+                    ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46
                 )
                 ON CONFLICT(id) DO UPDATE SET
                     auth_cache_ttl_seconds = excluded.auth_cache_ttl_seconds,
@@ -2949,6 +2984,10 @@ impl SqliteControlStore {
                         excluded.codex_status_refresh_max_interval_seconds,
                     codex_status_account_jitter_max_seconds =
                         excluded.codex_status_account_jitter_max_seconds,
+                    codex_weight_free = excluded.codex_weight_free,
+                    codex_weight_plus = excluded.codex_weight_plus,
+                    codex_weight_pro5x = excluded.codex_weight_pro5x,
+                    codex_weight_pro20x = excluded.codex_weight_pro20x,
                     kiro_status_refresh_min_interval_seconds =
                         excluded.kiro_status_refresh_min_interval_seconds,
                     kiro_status_refresh_max_interval_seconds =
@@ -3011,6 +3050,10 @@ impl SqliteControlStore {
                     record.codex_status_refresh_min_interval_seconds,
                     record.codex_status_refresh_max_interval_seconds,
                     record.codex_status_account_jitter_max_seconds,
+                    record.codex_weight_free,
+                    record.codex_weight_plus,
+                    record.codex_weight_pro5x,
+                    record.codex_weight_pro20x,
                     record.kiro_status_refresh_min_interval_seconds,
                     record.kiro_status_refresh_max_interval_seconds,
                     record.kiro_status_account_jitter_max_seconds,
@@ -3060,6 +3103,10 @@ impl SqliteControlStore {
                     codex_status_refresh_min_interval_seconds,
                     codex_status_refresh_max_interval_seconds,
                     codex_status_account_jitter_max_seconds,
+                    codex_weight_free,
+                    codex_weight_plus,
+                    codex_weight_pro5x,
+                    codex_weight_pro20x,
                     kiro_status_refresh_min_interval_seconds,
                     kiro_status_refresh_max_interval_seconds,
                     kiro_status_account_jitter_max_seconds,
@@ -4664,6 +4711,8 @@ fn route_strategy_from_config(route: &KeyRouteConfig) -> anyhow::Result<RouteStr
 fn sort_codex_routes_by_cached_quota(
     routes: &mut [ProviderCodexRoute],
     status: Option<&CodexRateLimitStatus>,
+    runtime_config: &RuntimeConfigRecord,
+    route_weight_tiers: &BTreeMap<String, Option<String>>,
 ) {
     let status_by_account = status
         .map(|status| {
@@ -4675,8 +4724,22 @@ fn sort_codex_routes_by_cached_quota(
         })
         .unwrap_or_default();
     routes.sort_by(|left, right| {
-        let left_score = codex_route_quota_score(&left.account_name, &status_by_account);
-        let right_score = codex_route_quota_score(&right.account_name, &status_by_account);
+        let left_score = codex_route_quota_score(
+            &left.account_name,
+            &status_by_account,
+            runtime_config,
+            route_weight_tiers
+                .get(&left.account_name)
+                .and_then(|value| value.as_deref()),
+        );
+        let right_score = codex_route_quota_score(
+            &right.account_name,
+            &status_by_account,
+            runtime_config,
+            route_weight_tiers
+                .get(&right.account_name)
+                .and_then(|value| value.as_deref()),
+        );
         right_score
             .rank
             .cmp(&left_score.rank)
@@ -4696,6 +4759,8 @@ struct CodexRouteQuotaScore {
 fn codex_route_quota_score(
     account_name: &str,
     status_by_account: &BTreeMap<&str, &core_store::CodexPublicAccountStatus>,
+    runtime_config: &RuntimeConfigRecord,
+    route_weight_tier: Option<&str>,
 ) -> CodexRouteQuotaScore {
     let Some(status) = status_by_account.get(account_name) else {
         return CodexRouteQuotaScore {
@@ -4720,8 +4785,55 @@ fn codex_route_quota_score(
     };
     CodexRouteQuotaScore {
         rank: if remaining > 0.0 { 3 } else { 1 },
-        remaining,
+        remaining: remaining
+            * codex_route_weight_multiplier(
+                status.plan_type.as_deref(),
+                route_weight_tier,
+                runtime_config,
+            ),
         last_success_at: status.last_usage_success_at.unwrap_or(0),
+    }
+}
+
+fn codex_route_weight_multiplier(
+    plan_type: Option<&str>,
+    route_weight_tier: Option<&str>,
+    runtime_config: &RuntimeConfigRecord,
+) -> f64 {
+    match codex_effective_route_weight_tier(plan_type, route_weight_tier) {
+        "free" => runtime_config.codex_weight_free.max(0) as f64,
+        "plus" => runtime_config.codex_weight_plus.max(0) as f64,
+        "pro20x" => runtime_config.codex_weight_pro20x.max(0) as f64,
+        _ => runtime_config.codex_weight_pro5x.max(0) as f64,
+    }
+}
+
+fn codex_effective_route_weight_tier(
+    plan_type: Option<&str>,
+    route_weight_tier: Option<&str>,
+) -> &'static str {
+    match route_weight_tier
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("free") => "free",
+        Some("plus") => "plus",
+        Some("pro5x") => "pro5x",
+        Some("pro20x") => "pro20x",
+        Some("auto") | None | Some(_) => match plan_type
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("free") => "free",
+            Some("plus") => "plus",
+            Some("pro20x") => "pro20x",
+            Some("pro") | Some("pro5x") => "pro5x",
+            _ => "free",
+        },
     }
 }
 
@@ -4971,38 +5083,42 @@ fn decode_runtime_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<RuntimeCon
         codex_status_refresh_min_interval_seconds: row.get(7)?,
         codex_status_refresh_max_interval_seconds: row.get(8)?,
         codex_status_account_jitter_max_seconds: row.get(9)?,
-        kiro_status_refresh_min_interval_seconds: row.get(10)?,
-        kiro_status_refresh_max_interval_seconds: row.get(11)?,
-        kiro_status_account_jitter_max_seconds: row.get(12)?,
-        usage_event_flush_batch_size: row.get(13)?,
-        usage_event_flush_interval_seconds: row.get(14)?,
-        usage_event_flush_max_buffer_bytes: row.get(15)?,
-        duckdb_usage_memory_limit_mib: row.get(16)?,
-        duckdb_usage_checkpoint_threshold_mib: row.get(17)?,
-        usage_journal_enabled: row.get::<_, i64>(18)? != 0,
-        usage_journal_max_file_bytes: row.get(19)?,
-        usage_journal_max_file_age_ms: row.get(20)?,
-        usage_journal_max_files: row.get(21)?,
-        usage_journal_block_target_uncompressed_bytes: row.get(22)?,
-        usage_journal_block_max_events: row.get(23)?,
-        usage_journal_fsync_interval_ms: row.get(24)?,
-        usage_journal_zstd_level: row.get(25)?,
-        usage_journal_consumer_lease_ms: row.get(26)?,
-        usage_journal_delete_bad_files: row.get::<_, i64>(27)? != 0,
-        usage_query_bind_addr: row.get(28)?,
-        usage_query_base_url: row.get(29)?,
-        usage_event_maintenance_enabled: row.get::<_, i64>(30)? != 0,
-        usage_event_maintenance_interval_seconds: row.get(31)?,
-        usage_event_detail_retention_days: row.get(32)?,
-        kiro_cache_kmodels_json: row.get(33)?,
-        kiro_billable_model_multipliers_json: row.get(34)?,
-        kiro_cache_policy_json: row.get(35)?,
-        kiro_prefix_cache_mode: row.get(36)?,
-        kiro_prefix_cache_max_tokens: row.get(37)?,
-        kiro_prefix_cache_entry_ttl_seconds: row.get(38)?,
-        kiro_conversation_anchor_max_entries: row.get(39)?,
-        kiro_conversation_anchor_ttl_seconds: row.get(40)?,
-        updated_at_ms: row.get(41)?,
+        codex_weight_free: row.get(10)?,
+        codex_weight_plus: row.get(11)?,
+        codex_weight_pro5x: row.get(12)?,
+        codex_weight_pro20x: row.get(13)?,
+        kiro_status_refresh_min_interval_seconds: row.get(14)?,
+        kiro_status_refresh_max_interval_seconds: row.get(15)?,
+        kiro_status_account_jitter_max_seconds: row.get(16)?,
+        usage_event_flush_batch_size: row.get(17)?,
+        usage_event_flush_interval_seconds: row.get(18)?,
+        usage_event_flush_max_buffer_bytes: row.get(19)?,
+        duckdb_usage_memory_limit_mib: row.get(20)?,
+        duckdb_usage_checkpoint_threshold_mib: row.get(21)?,
+        usage_journal_enabled: row.get::<_, i64>(22)? != 0,
+        usage_journal_max_file_bytes: row.get(23)?,
+        usage_journal_max_file_age_ms: row.get(24)?,
+        usage_journal_max_files: row.get(25)?,
+        usage_journal_block_target_uncompressed_bytes: row.get(26)?,
+        usage_journal_block_max_events: row.get(27)?,
+        usage_journal_fsync_interval_ms: row.get(28)?,
+        usage_journal_zstd_level: row.get(29)?,
+        usage_journal_consumer_lease_ms: row.get(30)?,
+        usage_journal_delete_bad_files: row.get::<_, i64>(31)? != 0,
+        usage_query_bind_addr: row.get(32)?,
+        usage_query_base_url: row.get(33)?,
+        usage_event_maintenance_enabled: row.get::<_, i64>(34)? != 0,
+        usage_event_maintenance_interval_seconds: row.get(35)?,
+        usage_event_detail_retention_days: row.get(36)?,
+        kiro_cache_kmodels_json: row.get(37)?,
+        kiro_billable_model_multipliers_json: row.get(38)?,
+        kiro_cache_policy_json: row.get(39)?,
+        kiro_prefix_cache_mode: row.get(40)?,
+        kiro_prefix_cache_max_tokens: row.get(41)?,
+        kiro_prefix_cache_entry_ttl_seconds: row.get(42)?,
+        kiro_conversation_anchor_max_entries: row.get(43)?,
+        kiro_conversation_anchor_ttl_seconds: row.get(44)?,
+        updated_at_ms: row.get(45)?,
     })
 }
 
@@ -5023,6 +5139,10 @@ impl Default for RuntimeConfigRecord {
                 core_store::DEFAULT_CODEX_STATUS_REFRESH_MAX_INTERVAL_SECONDS as i64,
             codex_status_account_jitter_max_seconds:
                 core_store::DEFAULT_CODEX_STATUS_ACCOUNT_JITTER_MAX_SECONDS as i64,
+            codex_weight_free: core_store::DEFAULT_CODEX_WEIGHT_FREE as i64,
+            codex_weight_plus: core_store::DEFAULT_CODEX_WEIGHT_PLUS as i64,
+            codex_weight_pro5x: core_store::DEFAULT_CODEX_WEIGHT_PRO5X as i64,
+            codex_weight_pro20x: core_store::DEFAULT_CODEX_WEIGHT_PRO20X as i64,
             kiro_status_refresh_min_interval_seconds:
                 core_store::DEFAULT_KIRO_STATUS_REFRESH_MIN_INTERVAL_SECONDS as i64,
             kiro_status_refresh_max_interval_seconds:
@@ -5091,6 +5211,10 @@ impl RuntimeConfigRecord {
                 as u64,
             codex_status_account_jitter_max_seconds: self.codex_status_account_jitter_max_seconds
                 as u64,
+            codex_weight_free: self.codex_weight_free as u64,
+            codex_weight_plus: self.codex_weight_plus as u64,
+            codex_weight_pro5x: self.codex_weight_pro5x as u64,
+            codex_weight_pro20x: self.codex_weight_pro20x as u64,
             kiro_status_refresh_min_interval_seconds: self.kiro_status_refresh_min_interval_seconds
                 as u64,
             kiro_status_refresh_max_interval_seconds: self.kiro_status_refresh_max_interval_seconds
@@ -5141,6 +5265,10 @@ impl RuntimeConfigRecord {
             config.codex_status_refresh_max_interval_seconds as i64;
         self.codex_status_account_jitter_max_seconds =
             config.codex_status_account_jitter_max_seconds as i64;
+        self.codex_weight_free = config.codex_weight_free as i64;
+        self.codex_weight_plus = config.codex_weight_plus as i64;
+        self.codex_weight_pro5x = config.codex_weight_pro5x as i64;
+        self.codex_weight_pro20x = config.codex_weight_pro20x as i64;
         self.kiro_status_refresh_min_interval_seconds =
             config.kiro_status_refresh_min_interval_seconds as i64;
         self.kiro_status_refresh_max_interval_seconds =
@@ -5196,6 +5324,10 @@ impl RuntimeConfigRecord {
             codex_status_refresh_min_interval_seconds: 240,
             codex_status_refresh_max_interval_seconds: 300,
             codex_status_account_jitter_max_seconds: 10,
+            codex_weight_free: 1,
+            codex_weight_plus: 10,
+            codex_weight_pro5x: 50,
+            codex_weight_pro20x: 200,
             kiro_status_refresh_min_interval_seconds: 240,
             kiro_status_refresh_max_interval_seconds: 300,
             kiro_status_account_jitter_max_seconds: 10,
@@ -5798,6 +5930,7 @@ mod tests {
                     auth_json: r#"{"tokens":{"access_token":"access-token"}}"#.to_string(),
                     map_gpt53_codex_to_spark: false,
                     auto_refresh_enabled: true,
+                    route_weight_tier: None,
                     created_at_ms: 400,
                 }),
                 Some(&llm_access_core::store::NewAdminAccountGroup {
@@ -5878,6 +6011,7 @@ mod tests {
             auth_json: r#"{"access_token":"access-route"}"#.to_string(),
             map_gpt53_codex_to_spark: true,
             auto_refresh_enabled: true,
+            route_weight_tier: None,
             created_at_ms: 100,
         })
         .expect("create codex account");
@@ -5896,6 +6030,7 @@ mod tests {
                 status: None,
                 map_gpt53_codex_to_spark: None,
                 auto_refresh_enabled: Some(false),
+                route_weight_tier: None,
                 proxy_mode: Some("fixed".to_string()),
                 proxy_config_id: Some(Some("proxy-codex-route".to_string())),
                 request_max_concurrency: Some(Some(3)),
@@ -5981,6 +6116,7 @@ mod tests {
             auth_json: r#"{"refresh_token":"rt-1"}"#.to_string(),
             map_gpt53_codex_to_spark: false,
             auto_refresh_enabled: true,
+            route_weight_tier: None,
             created_at_ms: 100,
         })
         .expect("create codex account");
@@ -6064,6 +6200,7 @@ mod tests {
                 auth_json: format!(r#"{{"access_token":"access-{name}"}}"#),
                 map_gpt53_codex_to_spark: false,
                 auto_refresh_enabled: true,
+                route_weight_tier: None,
                 created_at_ms,
             })
             .expect("create codex account");
@@ -6120,6 +6257,83 @@ mod tests {
     }
 
     #[test]
+    fn provider_route_repository_applies_codex_weight_tiers_to_auto_routing() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlStore::new(conn);
+
+        repo.create_admin_codex_account(&llm_access_core::store::NewAdminCodexAccount {
+            name: "free-heavy".to_string(),
+            account_id: Some("acct-free-heavy".to_string()),
+            auth_json: r#"{"access_token":"access-free-heavy"}"#.to_string(),
+            map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
+            route_weight_tier: Some("free".to_string()),
+            created_at_ms: 100,
+        })
+        .expect("create free-heavy account");
+        repo.create_admin_codex_account(&llm_access_core::store::NewAdminCodexAccount {
+            name: "pro-light".to_string(),
+            account_id: Some("acct-pro-light".to_string()),
+            auth_json: r#"{"access_token":"access-pro-light"}"#.to_string(),
+            map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
+            route_weight_tier: Some("pro20x".to_string()),
+            created_at_ms: 101,
+        })
+        .expect("create pro-light account");
+        repo.create_admin_key(&llm_access_core::store::NewAdminKey {
+            id: "key-weighted-auto".to_string(),
+            name: "weighted auto key".to_string(),
+            secret: "sfk_weighted_auto".to_string(),
+            key_hash: "hash-weighted-auto".to_string(),
+            provider_type: "codex".to_string(),
+            protocol_family: "openai".to_string(),
+            public_visible: false,
+            quota_billable_limit: 1000,
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+            created_at_ms: 110,
+        })
+        .expect("create key");
+        repo.upsert_codex_rate_limit_status(
+            &llm_access_core::store::CodexRateLimitStatus {
+                status: "ready".to_string(),
+                refresh_interval_seconds: 300,
+                last_checked_at: Some(200),
+                last_success_at: Some(200),
+                source_url: "https://chatgpt.com/backend-api/wham/usage".to_string(),
+                error_message: None,
+                accounts: vec![
+                    codex_public_status_with_plan("free-heavy", "Free", 80.0, 80.0),
+                    codex_public_status_with_plan("pro-light", "Plus", 10.0, 10.0),
+                ],
+                buckets: Vec::new(),
+            },
+            200,
+        )
+        .expect("persist codex status");
+
+        let routes = repo
+            .resolve_provider_codex_routes(&llm_access_core::store::AuthenticatedKey {
+                key_id: "key-weighted-auto".to_string(),
+                key_name: "weighted auto key".to_string(),
+                provider_type: "codex".to_string(),
+                protocol_family: "openai".to_string(),
+                status: "active".to_string(),
+                quota_billable_limit: 1000,
+                billable_tokens_used: 0,
+            })
+            .expect("resolve routes");
+
+        let names = routes
+            .iter()
+            .map(|route| route.account_name.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(names, vec!["pro-light", "free-heavy"]);
+    }
+
+    #[test]
     fn provider_route_repository_attaches_cached_codex_error_message() {
         let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
         crate::initialize_sqlite_target(&conn).expect("init schema");
@@ -6131,6 +6345,7 @@ mod tests {
             auth_json: r#"{"access_token":"access-DogDu"}"#.to_string(),
             map_gpt53_codex_to_spark: false,
             auto_refresh_enabled: true,
+            route_weight_tier: None,
             created_at_ms: 100,
         })
         .expect("create codex account");
@@ -6203,6 +6418,7 @@ mod tests {
             auth_json: r#"{"access_token":"access-DogDu"}"#.to_string(),
             map_gpt53_codex_to_spark: false,
             auto_refresh_enabled: true,
+            route_weight_tier: None,
             created_at_ms: 100,
         })
         .expect("create codex account");
@@ -6284,6 +6500,7 @@ mod tests {
             auth_json: format!(r#"{{"access_token":"{future_token}"}}"#),
             map_gpt53_codex_to_spark: false,
             auto_refresh_enabled: false,
+            route_weight_tier: None,
             created_at_ms: 100,
         })
         .expect("create codex account");
@@ -6359,6 +6576,7 @@ mod tests {
             auth_json: format!(r#"{{"access_token":"{expired_token}"}}"#),
             map_gpt53_codex_to_spark: false,
             auto_refresh_enabled: false,
+            route_weight_tier: None,
             created_at_ms: 100,
         })
         .expect("create codex account");
@@ -6415,10 +6633,24 @@ mod tests {
         primary_remaining_percent: f64,
         secondary_remaining_percent: f64,
     ) -> llm_access_core::store::CodexPublicAccountStatus {
+        codex_public_status_with_plan(
+            name,
+            "Plus",
+            primary_remaining_percent,
+            secondary_remaining_percent,
+        )
+    }
+
+    fn codex_public_status_with_plan(
+        name: &str,
+        plan_type: &str,
+        primary_remaining_percent: f64,
+        secondary_remaining_percent: f64,
+    ) -> llm_access_core::store::CodexPublicAccountStatus {
         llm_access_core::store::CodexPublicAccountStatus {
             name: name.to_string(),
             status: llm_access_core::store::KEY_STATUS_ACTIVE.to_string(),
-            plan_type: Some("Plus".to_string()),
+            plan_type: Some(plan_type.to_string()),
             primary_remaining_percent: Some(primary_remaining_percent),
             secondary_remaining_percent: Some(secondary_remaining_percent),
             last_usage_checked_at: Some(200),
@@ -6936,6 +7168,7 @@ mod tests {
             auth_json: r#"{"tokens":{"access_token":"access"}}"#.to_string(),
             map_gpt53_codex_to_spark: false,
             auto_refresh_enabled: true,
+            route_weight_tier: None,
             created_at_ms: 40,
         })
         .expect("create existing account");

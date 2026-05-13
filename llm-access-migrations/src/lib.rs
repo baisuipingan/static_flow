@@ -56,6 +56,11 @@ const SQLITE_MIGRATIONS: &[SqlMigration] = &[
             "../migrations/sqlite/0008_account_contribution_public_wall_visibility.sql"
         ),
     },
+    SqlMigration {
+        version: 9,
+        name: "codex_weighted_routing",
+        sql: include_str!("../migrations/sqlite/0008_codex_weighted_routing.sql"),
+    },
 ];
 
 const DUCKDB_MIGRATIONS: &[SqlMigration] = &[
@@ -242,6 +247,22 @@ mod tests {
             )
             .expect("inspect runtime config duckdb columns");
         assert_eq!(runtime_duckdb_column_count, 2);
+
+        let runtime_codex_weight_column_count: i64 = conn
+            .query_row(
+                "SELECT count(*)
+                 FROM pragma_table_info('llm_runtime_config')
+                 WHERE name IN (
+                    'codex_weight_free',
+                    'codex_weight_plus',
+                    'codex_weight_pro5x',
+                    'codex_weight_pro20x'
+                 )",
+                [],
+                |row| row.get(0),
+            )
+            .expect("inspect runtime config codex weight columns");
+        assert_eq!(runtime_codex_weight_column_count, 4);
 
         let runtime_journal_column_count: i64 = conn
             .query_row(
