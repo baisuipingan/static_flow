@@ -124,6 +124,8 @@ private env files, not in tracked docs.
   - archived immutable DuckDB segments:
     `/mnt/llm-access/analytics/segments`
   - DuckDB segment catalog: `/mnt/llm-access/analytics/catalog`
+  - heavy usage detail object prefix: direct R2 object storage configured by
+    `LLM_ACCESS_USAGE_DETAILS_OBJECT_STORE_URL`
   - email credentials: `/mnt/llm-access/config/email_accounts.json`
   - API bind address: `127.0.0.1:19080`
   - usage worker bind address: `127.0.0.1:19081`
@@ -135,13 +137,21 @@ private env files, not in tracked docs.
   - `llm-access.service`: provider traffic, SQLite control/rollups, account
     status refreshers, and compact local usage journal production.
   - `llm-access-usage-worker.service`: journal consumption, tiered DuckDB
-    writes, worker progress state, and legacy admin usage list/detail query
-    routes on the worker port.
+    summary writes, direct usage-detail object uploads, worker progress state,
+    and legacy admin usage list/detail query routes on the worker port.
+- The live worker environment must include direct object-store credentials for
+  usage details. At minimum:
+  - `LLM_ACCESS_USAGE_DETAILS_OBJECT_STORE_URL`
+  - `R2_ENDPOINT`
+  - `R2_ACCESS_KEY_ID`
+  - `R2_SECRET_ACCESS_KEY`
+  If these are missing, the worker will fall back to metadata credentials and
+  detail uploads will fail even though the service still starts.
 - Live GCP `llm-access.service` currently runs as the non-root `ts_user`
   service user. The checked-in template still uses a dedicated `llm-access`
   user for fresh deployments; either is acceptable if file ownership, FUSE
   permissions, and readiness checks are consistent.
-- Current GCP systemd units verified on 2026-05-07:
+- Current GCP systemd units verified on 2026-05-13:
   - `juicefs-llm-access.service`: mounts `/mnt/llm-access`
   - `llm-access.service`: serves `127.0.0.1:19080`
     and proxies legacy admin usage routes to the worker query port
@@ -193,6 +203,11 @@ extra swap as an emergency buffer, not as normal working memory.
   immutable archived segment files plus the low-frequency segment catalog. Do
   not point a live writer at `/mnt/llm-access/analytics/usage.duckdb` as a
   mutable all-history DuckDB file.
+- Heavy per-event detail payloads are not part of the hot DuckDB write path
+  anymore. The worker writes summary facts into tiered DuckDB, but writes
+  detail payloads as compressed JSON objects directly to R2. This keeps
+  checkpoint/rollover memory bounded by summary analytics instead of full
+  request bodies.
 - The API process no longer writes usage events directly into DuckDB. It first
   commits SQLite rollups, then appends compact diagnostic usage events to
   `/var/lib/staticflow/llm-access/usage-journal`. The separate usage worker consumes sealed
@@ -249,7 +264,7 @@ extra swap as an emergency buffer, not as normal working memory.
 
 ## Current Runtime Verification Snapshot
 
-- Verified on GCP at `2026-05-07T18:32:27Z`.
+- Verified on GCP at `2026-05-13T20:22:32Z`.
 - Effective live API unit:
   - service user: `ts_user`
   - bind: `127.0.0.1:19080`
@@ -261,9 +276,10 @@ extra swap as an emergency buffer, not as normal working memory.
   - service user: `ts_user`
   - bind: `127.0.0.1:19081`
   - current `ExecStart`: worker process with local journal root,
-    local active DuckDB dir, and JuiceFS archive/catalog dirs
+    local active DuckDB dir, JuiceFS archive/catalog dirs, and direct R2 usage
+    detail object uploads
   - cgroup guard observed live:
-    `MemoryHigh=3584M`, `MemoryMax=4096M`, `MemorySwapMax=1024M`
+    `MemoryHigh=2200M`, `MemoryMax=3072M`, `MemorySwapMax=1024M`
 - Live health checks that should all pass:
   ```bash
   curl -fsS http://127.0.0.1:19080/healthz
@@ -280,11 +296,11 @@ extra swap as an emergency buffer, not as normal working memory.
     to be consumed. This is healthy, not a stuck worker.
   - `active_file_sequence` and `active_file_bytes` should move over time while
     traffic exists.
-- Current live snapshot on 2026-05-07 showed:
+- Current live snapshot on 2026-05-13 after the direct-R2 detail cutover showed:
   - API `/healthz`: `{"status":"ok","service":"llm-access"}`
-  - worker status: `state=idle`, `last_error=null`
-  - combined journal status: `sealed_file_count=0`, `write_failures_total=0`,
-    `journal_root=/var/lib/staticflow/llm-access/usage-journal`
+  - worker status advancing in `state=importing`, `last_error=null`
+  - worker environment includes `LLM_ACCESS_USAGE_DETAILS_OBJECT_STORE_URL`,
+    `R2_ENDPOINT`, `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY`
 
 ## Known Residuals After Journal-Root Cutover
 
@@ -344,6 +360,11 @@ extra swap as an emergency buffer, not as normal working memory.
   - `/etc/systemd/system/llm-access.service.d/zzz-usage-journal-local.conf`
   - `/etc/systemd/system/llm-access-usage-worker.service.d/zzz-usage-journal-local.conf`
   - owner/group of `/var/lib/staticflow/llm-access/usage-journal`
+- If the worker starts but `last_error` shows `169.254.169.254/latest/api/token`
+  or other metadata-provider credential failures, check the live
+  `/etc/llm-access/llm-access.env` first. That means the worker has
+  `LLM_ACCESS_USAGE_DETAILS_OBJECT_STORE_URL` but is missing direct R2
+  credentials, so `object_store` fell back to instance metadata auth.
 
 ## Emergency Recovery for Sudden Public Outage
 

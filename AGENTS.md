@@ -25,8 +25,16 @@ Canonical root: `/mnt/wsl/data4tb/static-flow-data`
 
 The local content DB `llm_gateway_*` tables are legacy/source-of-migration
 state. Current production LLM access is owned by the cloud `llm-access`
-service: SQLite control under `/mnt/llm-access/control` and tiered DuckDB
-analytics with an active local VM segment plus archived JuiceFS/R2 segments.
+service:
+- SQLite control under `/mnt/llm-access/control`
+- local hot journal under `/var/lib/staticflow/llm-access/usage-journal`
+- tiered DuckDB analytics with an active local VM segment under
+  `/var/lib/staticflow/llm-access/analytics-active`
+- archived immutable DuckDB segments plus the low-frequency segment catalog on
+  JuiceFS under `/mnt/llm-access/analytics`
+- per-event heavy usage detail payloads as compressed JSON objects in direct
+  Cloudflare R2 object storage, configured by
+  `LLM_ACCESS_USAGE_DETAILS_OBJECT_STORE_URL`
 
 Current storage invariants:
 - All current production tables use stable row IDs.
@@ -95,6 +103,11 @@ Key rules:
   API binary/unit changed, and `scripts/release_llm_access_cloud_worker_only.sh`
   when only the worker changed. Do not restart the other service just because
   you are shipping one side.
+- The usage worker now depends on both the JuiceFS state mount and direct R2
+  credentials. The live `/etc/llm-access/llm-access.env` must include
+  `LLM_ACCESS_USAGE_DETAILS_OBJECT_STORE_URL`, `R2_ENDPOINT`,
+  `R2_ACCESS_KEY_ID`, and `R2_SECRET_ACCESS_KEY`; otherwise the worker will
+  fall back to metadata credentials and usage-detail uploads will fail.
 - For GCP `llm-access` memory changes, remember that
   `/etc/systemd/system/llm-access.service.d/resource-guard.conf` can override
   the base unit. Raising the limit in the template alone is not sufficient if a

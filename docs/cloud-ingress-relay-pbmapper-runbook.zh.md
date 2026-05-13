@@ -14,8 +14,10 @@ public client
      ├── LLM paths
      │   -> cloud llm-access 127.0.0.1:19080
      │      -> SQLite control DB on /mnt/llm-access/control
+     │      -> usage journal on /var/lib/staticflow/llm-access/usage-journal
      │      -> active DuckDB on /var/lib/staticflow/llm-access/analytics-active
      │      -> archived DuckDB segments/catalog on JuiceFS/R2
+     │      -> heavy usage details as compressed JSON in direct R2 object storage
      └── non-LLM paths
          -> cloud pb-mapper-client-cli 127.0.0.1:39080
          -> configured cloud pb-mapper relay
@@ -136,6 +138,7 @@ sudo journalctl -u caddy -n 120 --no-pager -l
   /analytics/segments
   /analytics/catalog
 
+/var/lib/staticflow/llm-access/usage-journal
 /var/lib/staticflow/llm-access/analytics-active
   usage-active-*.duckdb
 ```
@@ -143,6 +146,20 @@ sudo journalctl -u caddy -n 120 --no-pager -l
 `/mnt/llm-access` 是 JuiceFS FUSE mount。对象存储后端是 Cloudflare R2，
 元数据后端是 Valkey。R2/Valkey 密钥只放在被 git 忽略的私有 env 文件里，
 不要写入 README、runbook、systemd 模板或 shell history。
+
+当前 usage analytics 已经拆成两层：
+
+- summary fact 继续写入 tiered DuckDB
+- 单条事件的重明细 payload 直接写入 R2 中的压缩 JSON 对象，由
+  `LLM_ACCESS_USAGE_DETAILS_OBJECT_STORE_URL` 指向
+
+因此 worker 除了依赖 JuiceFS mount，还依赖直接 R2 凭证。线上
+`/etc/llm-access/llm-access.env` 至少必须包含：
+
+- `LLM_ACCESS_USAGE_DETAILS_OBJECT_STORE_URL`
+- `R2_ENDPOINT`
+- `R2_ACCESS_KEY_ID`
+- `R2_SECRET_ACCESS_KEY`
 
 当前资源保护基线：
 

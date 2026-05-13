@@ -103,6 +103,37 @@ StaticFlow supports three deployment modes:
 - **GitHub Pages**: Frontend-only static deploy; API calls go to configured
   `STATICFLOW_API_BASE`. CI: `.github/workflows/deploy.yml`.
 
+## Current Production Shape
+
+Current production is split between a cloud LLM tier and a local content tier:
+
+- `https://ackingliu.top` terminates at GCP Caddy
+- LLM paths (`/v1/*`, `/cc/v1/*`, `/api/llm-gateway/*`, `/api/kiro-gateway/*`,
+  `/api/codex-gateway/*`, `/api/llm-access/*`) stay on the cloud VM and go to
+  standalone `llm-access`
+- non-LLM StaticFlow paths continue through cloud pb-mapper and land on the
+  local Pingora gateway + active backend slot
+
+The cloud `llm-access` service itself is split in two processes:
+
+- `llm-access.service`: provider/admin API, SQLite control plane, account
+  refreshers, and usage journal production
+- `llm-access-usage-worker.service`: journal consumption, tiered DuckDB usage
+  analytics, and usage query routes
+
+Current usage analytics storage shape:
+
+- SQLite control: `/mnt/llm-access/control/llm-access.sqlite3`
+- hot journal: `/var/lib/staticflow/llm-access/usage-journal`
+- active mutable DuckDB: `/var/lib/staticflow/llm-access/analytics-active`
+- archived immutable DuckDB segments + catalog: `/mnt/llm-access/analytics`
+- heavy per-event detail payloads: compressed JSON objects in direct R2 object
+  storage, configured by `LLM_ACCESS_USAGE_DETAILS_OBJECT_STORE_URL`
+
+This means production usage detail payloads are no longer stored in the hot
+DuckDB files. The worker writes summary facts to DuckDB and writes heavy detail
+blobs straight to object storage.
+
 ## CLI Reference
 
 `sf-cli` provides LanceDB operations: write articles/images, sync notes,
