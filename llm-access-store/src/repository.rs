@@ -870,6 +870,24 @@ impl ProviderRouteStore for SqliteControlRepository {
         .context("sqlite control repository provider codex auth update task failed")?
     }
 
+    async fn set_codex_account_auto_refresh_enabled(
+        &self,
+        account_name: &str,
+        enabled: bool,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let account_name = account_name.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.set_codex_account_auto_refresh_enabled(&account_name, enabled, updated_at_ms)
+        })
+        .await
+        .context("sqlite control repository provider codex auto-refresh toggle task failed")?
+    }
+
     async fn mark_kiro_account_quota_exhausted(
         &self,
         account_name: &str,
@@ -1715,6 +1733,7 @@ mod tests {
                 })
                 .to_string(),
                 map_gpt53_codex_to_spark: false,
+                auto_refresh_enabled: true,
                 created_at_ms: 100,
             })
             .await
@@ -1732,6 +1751,7 @@ mod tests {
         let patched = repo
             .patch_admin_codex_account("codex_primary", AdminCodexAccountPatch {
                 map_gpt53_codex_to_spark: Some(true),
+                auto_refresh_enabled: Some(false),
                 proxy_mode: Some("none".to_string()),
                 request_max_concurrency: Some(Some(2)),
                 request_min_start_interval_ms: Some(Some(50)),
@@ -1742,6 +1762,7 @@ mod tests {
             .expect("patch codex account")
             .expect("account exists");
         assert!(patched.map_gpt53_codex_to_spark);
+        assert!(!patched.auto_refresh_enabled);
         assert_eq!(patched.proxy_mode, "none");
         assert_eq!(patched.request_max_concurrency, Some(2));
         assert_eq!(patched.request_min_start_interval_ms, Some(50));

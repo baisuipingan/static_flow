@@ -1489,6 +1489,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn router_refreshes_codex_status_with_access_token_only_auth() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("Codex upstream env lock");
+        let upstream_base = spawn_fake_codex_usage_upstream(true).await;
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+        let (router, root) = persistent_test_router("codex-status-access-token-only").await;
+        let repo = llm_access_store::repository::SqliteControlRepository::open_path(
+            root.join("control/llm-access.sqlite3"),
+        )
+        .expect("open sqlite control repository");
+        repo.create_admin_codex_account(NewAdminCodexAccount {
+            name: "codex_short".to_string(),
+            account_id: Some("acct-short".to_string()),
+            auth_json: serde_json::json!({
+                "access_token": "short-lived-access-token",
+                "account_id": "acct-short"
+            })
+            .to_string(),
+            map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
+            created_at_ms: 100,
+        })
+        .await
+        .expect("create codex account");
+
+        let response = router
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/admin/llm-gateway/accounts/codex_short/refresh")
+                    .header(header::HOST, "localhost")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("refresh response");
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+        std::fs::remove_dir_all(&root).expect("cleanup state root");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("refresh body");
+        let value: serde_json::Value = serde_json::from_slice(&body).expect("refresh json");
+        assert_eq!(value["name"], "codex_short");
+        assert!(value["last_usage_success_at"].is_number());
+        assert!(value["usage_error_message"].is_null());
+    }
+
+    #[tokio::test]
     async fn router_keeps_issue_success_when_post_issue_codex_status_refresh_fails() {
         let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
@@ -2211,6 +2263,7 @@ mod tests {
             })
             .to_string(),
             map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
             created_at_ms: 100,
         })
         .await

@@ -3,7 +3,9 @@
 use std::collections::BTreeMap;
 
 use async_trait::async_trait;
+use base64::{engine::general_purpose::URL_SAFE_NO_PAD, Engine as _};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 
 use crate::{provider::RouteStrategy, usage::UsageEvent};
 
@@ -718,6 +720,8 @@ pub struct AdminCodexAccount {
     pub secondary_remaining_percent: Option<f64>,
     /// Whether GPT-5.3 Codex is mapped to Spark for this account.
     pub map_gpt53_codex_to_spark: bool,
+    /// Whether this account may participate in automatic auth refresh.
+    pub auto_refresh_enabled: bool,
     /// Per-account request concurrency cap.
     pub request_max_concurrency: Option<u64>,
     /// Per-account request pacing interval.
@@ -734,6 +738,10 @@ pub struct AdminCodexAccount {
     pub effective_proxy_config_name: Option<String>,
     /// Last auth refresh timestamp.
     pub last_refresh: Option<i64>,
+    /// Current access token expiry timestamp in Unix milliseconds.
+    pub access_token_expires_at: Option<i64>,
+    /// Last auth refresh error, if any.
+    pub auth_refresh_error_message: Option<String>,
     /// Last usage refresh attempt timestamp.
     pub last_usage_checked_at: Option<i64>,
     /// Last successful usage refresh timestamp.
@@ -753,6 +761,8 @@ pub struct NewAdminCodexAccount {
     pub auth_json: String,
     /// Whether GPT-5.3 Codex is mapped to Spark for this account.
     pub map_gpt53_codex_to_spark: bool,
+    /// Whether this account may participate in automatic auth refresh.
+    pub auto_refresh_enabled: bool,
     /// Creation timestamp.
     pub created_at_ms: i64,
 }
@@ -764,6 +774,8 @@ pub struct AdminCodexAccountPatch {
     pub status: Option<String>,
     /// New GPT-5.3 Codex Spark mapping toggle.
     pub map_gpt53_codex_to_spark: Option<bool>,
+    /// New automatic auth refresh toggle.
+    pub auto_refresh_enabled: Option<bool>,
     /// New proxy selection mode.
     pub proxy_mode: Option<String>,
     /// New proxy config id.
@@ -1117,6 +1129,8 @@ pub struct ProviderCodexRoute {
     pub auth_json: String,
     /// Whether this account maps public gpt-5.3-codex to Spark upstream.
     pub map_gpt53_codex_to_spark: bool,
+    /// Whether this account may participate in automatic auth refresh.
+    pub auth_refresh_enabled: bool,
     /// Request concurrency cap configured on this key route.
     pub request_max_concurrency: Option<u64>,
     /// Minimum interval between request starts configured on this key route.
@@ -1163,6 +1177,37 @@ pub fn is_terminal_codex_auth_error(message: &str) -> bool {
         || ((message.contains("codex request returned 401")
             || message.contains("codex request returned 403"))
             && message.contains("after forced refresh"))
+        || message.contains("codex auth refresh disabled and current access token expired")
+}
+
+/// Decode the JWT `exp` claim from one access token into Unix milliseconds.
+pub fn jwt_expiry_unix_ms(token: &str) -> Option<i64> {
+    let payload = token.split('.').nth(1)?;
+    let decoded = URL_SAFE_NO_PAD.decode(payload.as_bytes()).ok()?;
+    let value: Value = serde_json::from_slice(&decoded).ok()?;
+    let exp_seconds = value.get("exp")?.as_i64()?;
+    exp_seconds.checked_mul(1000)
+}
+
+/// Extract the current Codex access token expiry timestamp from persisted auth
+/// JSON when it is available.
+pub fn codex_auth_access_token_expires_at_ms(auth_json: &str) -> Option<i64> {
+    let value: Value = serde_json::from_str(auth_json).ok()?;
+    let access_token = json_string_any(&value, &["access_token", "accessToken"]).or_else(|| {
+        value
+            .get("tokens")
+            .and_then(|tokens| json_string_any(tokens, &["access_token", "accessToken"]))
+    })?;
+    jwt_expiry_unix_ms(&access_token)
+}
+
+fn json_string_any(value: &Value, fields: &[&str]) -> Option<String> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
 }
 
 /// Resolved Kiro account selected for one provider request.
@@ -1782,6 +1827,16 @@ pub trait ProviderRouteStore: Send + Sync {
 
     /// Persist a refreshed Codex credential snapshot.
     async fn save_codex_auth_update(&self, update: ProviderCodexAuthUpdate) -> anyhow::Result<()>;
+
+    /// Enable or disable automatic Codex auth refresh for one account.
+    async fn set_codex_account_auto_refresh_enabled(
+        &self,
+        _account_name: &str,
+        _enabled: bool,
+        _updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        Ok(())
+    }
 
     /// Persist a hot-path Kiro account quota-exhausted marker.
     async fn mark_kiro_account_quota_exhausted(
@@ -2659,6 +2714,7 @@ impl AdminCodexAccountStore for EmptyAdminCodexAccountStore {
             primary_remaining_percent: None,
             secondary_remaining_percent: None,
             map_gpt53_codex_to_spark: account.map_gpt53_codex_to_spark,
+            auto_refresh_enabled: account.auto_refresh_enabled,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
             proxy_mode: "inherit".to_string(),
@@ -2667,6 +2723,8 @@ impl AdminCodexAccountStore for EmptyAdminCodexAccountStore {
             effective_proxy_url: None,
             effective_proxy_config_name: None,
             last_refresh: Some(account.created_at_ms),
+            access_token_expires_at: codex_auth_access_token_expires_at_ms(&account.auth_json),
+            auth_refresh_error_message: None,
             last_usage_checked_at: None,
             last_usage_success_at: None,
             usage_error_message: None,

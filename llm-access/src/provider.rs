@@ -5251,7 +5251,7 @@ pub(crate) fn codex_upstream_base_url() -> String {
         .unwrap_or_else(|_| "https://chatgpt.com/backend-api/codex".to_string())
 }
 
-fn compute_codex_upstream_url(base: &str, path: &str) -> String {
+pub(crate) fn compute_codex_upstream_url(base: &str, path: &str) -> String {
     let base = base.trim_end_matches('/');
     if base.contains("/backend-api/codex") && path.starts_with("/v1/") {
         format!("{}{}", base, path.trim_start_matches("/v1"))
@@ -6852,6 +6852,7 @@ mod tests {
             route_strategy_at_event: RouteStrategy::Auto,
             auth_json: format!(r#"{{"access_token":"{access_token}"}}"#),
             map_gpt53_codex_to_spark: true,
+            auth_refresh_enabled: true,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
             account_request_max_concurrency: None,
@@ -10115,6 +10116,7 @@ mod tests {
                     route_strategy_at_event: RouteStrategy::Auto,
                     auth_json: r#"{"access_token":"upstream-token"}"#.to_string(),
                     map_gpt53_codex_to_spark: true,
+                    auth_refresh_enabled: true,
                     request_max_concurrency: None,
                     request_min_start_interval_ms: None,
                     account_request_max_concurrency: None,
@@ -10179,6 +10181,7 @@ mod tests {
                     route_strategy_at_event: RouteStrategy::Auto,
                     auth_json: r#"{"access_token":"upstream-token"}"#.to_string(),
                     map_gpt53_codex_to_spark: true,
+                    auth_refresh_enabled: true,
                     request_max_concurrency: None,
                     request_min_start_interval_ms: None,
                     account_request_max_concurrency: None,
@@ -10494,6 +10497,7 @@ mod tests {
                     route_strategy_at_event: RouteStrategy::Auto,
                     auth_json: r#"{"access_token":"upstream-token"}"#.to_string(),
                     map_gpt53_codex_to_spark: true,
+                    auth_refresh_enabled: true,
                     request_max_concurrency: None,
                     request_min_start_interval_ms: None,
                     account_request_max_concurrency: None,

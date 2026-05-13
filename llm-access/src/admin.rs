@@ -91,6 +91,8 @@ const MAX_ADMIN_REVIEW_QUEUE_LIMIT: usize = 200;
 const DEFAULT_ADMIN_IMPORT_JOB_LIMIT: usize = 20;
 const MAX_ADMIN_IMPORT_JOB_LIMIT: usize = 50;
 const PROXY_CONNECTIVITY_CHECK_TIMEOUT_SECONDS: u64 = 10;
+const CODEX_ACCESS_TOKEN_VALIDATION_TIMEOUT_SECONDS: u64 = 20;
+const CODEX_WIRE_ORIGINATOR: &str = "codex_cli_rs";
 const BAND_CONTIGUITY_TOLERANCE: f64 = 1e-12;
 
 #[derive(Debug, Serialize)]
@@ -524,6 +526,8 @@ pub(crate) struct PatchLlmGatewayAccountRequest {
     proxy_config_id: Option<String>,
     #[serde(default)]
     map_gpt53_codex_to_spark: Option<bool>,
+    #[serde(default)]
+    auto_refresh_enabled: Option<bool>,
     #[serde(default)]
     request_max_concurrency: Option<u64>,
     #[serde(default)]
@@ -1349,7 +1353,7 @@ fn apply_cached_codex_status_to_admin_accounts(
 fn apply_codex_public_status_to_admin_account(
     account: &mut core_store::AdminCodexAccount,
     status_account: core_store::CodexPublicAccountStatus,
-    status_last_checked_at: Option<i64>,
+    _status_last_checked_at: Option<i64>,
 ) {
     if account.status != KEY_STATUS_ACTIVE || status_account.status != KEY_STATUS_ACTIVE {
         account.plan_type = None;
@@ -1363,23 +1367,9 @@ fn apply_codex_public_status_to_admin_account(
     account.plan_type = status_account.plan_type;
     account.primary_remaining_percent = status_account.primary_remaining_percent;
     account.secondary_remaining_percent = status_account.secondary_remaining_percent;
-    let local_error = account.usage_error_message.clone();
-    let local_refresh = account.last_refresh.unwrap_or(0);
-    let status_checked_at = status_account.last_usage_checked_at.unwrap_or(0);
-    let merged_refresh = status_account
-        .last_usage_checked_at
-        .or(status_last_checked_at)
-        .map(|value| value.max(local_refresh))
-        .or(account.last_refresh);
-    account.last_refresh = merged_refresh;
     account.last_usage_checked_at = status_account.last_usage_checked_at;
     account.last_usage_success_at = status_account.last_usage_success_at;
-    if status_account.usage_error_message.is_some()
-        || local_error.is_none()
-        || local_refresh <= status_checked_at
-    {
-        account.usage_error_message = status_account.usage_error_message;
-    }
+    account.usage_error_message = status_account.usage_error_message;
 }
 
 pub(crate) async fn import_llm_gateway_account(
@@ -1403,6 +1393,7 @@ pub(crate) async fn import_llm_gateway_account(
         account_id: auth.account_id,
         auth_json: auth.auth_json,
         map_gpt53_codex_to_spark: false,
+        auto_refresh_enabled: true,
         created_at_ms: now_ms(),
     };
     match state
@@ -1644,7 +1635,7 @@ pub(crate) async fn refresh_llm_gateway_account(
     };
     match state
         .admin_codex_account_store
-        .refresh_admin_codex_account(&name, now_ms())
+        .get_admin_codex_account(&name)
         .await
     {
         Ok(Some(mut account)) => {
@@ -2383,10 +2374,6 @@ pub(crate) async fn validate_llm_gateway_account_contribution_request(
         return conflict("LLM gateway account contribution request is finalized").into_response();
     }
     let action = review_queue_action(request);
-    let proxy = match required_codex_default_proxy(&state).await {
-        Ok(proxy) => proxy,
-        Err(response) => return response.into_response(),
-    };
     let auth = match codex_auth_from_fields(
         current.account_id.as_deref(),
         Some(&current.id_token),
@@ -2396,23 +2383,12 @@ pub(crate) async fn validate_llm_gateway_account_contribution_request(
         Ok(auth) => auth,
         Err(response) => return response.into_response(),
     };
-    let route = core_store::ProviderCodexRoute {
-        account_name: current.account_name.clone(),
-        account_group_id_at_event: None,
-        route_strategy_at_event: RouteStrategy::Auto,
-        auth_json: auth.auth_json,
-        map_gpt53_codex_to_spark: false,
-        request_max_concurrency: None,
-        request_min_start_interval_ms: None,
-        account_request_max_concurrency: None,
-        account_request_min_start_interval_ms: None,
-        cached_error_message: None,
-        proxy: Some(proxy),
-    };
-    let refreshed = match codex_refresh::refresh_auth_json_for_route(&route).await {
-        Ok(update) => update,
+    let validated_auth = match validate_codex_import_auth(&state, &current.account_name, &auth)
+        .await
+    {
+        Ok(auth) => auth,
         Err(err) => {
-            let failure_reason = format!("Codex auth refresh validation failed: {err}");
+            let failure_reason = format!("Codex auth validation failed: {err}");
             return match state
                 .admin_review_queue_store
                 .fail_admin_account_contribution_request(&request_id, failure_reason, action)
@@ -2427,21 +2403,17 @@ pub(crate) async fn validate_llm_gateway_account_contribution_request(
             };
         },
     };
-    let refreshed_auth = match normalize_codex_auth_json(&refreshed.auth_json) {
-        Ok(auth) => auth,
-        Err(response) => return response.into_response(),
-    };
-    let refreshed_id_token = refreshed_auth.id_token_or_empty();
-    let refreshed_access_token = refreshed_auth.access_token_or_empty();
-    let refreshed_refresh_token = refreshed_auth.refresh_token_or_empty();
+    let validated_id_token = validated_auth.id_token_or_empty();
+    let validated_access_token = validated_auth.access_token_or_empty();
+    let validated_refresh_token = validated_auth.refresh_token_or_empty();
     match state
         .admin_review_queue_store
         .validate_admin_account_contribution_request(
             &request_id,
-            refreshed_auth.account_id,
-            refreshed_id_token,
-            refreshed_access_token,
-            refreshed_refresh_token,
+            validated_auth.account_id,
+            validated_id_token,
+            validated_access_token,
+            validated_refresh_token,
             action,
         )
         .await
@@ -2527,6 +2499,7 @@ pub(crate) async fn approve_and_issue_llm_gateway_account_contribution_request(
             account_id: auth.account_id,
             auth_json: auth.auth_json,
             map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
             created_at_ms: action.updated_at_ms,
         })
     } else {
@@ -2635,18 +2608,6 @@ async fn prime_codex_status_after_account_contribution_issue(
             return;
         },
     };
-    if let Err(err) = state
-        .admin_codex_account_store
-        .refresh_admin_codex_account(account_name, now_ms())
-        .await
-    {
-        tracing::warn!(
-            request_id = %request.request_id,
-            account_name,
-            "failed to update issued Codex account refresh timestamp after priming status: {err:#}",
-        );
-        return;
-    }
     tracing::info!(
         request_id = %request.request_id,
         account_name,
@@ -3915,7 +3876,7 @@ async fn run_codex_batch_import_job(
         }
 
         let (auth, validated_at_ms) = if request.validate_before_import {
-            match refresh_validated_codex_batch_import_auth(&state, &item).await {
+            match validate_codex_batch_import_auth(&state, &item).await {
                 Ok(auth) => (auth, Some(now_ms())),
                 Err(err) => {
                     state
@@ -3991,6 +3952,7 @@ async fn run_codex_batch_import_job(
                 account_id: auth.account_id.clone(),
                 auth_json: auth.auth_json.clone(),
                 map_gpt53_codex_to_spark: false,
+                auto_refresh_enabled: true,
                 created_at_ms: imported_at_ms,
             })
             .await
@@ -4044,32 +4006,149 @@ async fn run_codex_batch_import_job(
     Ok(())
 }
 
-async fn refresh_validated_codex_batch_import_auth(
+async fn validate_codex_batch_import_auth(
     state: &HttpState,
     item: &NormalizedCodexBatchImportJobItem,
+) -> anyhow::Result<NormalizedCodexAuth> {
+    validate_codex_import_auth(state, &item.requested_name, &item.auth)
+        .await
+        .with_context(|| {
+            format!("validate auth for codex batch import account `{}`", item.requested_name)
+        })
+}
+
+async fn validate_codex_import_auth(
+    state: &HttpState,
+    account_name: &str,
+    auth: &NormalizedCodexAuth,
 ) -> anyhow::Result<NormalizedCodexAuth> {
     let proxy = required_codex_default_proxy(state)
         .await
         .map_err(|err| anyhow::anyhow!(err.message))?;
-    let route = core_store::ProviderCodexRoute {
-        account_name: item.requested_name.clone(),
+    let route = codex_validation_route(account_name, auth, proxy.clone());
+    let has_refresh_token = auth
+        .refresh_token
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|token| !token.is_empty());
+    if should_validate_codex_access_token_directly(auth) {
+        match validate_codex_access_token_for_import(&route, auth).await {
+            Ok(()) => return Ok(auth.clone()),
+            Err(access_err) if !has_refresh_token => {
+                return Err(access_err)
+                    .context("validate codex import access token against models");
+            },
+            Err(_) => {},
+        }
+    }
+
+    let refreshed = codex_refresh::refresh_auth_json_for_route(&route)
+        .await
+        .context("refresh auth for codex import account")?;
+    let refreshed_auth = normalize_codex_auth_json(&refreshed.auth_json)
+        .map_err(|err| anyhow::anyhow!(err.message))?;
+    let refreshed_route = codex_validation_route(account_name, &refreshed_auth, proxy);
+    validate_codex_access_token_for_import(&refreshed_route, &refreshed_auth)
+        .await
+        .context("validate refreshed codex import access token against models")?;
+    Ok(refreshed_auth)
+}
+
+fn codex_validation_route(
+    account_name: &str,
+    auth: &NormalizedCodexAuth,
+    proxy: core_store::ProviderProxyConfig,
+) -> core_store::ProviderCodexRoute {
+    core_store::ProviderCodexRoute {
+        account_name: account_name.to_string(),
         account_group_id_at_event: None,
         route_strategy_at_event: RouteStrategy::Fixed,
-        auth_json: item.auth.auth_json.clone(),
+        auth_json: auth.auth_json.clone(),
         map_gpt53_codex_to_spark: false,
+        auth_refresh_enabled: true,
         request_max_concurrency: None,
         request_min_start_interval_ms: None,
         account_request_max_concurrency: None,
         account_request_min_start_interval_ms: None,
         cached_error_message: None,
         proxy: Some(proxy),
-    };
-    let refreshed = codex_refresh::refresh_auth_json_for_route(&route)
+    }
+}
+
+fn should_validate_codex_access_token_directly(auth: &NormalizedCodexAuth) -> bool {
+    auth.access_token
+        .as_deref()
+        .map(str::trim)
+        .is_some_and(|token| !token.is_empty() && !codex_refresh::access_token_is_expired(token))
+}
+
+async fn validate_codex_access_token_for_import(
+    route: &core_store::ProviderCodexRoute,
+    auth: &NormalizedCodexAuth,
+) -> anyhow::Result<()> {
+    let access_token = auth
+        .access_token
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .ok_or_else(|| anyhow::anyhow!("missing codex access_token"))?;
+    let upstream_url = llm_access_codex::models::append_client_version_query(
+        &crate::provider::compute_codex_upstream_url(
+            &crate::provider::codex_upstream_base_url(),
+            "/v1/models",
+        ),
+        core_store::DEFAULT_CODEX_CLIENT_VERSION,
+    );
+    let client = codex_refresh::provider_client(route.proxy.as_ref())?;
+    let mut request = client
+        .get(&upstream_url)
+        .bearer_auth(access_token)
+        .header(reqwest::header::ACCEPT, "application/json")
+        .header(
+            reqwest::header::USER_AGENT,
+            format!("{}/{}", CODEX_WIRE_ORIGINATOR, core_store::DEFAULT_CODEX_CLIENT_VERSION),
+        )
+        .header(reqwest::header::HeaderName::from_static("originator"), CODEX_WIRE_ORIGINATOR)
+        .timeout(Duration::from_secs(CODEX_ACCESS_TOKEN_VALIDATION_TIMEOUT_SECONDS));
+    if let Some(account_id) = auth.account_id.as_deref() {
+        request = request.header("chatgpt-account-id", account_id);
+    }
+    if auth
+        .id_token
+        .as_deref()
+        .is_some_and(codex_refresh::id_token_is_fedramp_account)
+    {
+        request = request.header("x-openai-fedramp", "true");
+    }
+
+    let response = request
+        .send()
         .await
-        .with_context(|| {
-            format!("refresh auth for codex batch import account `{}`", item.requested_name)
-        })?;
-    normalize_codex_auth_json(&refreshed.auth_json).map_err(|err| anyhow::anyhow!(err.message))
+        .context("request Codex models with access token")?;
+    let status = response.status();
+    if !status.is_success() {
+        let body = response.text().await.unwrap_or_default();
+        anyhow::bail!(
+            "codex access token validation returned {status}: {}",
+            summarize_upstream_error_body(&body)
+        );
+    }
+    let payload = response
+        .json::<serde_json::Value>()
+        .await
+        .context("parse Codex models response")?;
+    validate_codex_models_probe_payload(&payload)
+}
+
+fn validate_codex_models_probe_payload(payload: &serde_json::Value) -> anyhow::Result<()> {
+    let models = payload
+        .get("models")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| anyhow::anyhow!("Codex models response is missing models array"))?;
+    if models.is_empty() {
+        anyhow::bail!("Codex models response has empty models array");
+    }
+    Ok(())
 }
 
 fn codex_import_job_failure_result(
@@ -4737,6 +4816,7 @@ fn normalize_account_patch(
     Ok(AdminCodexAccountPatch {
         status,
         map_gpt53_codex_to_spark: request.map_gpt53_codex_to_spark,
+        auto_refresh_enabled: request.auto_refresh_enabled,
         proxy_mode,
         proxy_config_id,
         request_max_concurrency,
@@ -5386,6 +5466,24 @@ mod tests {
     }
 
     #[test]
+    fn normalize_account_patch_accepts_auto_refresh_toggle() {
+        let patch = normalize_account_patch(PatchLlmGatewayAccountRequest {
+            status: None,
+            proxy_mode: None,
+            proxy_config_id: None,
+            map_gpt53_codex_to_spark: None,
+            auto_refresh_enabled: Some(false),
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+            request_max_concurrency_unlimited: false,
+            request_min_start_interval_ms_unlimited: false,
+        })
+        .expect("auto refresh toggle should be accepted");
+
+        assert_eq!(patch.auto_refresh_enabled, Some(false));
+    }
+
+    #[test]
     fn effective_kiro_policy_merges_partial_override_with_global_policy() {
         let config = AdminRuntimeConfig::default();
         let keys = vec![sample_kiro_key(Some(
@@ -5577,6 +5675,7 @@ mod tests {
             primary_remaining_percent: None,
             secondary_remaining_percent: None,
             map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
             request_max_concurrency: Some(3),
             request_min_start_interval_ms: Some(1000),
             proxy_mode: "inherit".to_string(),
@@ -5585,6 +5684,8 @@ mod tests {
             effective_proxy_url: Some("http://127.0.0.1:11118".to_string()),
             effective_proxy_config_name: Some("us-home1".to_string()),
             last_refresh: Some(900),
+            access_token_expires_at: Some(1_800),
+            auth_refresh_error_message: None,
             last_usage_checked_at: None,
             last_usage_success_at: None,
             usage_error_message: None,
@@ -5614,7 +5715,7 @@ mod tests {
         assert_eq!(accounts[0].plan_type.as_deref(), Some("Pro"));
         assert_eq!(accounts[0].primary_remaining_percent, Some(62.0));
         assert_eq!(accounts[0].secondary_remaining_percent, Some(39.0));
-        assert_eq!(accounts[0].last_refresh, Some(1200));
+        assert_eq!(accounts[0].last_refresh, Some(900));
         assert_eq!(accounts[0].last_usage_checked_at, Some(1200));
         assert_eq!(accounts[0].last_usage_success_at, Some(1100));
         assert_eq!(accounts[0].usage_error_message.as_deref(), Some("upstream 503"));
@@ -5630,6 +5731,7 @@ mod tests {
             primary_remaining_percent: None,
             secondary_remaining_percent: None,
             map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
             request_max_concurrency: Some(3),
             request_min_start_interval_ms: Some(1000),
             proxy_mode: "inherit".to_string(),
@@ -5638,6 +5740,8 @@ mod tests {
             effective_proxy_url: Some("http://127.0.0.1:11118".to_string()),
             effective_proxy_config_name: Some("us-home1".to_string()),
             last_refresh: Some(900),
+            access_token_expires_at: Some(1_800),
+            auth_refresh_error_message: None,
             last_usage_checked_at: None,
             last_usage_success_at: None,
             usage_error_message: None,
@@ -5680,6 +5784,7 @@ mod tests {
             primary_remaining_percent: None,
             secondary_remaining_percent: None,
             map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
             request_max_concurrency: Some(3),
             request_min_start_interval_ms: Some(1000),
             proxy_mode: "inherit".to_string(),
@@ -5688,13 +5793,15 @@ mod tests {
             effective_proxy_url: Some("http://127.0.0.1:11118".to_string()),
             effective_proxy_config_name: Some("us-home1".to_string()),
             last_refresh: Some(1300),
-            last_usage_checked_at: None,
-            last_usage_success_at: None,
-            usage_error_message: Some(
+            access_token_expires_at: Some(1_800),
+            auth_refresh_error_message: Some(
                 "codex refresh token returned 401 Unauthorized: \
                  {\"error\":{\"code\":\"refresh_token_reused\"}}"
                     .to_string(),
             ),
+            last_usage_checked_at: None,
+            last_usage_success_at: None,
+            usage_error_message: None,
         }];
         let status = core_store::CodexRateLimitStatus {
             status: "ready".to_string(),
@@ -5720,8 +5827,9 @@ mod tests {
 
         assert_eq!(accounts[0].plan_type.as_deref(), Some("Pro"));
         assert_eq!(accounts[0].last_refresh, Some(1300));
+        assert_eq!(accounts[0].usage_error_message, None);
         assert_eq!(
-            accounts[0].usage_error_message.as_deref(),
+            accounts[0].auth_refresh_error_message.as_deref(),
             Some(
                 "codex refresh token returned 401 Unauthorized: \
                  {\"error\":{\"code\":\"refresh_token_reused\"}}"
@@ -5749,6 +5857,33 @@ mod tests {
         assert_eq!(auth.access_token, None);
         assert_eq!(stored["device_id"], "device-1");
         assert_eq!(stored["tokens"]["refreshToken"], " refresh-token ");
+    }
+
+    #[test]
+    fn codex_import_validation_prefers_present_access_token() {
+        let auth = normalize_imported_codex_auth(
+            Some(serde_json::json!({
+                "access_token": "access-token",
+                "refresh_token": "refresh-token",
+                "account_id": "acct-1"
+            })),
+            None,
+        )
+        .expect("normalize auth json");
+
+        assert!(should_validate_codex_access_token_directly(&auth));
+    }
+
+    #[test]
+    fn codex_access_token_validation_requires_models_payload() {
+        validate_codex_models_probe_payload(&serde_json::json!({
+            "models": [{"slug": "gpt-5.5"}]
+        }))
+        .expect("models payload should validate");
+
+        let err = validate_codex_models_probe_payload(&serde_json::json!({"models": []}))
+            .expect_err("empty models should not validate");
+        assert!(err.to_string().contains("models array"));
     }
 
     #[test]

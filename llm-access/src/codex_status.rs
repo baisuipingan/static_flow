@@ -182,7 +182,7 @@ pub(crate) async fn refresh_single_codex_account_status(
         route_store,
         status_store,
         account_name,
-        true,
+        false,
     )
     .await
 }
@@ -575,43 +575,116 @@ async fn fetch_route_usage(
 ) -> anyhow::Result<Vec<CodexRateLimitBucket>> {
     let mut force_refresh_attempt = force_refresh;
     loop {
-        let context =
-            codex_refresh::ensure_context_for_route(route, route_store, force_refresh_attempt)
-                .await?;
-        let source_url = compute_usage_url(&provider::codex_upstream_base_url());
-        let client_version =
-            provider::resolve_codex_client_version(Some(&config.codex_client_version));
-        let mut request = codex_refresh::provider_client(route.proxy.as_ref())?
-            .get(&source_url)
-            .header(reqwest::header::USER_AGENT, codex_user_agent(&client_version))
-            .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", context.access_token))
-            .header(reqwest::header::ACCEPT, "application/json")
-            .timeout(Duration::from_secs(20));
-        if let Some(account_id) = context.account_id.as_deref() {
-            request = request.header("ChatGPT-Account-Id", account_id);
+        let context = match codex_refresh::ensure_context_for_route(
+            route,
+            route_store,
+            force_refresh_attempt,
+        )
+        .await
+        {
+            Ok(context) => context,
+            Err(err) => {
+                if force_refresh_attempt && is_terminal_codex_auth_error(&format!("{err:#}")) {
+                    if let Some(context) =
+                        codex_refresh::current_unexpired_context_for_route(route, route_store)
+                            .await?
+                    {
+                        match fetch_route_usage_once(route, config, &context).await? {
+                            FetchRouteUsageOutcome::Ready(mut buckets) => {
+                                if let Err(disable_err) =
+                                    codex_refresh::disable_auto_refresh_for_route(
+                                        route,
+                                        route_store,
+                                    )
+                                    .await
+                                {
+                                    tracing::warn!(
+                                        account_name = %route.account_name,
+                                        error = ?disable_err,
+                                        "failed to disable Codex auto refresh after direct access-token usage fallback",
+                                    );
+                                }
+                                for bucket in &mut buckets {
+                                    bucket.account_name = Some(route.account_name.clone());
+                                }
+                                return Ok(buckets);
+                            },
+                            FetchRouteUsageOutcome::Unauthorized {
+                                body,
+                            } => {
+                                tracing::warn!(
+                                    account_name = %route.account_name,
+                                    body,
+                                    "Codex access token remained unusable after terminal refresh failure",
+                                );
+                            },
+                        }
+                    }
+                }
+                return Err(err);
+            },
+        };
+        match fetch_route_usage_once(route, config, &context).await? {
+            FetchRouteUsageOutcome::Ready(mut buckets) => {
+                for bucket in &mut buckets {
+                    bucket.account_name = Some(route.account_name.clone());
+                }
+                return Ok(buckets);
+            },
+            FetchRouteUsageOutcome::Unauthorized {
+                body,
+            } if !force_refresh_attempt => {
+                let _ = body;
+                force_refresh_attempt = true;
+            },
+            FetchRouteUsageOutcome::Unauthorized {
+                body,
+            } => {
+                anyhow::bail!("Codex usage status returned 401 Unauthorized: {body}");
+            },
         }
-        if context.is_fedramp_account {
-            request = request.header("X-OpenAI-Fedramp", "true");
-        }
-
-        let response = request.send().await.context("request Codex usage status")?;
-        let status = response.status();
-        let body = response.text().await.unwrap_or_default();
-        if status == reqwest::StatusCode::UNAUTHORIZED && !force_refresh_attempt {
-            force_refresh_attempt = true;
-            continue;
-        }
-        if !status.is_success() {
-            anyhow::bail!("Codex usage status returned {status}: {body}");
-        }
-        let payload = serde_json::from_str::<UsageStatusPayload>(&body)
-            .context("parse Codex usage status")?;
-        let mut buckets = map_rate_limit_status_payload(payload);
-        for bucket in &mut buckets {
-            bucket.account_name = Some(route.account_name.clone());
-        }
-        return Ok(buckets);
     }
+}
+
+enum FetchRouteUsageOutcome {
+    Ready(Vec<CodexRateLimitBucket>),
+    Unauthorized { body: String },
+}
+
+async fn fetch_route_usage_once(
+    route: &ProviderCodexRoute,
+    config: &AdminRuntimeConfig,
+    context: &codex_refresh::CodexCallContext,
+) -> anyhow::Result<FetchRouteUsageOutcome> {
+    let source_url = compute_usage_url(&provider::codex_upstream_base_url());
+    let client_version = provider::resolve_codex_client_version(Some(&config.codex_client_version));
+    let mut request = codex_refresh::provider_client(route.proxy.as_ref())?
+        .get(&source_url)
+        .header(reqwest::header::USER_AGENT, codex_user_agent(&client_version))
+        .header(reqwest::header::AUTHORIZATION, format!("Bearer {}", context.access_token))
+        .header(reqwest::header::ACCEPT, "application/json")
+        .timeout(Duration::from_secs(20));
+    if let Some(account_id) = context.account_id.as_deref() {
+        request = request.header("ChatGPT-Account-Id", account_id);
+    }
+    if context.is_fedramp_account {
+        request = request.header("X-OpenAI-Fedramp", "true");
+    }
+
+    let response = request.send().await.context("request Codex usage status")?;
+    let status = response.status();
+    let body = response.text().await.unwrap_or_default();
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return Ok(FetchRouteUsageOutcome::Unauthorized {
+            body,
+        });
+    }
+    if !status.is_success() {
+        anyhow::bail!("Codex usage status returned {status}: {body}");
+    }
+    let payload =
+        serde_json::from_str::<UsageStatusPayload>(&body).context("parse Codex usage status")?;
+    Ok(FetchRouteUsageOutcome::Ready(map_rate_limit_status_payload(payload)))
 }
 
 #[derive(Clone)]
@@ -905,6 +978,7 @@ mod tests {
             primary_remaining_percent: None,
             secondary_remaining_percent: None,
             map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
             proxy_mode: "inherit".to_string(),
@@ -913,6 +987,8 @@ mod tests {
             effective_proxy_url: None,
             effective_proxy_config_name: None,
             last_refresh: Some(100),
+            access_token_expires_at: None,
+            auth_refresh_error_message: None,
             last_usage_checked_at: None,
             last_usage_success_at: None,
             usage_error_message: None,

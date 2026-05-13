@@ -80,6 +80,15 @@ pub(crate) async fn ensure_context_for_route(
     if force_refresh && auth_parts_changed(&initial, &latest) && !latest_access_token_is_expired {
         return Ok(latest.into_context());
     }
+    if !latest_route.auth_refresh_enabled {
+        let err = if latest_access_token_is_expired {
+            anyhow!("codex auth refresh disabled and current access token expired")
+        } else {
+            anyhow!("codex auth refresh disabled for account `{}`", latest_route.account_name)
+        };
+        persist_codex_refresh_error(store, &latest_route, &latest, &err).await;
+        return Err(err);
+    }
 
     let refreshed = match refresh_auth(&latest_route, &latest).await {
         Ok(refreshed) => refreshed,
@@ -118,6 +127,32 @@ pub(crate) async fn refresh_auth_json_for_route(
         last_error: None,
         refreshed_at_ms: now_ms(),
     })
+}
+
+pub(crate) async fn current_unexpired_context_for_route(
+    route: &ProviderCodexRoute,
+    store: &dyn ProviderRouteStore,
+) -> anyhow::Result<Option<CodexCallContext>> {
+    let Some(latest_route) = store
+        .resolve_codex_account_route(&route.account_name)
+        .await?
+    else {
+        return Ok(None);
+    };
+    let latest = parse_auth_parts_allow_missing_access(&latest_route.auth_json)?;
+    if latest.access_token.is_empty() || access_token_is_expired(&latest.access_token) {
+        return Ok(None);
+    }
+    Ok(Some(latest.into_context()))
+}
+
+pub(crate) async fn disable_auto_refresh_for_route(
+    route: &ProviderCodexRoute,
+    store: &dyn ProviderRouteStore,
+) -> anyhow::Result<()> {
+    store
+        .set_codex_account_auto_refresh_enabled(&route.account_name, false, now_ms())
+        .await
 }
 
 fn auth_parts_changed(previous: &CodexAuthParts, latest: &CodexAuthParts) -> bool {
@@ -365,7 +400,7 @@ fn refreshed_auth_json(
     serde_json::to_string(&value).context("serialize refreshed codex auth")
 }
 
-fn access_token_is_expired(token: &str) -> bool {
+pub(crate) fn access_token_is_expired(token: &str) -> bool {
     let Some(expires_at) = access_token_expiry(token) else {
         return false;
     };
@@ -380,7 +415,7 @@ fn access_token_expiry(token: &str) -> Option<DateTime<Utc>> {
     DateTime::from_timestamp(exp, 0)
 }
 
-fn id_token_is_fedramp_account(id_token: &str) -> bool {
+pub(crate) fn id_token_is_fedramp_account(id_token: &str) -> bool {
     let Some(payload_b64) = id_token.split('.').nth(1) else {
         return false;
     };
@@ -497,6 +532,15 @@ mod tests {
             self.codex_updates.lock().expect("updates").push(update);
             Ok(())
         }
+
+        async fn set_codex_account_auto_refresh_enabled(
+            &self,
+            _account_name: &str,
+            _enabled: bool,
+            _updated_at_ms: i64,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
     }
 
     #[tokio::test]
@@ -567,6 +611,45 @@ mod tests {
         assert_eq!(updates[0].last_error.as_deref(), Some(err_text.as_str()));
     }
 
+    #[tokio::test]
+    async fn disabled_auto_refresh_uses_existing_access_token_without_refresh() {
+        let mut route = codex_route_with_auth(auth_json(future_token(), Some("refresh-token")));
+        route.auth_refresh_enabled = false;
+        let store = TestRouteStore {
+            latest_codex_route: Arc::new(Mutex::new(Some(route.clone()))),
+            codex_updates: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let context = ensure_context_for_route(&route, &store, false)
+            .await
+            .expect("valid access token should still be usable");
+
+        assert!(!context.access_token.is_empty());
+        assert!(store.codex_updates.lock().expect("updates").is_empty());
+    }
+
+    #[tokio::test]
+    async fn disabled_auto_refresh_blocks_refresh_when_access_token_is_expired() {
+        let mut route = codex_route_with_auth(auth_json(expired_token(), Some("refresh-token")));
+        route.auth_refresh_enabled = false;
+        let store = TestRouteStore {
+            latest_codex_route: Arc::new(Mutex::new(Some(route.clone()))),
+            codex_updates: Arc::new(Mutex::new(Vec::new())),
+        };
+
+        let err = ensure_context_for_route(&route, &store, false)
+            .await
+            .expect_err("disabled auto refresh should block refresh attempts");
+
+        assert!(err.to_string().contains("refresh disabled"));
+        let updates = store.codex_updates.lock().expect("updates");
+        assert_eq!(updates.len(), 1);
+        assert!(updates[0]
+            .last_error
+            .as_deref()
+            .is_some_and(|message| message.contains("refresh disabled")));
+    }
+
     fn codex_route_with_auth(auth_json: String) -> ProviderCodexRoute {
         ProviderCodexRoute {
             account_name: "codex-account".to_string(),
@@ -574,6 +657,7 @@ mod tests {
             route_strategy_at_event: RouteStrategy::Auto,
             auth_json,
             map_gpt53_codex_to_spark: false,
+            auth_refresh_enabled: true,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
             account_request_max_concurrency: None,

@@ -345,6 +345,41 @@ fn format_relative_age_from_ms(now_ms: i64, timestamp_ms: Option<i64>) -> String
     format_optional_duration_ms(age_ms)
 }
 
+fn format_future_duration_ms(remaining_ms: i64) -> String {
+    if remaining_ms >= 24 * 3_600_000 {
+        format!("{:.1} d", remaining_ms as f64 / (24.0 * 3_600_000.0))
+    } else if remaining_ms >= 3_600_000 {
+        format!("{:.1} h", remaining_ms as f64 / 3_600_000.0)
+    } else if remaining_ms >= 60_000 {
+        format!("{:.1} min", remaining_ms as f64 / 60_000.0)
+    } else if remaining_ms >= 1_000 {
+        format!("{:.1} s", remaining_ms as f64 / 1_000.0)
+    } else {
+        format!("{remaining_ms} ms")
+    }
+}
+
+fn format_access_token_expiry(now_ms: i64, expires_at_ms: Option<i64>) -> String {
+    let Some(expires_at_ms) = expires_at_ms else {
+        return "access token expiry -".to_string();
+    };
+    let absolute = format_ms(expires_at_ms);
+    let remaining_ms = expires_at_ms.saturating_sub(now_ms);
+    if remaining_ms > 0 {
+        format!(
+            "access token expires {} · ~{} left",
+            absolute,
+            format_future_duration_ms(remaining_ms)
+        )
+    } else {
+        format!(
+            "access token expired {} ago · {}",
+            format_optional_duration_ms(Some(remaining_ms.saturating_abs())),
+            absolute
+        )
+    }
+}
+
 fn render_usage_journal_file_list(
     title: &str,
     files: &[AdminUsageJournalFileView],
@@ -3845,6 +3880,55 @@ pub fn admin_llm_gateway_page() -> Html {
                     &PatchAdminLlmGatewayAccountInput {
                         status: None,
                         map_gpt53_codex_to_spark: Some(enabled),
+                        auto_refresh_enabled: None,
+                        proxy_mode: None,
+                        proxy_config_id: None,
+                        request_max_concurrency: None,
+                        request_min_start_interval_ms: None,
+                        request_max_concurrency_unlimited: false,
+                        request_min_start_interval_ms_unlimited: false,
+                    },
+                )
+                .await
+                {
+                    Ok(updated) => {
+                        let mut items = (*accounts).clone();
+                        if let Some(item) = items.iter_mut().find(|item| item.name == updated.name)
+                        {
+                            *item = updated;
+                        }
+                        accounts.set(items);
+                        load_error.set(None);
+                    },
+                    Err(err) => load_error.set(Some(err)),
+                }
+
+                let mut inflight = (*account_action_inflight).clone();
+                inflight.remove(&account_name);
+                account_action_inflight.set(inflight);
+            });
+        })
+    };
+
+    let on_toggle_account_auto_refresh = {
+        let account_action_inflight = account_action_inflight.clone();
+        let accounts = accounts.clone();
+        let load_error = load_error.clone();
+        Callback::from(move |(account_name, enabled): (String, bool)| {
+            let account_action_inflight = account_action_inflight.clone();
+            let accounts = accounts.clone();
+            let load_error = load_error.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                let mut inflight = (*account_action_inflight).clone();
+                inflight.insert(account_name.clone());
+                account_action_inflight.set(inflight);
+
+                match patch_admin_llm_gateway_account(
+                    &account_name,
+                    &PatchAdminLlmGatewayAccountInput {
+                        status: None,
+                        map_gpt53_codex_to_spark: None,
+                        auto_refresh_enabled: Some(enabled),
                         proxy_mode: None,
                         proxy_config_id: None,
                         request_max_concurrency: None,
@@ -3892,6 +3976,7 @@ pub fn admin_llm_gateway_page() -> Html {
                     &PatchAdminLlmGatewayAccountInput {
                         status: Some(status),
                         map_gpt53_codex_to_spark: None,
+                        auto_refresh_enabled: None,
                         proxy_mode: None,
                         proxy_config_id: None,
                         request_max_concurrency: None,
@@ -3990,6 +4075,7 @@ pub fn admin_llm_gateway_page() -> Html {
                     &PatchAdminLlmGatewayAccountInput {
                         status: None,
                         map_gpt53_codex_to_spark: None,
+                        auto_refresh_enabled: None,
                         proxy_mode,
                         proxy_config_id,
                         request_max_concurrency,
@@ -6655,6 +6741,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         <div class={classes!("mt-4", "space-y-2")}>
                             { for accounts.iter().map(|acc| {
                                 let acc_name_for_toggle = acc.name.clone();
+                                let acc_name_for_auto_refresh_toggle = acc.name.clone();
                                 let acc_name_for_status_toggle = acc.name.clone();
                                 let acc_name_for_delete = acc.name.clone();
                                 let acc_name_for_refresh = acc.name.clone();
@@ -6673,6 +6760,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                 let acc_plan_type = acc.plan_type.clone();
                                 let acc_account_id = acc.account_id.clone();
                                 let spark_mapping_enabled = acc.map_gpt53_codex_to_spark;
+                                let auto_refresh_enabled = acc.auto_refresh_enabled;
                                 let selected_proxy_value = (*account_proxy_inputs)
                                     .get(&acc_name)
                                     .cloned()
@@ -6712,6 +6800,10 @@ pub fn admin_llm_gateway_page() -> Html {
                                     .last_refresh
                                     .map(format_ms)
                                     .unwrap_or_else(|| "-".to_string());
+                                let access_token_expiry_line = format_access_token_expiry(
+                                    Date::now() as i64,
+                                    acc.access_token_expires_at,
+                                );
                                 let last_usage_checked_line = acc
                                     .last_usage_checked_at
                                     .map(format_ms)
@@ -6725,6 +6817,8 @@ pub fn admin_llm_gateway_page() -> Html {
                                 let on_toggle_account_status = on_toggle_account_status.clone();
                                 let on_toggle_account_spark_mapping =
                                     on_toggle_account_spark_mapping.clone();
+                                let on_toggle_account_auto_refresh =
+                                    on_toggle_account_auto_refresh.clone();
                                 let on_save_account_settings = on_save_account_settings.clone();
                                 let primary_pct = acc.primary_remaining_percent
                                     .map(|v| format!("{:.0}%", v))
@@ -6765,10 +6859,17 @@ pub fn admin_llm_gateway_page() -> Html {
                                                     { scheduler_line.clone() }
                                                 </div>
                                                 <div class={classes!("mt-1", "text-xs", "font-mono", "text-[var(--muted)]", "flex", "gap-3", "flex-wrap")}>
+                                                    <span>{ if auto_refresh_enabled { "auto refresh on" } else { "auto refresh off" } }</span>
                                                     <span>{ format!("token refresh {}", last_refresh_line) }</span>
+                                                    <span>{ access_token_expiry_line.clone() }</span>
                                                     <span>{ format!("usage checked {}", last_usage_checked_line) }</span>
                                                     <span>{ format!("usage success {}", last_usage_success_line) }</span>
                                                 </div>
+                                                if let Some(auth_error) = acc.auth_refresh_error_message.as_deref() {
+                                                    <div class={classes!("mt-2", "max-w-3xl", "text-xs", "leading-5", "text-amber-700", "dark:text-amber-300")}>
+                                                        { format!("auth refresh error: {}", auth_error) }
+                                                    </div>
+                                                }
                                                 if let Some(usage_error) = acc.usage_error_message.as_deref() {
                                                     <div class={classes!("mt-2", "max-w-3xl", "text-xs", "leading-5", "text-amber-700", "dark:text-amber-300")}>
                                                         { format!("usage refresh error: {}", usage_error) }
@@ -6853,6 +6954,33 @@ pub fn admin_llm_gateway_page() -> Html {
                                                     disabled={account_busy}
                                                 >
                                                     { if account_busy { "处理中..." } else { "刷新状态" } }
+                                                </button>
+                                                <button
+                                                    class={classes!(
+                                                        "btn-terminal",
+                                                        if auto_refresh_enabled {
+                                                            "btn-terminal-primary"
+                                                        } else {
+                                                            ""
+                                                        }
+                                                    )}
+                                                    onclick={Callback::from(move |_| {
+                                                        on_toggle_account_auto_refresh.emit((
+                                                            acc_name_for_auto_refresh_toggle.clone(),
+                                                            !auto_refresh_enabled,
+                                                        ))
+                                                    })}
+                                                    disabled={account_busy}
+                                                >
+                                                    {
+                                                        if account_busy {
+                                                            "切换中..."
+                                                        } else if auto_refresh_enabled {
+                                                            "Auto Refresh 已开"
+                                                        } else {
+                                                            "Auto Refresh 已关"
+                                                        }
+                                                    }
                                                 </button>
                                                 <button
                                                     class={classes!("btn-terminal")}

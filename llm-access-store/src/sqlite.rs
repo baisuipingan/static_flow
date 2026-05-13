@@ -298,6 +298,7 @@ pub struct KiroAccountRecord {
 #[serde(default)]
 struct CodexAccountSettings {
     map_gpt53_codex_to_spark: bool,
+    auth_refresh_enabled: bool,
     proxy_mode: String,
     proxy_config_id: Option<String>,
     request_max_concurrency: Option<u64>,
@@ -308,6 +309,7 @@ impl Default for CodexAccountSettings {
     fn default() -> Self {
         Self {
             map_gpt53_codex_to_spark: false,
+            auth_refresh_enabled: true,
             proxy_mode: "inherit".to_string(),
             proxy_config_id: None,
             request_max_concurrency: None,
@@ -667,12 +669,21 @@ impl SqliteControlStore {
                 settings.proxy_config_id.as_deref(),
                 &proxy_context,
             )?;
+            let cached_error_message = codex_cached_error_message(
+                &account_name,
+                record.last_error.as_deref(),
+                record.last_refresh_at_ms,
+                settings.auth_refresh_enabled,
+                &record.auth_json,
+                &status_by_account,
+            );
             routes.push(ProviderCodexRoute {
                 account_name: record.account_name,
                 account_group_id_at_event: account_group_id_at_event.clone(),
                 route_strategy_at_event,
                 auth_json: record.auth_json,
                 map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
+                auth_refresh_enabled: settings.auth_refresh_enabled,
                 request_max_concurrency: bundle
                     .route
                     .request_max_concurrency
@@ -683,12 +694,7 @@ impl SqliteControlStore {
                     .and_then(non_negative_i64_to_u64),
                 account_request_max_concurrency: settings.request_max_concurrency,
                 account_request_min_start_interval_ms: settings.request_min_start_interval_ms,
-                cached_error_message: codex_cached_error_message(
-                    &account_name,
-                    record.last_error.as_deref(),
-                    record.last_refresh_at_ms,
-                    &status_by_account,
-                ),
+                cached_error_message,
                 proxy,
             });
         }
@@ -1625,6 +1631,7 @@ impl SqliteControlStore {
     ) -> anyhow::Result<AdminCodexAccount> {
         let settings = CodexAccountSettings {
             map_gpt53_codex_to_spark: account.map_gpt53_codex_to_spark,
+            auth_refresh_enabled: account.auto_refresh_enabled,
             ..CodexAccountSettings::default()
         };
         let record = CodexAccountRecord {
@@ -1661,6 +1668,9 @@ impl SqliteControlStore {
         let mut settings = decode_codex_account_settings(&record.settings_json)?;
         if let Some(value) = patch.map_gpt53_codex_to_spark {
             settings.map_gpt53_codex_to_spark = value;
+        }
+        if let Some(value) = patch.auto_refresh_enabled {
+            settings.auth_refresh_enabled = value;
         }
         if let Some(value) = patch.proxy_mode.as_ref() {
             settings.proxy_mode = value.clone();
@@ -1727,6 +1737,27 @@ impl SqliteControlStore {
         self.upsert_codex_account(&record)
     }
 
+    /// Enable or disable automatic auth refresh for one Codex account.
+    pub fn set_codex_account_auto_refresh_enabled(
+        &self,
+        account_name: &str,
+        enabled: bool,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let Some(mut record) = self.get_codex_account(account_name)? else {
+            anyhow::bail!("codex account `{account_name}` is not configured");
+        };
+        let mut settings = decode_codex_account_settings(&record.settings_json)?;
+        if settings.auth_refresh_enabled == enabled {
+            return Ok(());
+        }
+        settings.auth_refresh_enabled = enabled;
+        record.settings_json =
+            serde_json::to_string(&settings).context("serialize codex settings")?;
+        record.updated_at_ms = updated_at_ms;
+        self.upsert_codex_account(&record)
+    }
+
     /// Resolve one Codex account as a provider route for admin refresh.
     pub fn resolve_admin_codex_account_route(
         &self,
@@ -1754,22 +1785,26 @@ impl SqliteControlStore {
                     .collect::<BTreeMap<_, _>>()
             })
             .unwrap_or_default();
+        let cached_error_message = codex_cached_error_message(
+            &record.account_name,
+            record.last_error.as_deref(),
+            record.last_refresh_at_ms,
+            settings.auth_refresh_enabled,
+            &record.auth_json,
+            &status_by_account,
+        );
         Ok(Some(ProviderCodexRoute {
             account_name: record.account_name.clone(),
             account_group_id_at_event: None,
             route_strategy_at_event: RouteStrategy::Auto,
             auth_json: record.auth_json,
             map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
+            auth_refresh_enabled: settings.auth_refresh_enabled,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
             account_request_max_concurrency: settings.request_max_concurrency,
             account_request_min_start_interval_ms: settings.request_min_start_interval_ms,
-            cached_error_message: codex_cached_error_message(
-                &record.account_name,
-                record.last_error.as_deref(),
-                record.last_refresh_at_ms,
-                &status_by_account,
-            ),
+            cached_error_message,
             proxy,
         }))
     }
@@ -2100,6 +2135,7 @@ impl SqliteControlStore {
             primary_remaining_percent: None,
             secondary_remaining_percent: None,
             map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
+            auto_refresh_enabled: settings.auth_refresh_enabled,
             request_max_concurrency: settings.request_max_concurrency,
             request_min_start_interval_ms: settings.request_min_start_interval_ms,
             proxy_mode: settings.proxy_mode,
@@ -2108,9 +2144,13 @@ impl SqliteControlStore {
             effective_proxy_url,
             effective_proxy_config_name,
             last_refresh: record.last_refresh_at_ms,
+            access_token_expires_at: core_store::codex_auth_access_token_expires_at_ms(
+                &record.auth_json,
+            ),
+            auth_refresh_error_message: record.last_error.clone(),
             last_usage_checked_at: None,
             last_usage_success_at: None,
-            usage_error_message: record.last_error.clone(),
+            usage_error_message: None,
         })
     }
 
@@ -4698,8 +4738,12 @@ fn codex_cached_error_message(
     account_name: &str,
     record_last_error: Option<&str>,
     record_last_refresh_at_ms: Option<i64>,
+    auth_refresh_enabled: bool,
+    auth_json: &str,
     status_by_account: &BTreeMap<String, core_store::CodexPublicAccountStatus>,
 ) -> Option<String> {
+    let local_auth_error =
+        codex_local_auth_error_message(record_last_error, auth_refresh_enabled, auth_json);
     match status_by_account.get(account_name) {
         Some(status) => {
             if status.usage_error_message.is_some() {
@@ -4708,13 +4752,46 @@ fn codex_cached_error_message(
             let local_refresh = record_last_refresh_at_ms.unwrap_or(0);
             let status_checked_at = status.last_usage_checked_at.unwrap_or(0);
             if local_refresh > status_checked_at {
-                record_last_error.map(str::to_string)
+                local_auth_error
             } else {
-                None
+                codex_disabled_expired_auth_error(auth_refresh_enabled, auth_json)
             }
         },
-        None => record_last_error.map(str::to_string),
+        None => local_auth_error,
     }
+}
+
+fn codex_local_auth_error_message(
+    record_last_error: Option<&str>,
+    auth_refresh_enabled: bool,
+    auth_json: &str,
+) -> Option<String> {
+    if auth_refresh_enabled {
+        return record_last_error.map(str::to_string);
+    }
+    if codex_access_token_is_still_usable(auth_json) {
+        return None;
+    }
+    record_last_error
+        .map(str::to_string)
+        .or_else(|| codex_disabled_expired_auth_error(auth_refresh_enabled, auth_json))
+}
+
+fn codex_disabled_expired_auth_error(
+    auth_refresh_enabled: bool,
+    auth_json: &str,
+) -> Option<String> {
+    if auth_refresh_enabled || codex_access_token_is_still_usable(auth_json) {
+        return None;
+    }
+    Some("codex auth refresh disabled and current access token expired".to_string())
+}
+
+fn codex_access_token_is_still_usable(auth_json: &str) -> bool {
+    let Some(expires_at_ms) = core_store::codex_auth_access_token_expires_at_ms(auth_json) else {
+        return true;
+    };
+    expires_at_ms > now_ms()
 }
 
 fn effective_kiro_cache_policy_json(
@@ -5720,6 +5797,7 @@ mod tests {
                     account_id: Some("acct-action".to_string()),
                     auth_json: r#"{"tokens":{"access_token":"access-token"}}"#.to_string(),
                     map_gpt53_codex_to_spark: false,
+                    auto_refresh_enabled: true,
                     created_at_ms: 400,
                 }),
                 Some(&llm_access_core::store::NewAdminAccountGroup {
@@ -5799,6 +5877,7 @@ mod tests {
             account_id: Some("acct-route".to_string()),
             auth_json: r#"{"access_token":"access-route"}"#.to_string(),
             map_gpt53_codex_to_spark: true,
+            auto_refresh_enabled: true,
             created_at_ms: 100,
         })
         .expect("create codex account");
@@ -5816,6 +5895,7 @@ mod tests {
             &llm_access_core::store::AdminCodexAccountPatch {
                 status: None,
                 map_gpt53_codex_to_spark: None,
+                auto_refresh_enabled: Some(false),
                 proxy_mode: Some("fixed".to_string()),
                 proxy_config_id: Some(Some("proxy-codex-route".to_string())),
                 request_max_concurrency: Some(Some(3)),
@@ -5880,6 +5960,7 @@ mod tests {
         assert_eq!(route.route_strategy_at_event, llm_access_core::provider::RouteStrategy::Fixed);
         assert_eq!(route.auth_json, r#"{"access_token":"access-route"}"#);
         assert!(route.map_gpt53_codex_to_spark);
+        assert!(!route.auth_refresh_enabled);
         assert_eq!(route.request_max_concurrency, Some(2));
         assert_eq!(route.request_min_start_interval_ms, Some(50));
         assert_eq!(route.account_request_max_concurrency, Some(3));
@@ -5899,6 +5980,7 @@ mod tests {
             account_id: Some("acct-1".to_string()),
             auth_json: r#"{"refresh_token":"rt-1"}"#.to_string(),
             map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
             created_at_ms: 100,
         })
         .expect("create codex account");
@@ -5981,6 +6063,7 @@ mod tests {
                 account_id: Some(format!("acct-{name}")),
                 auth_json: format!(r#"{{"access_token":"access-{name}"}}"#),
                 map_gpt53_codex_to_spark: false,
+                auto_refresh_enabled: true,
                 created_at_ms,
             })
             .expect("create codex account");
@@ -6047,6 +6130,7 @@ mod tests {
             account_id: Some("acct-DogDu".to_string()),
             auth_json: r#"{"access_token":"access-DogDu"}"#.to_string(),
             map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
             created_at_ms: 100,
         })
         .expect("create codex account");
@@ -6118,6 +6202,7 @@ mod tests {
             account_id: Some("acct-DogDu".to_string()),
             auth_json: r#"{"access_token":"access-DogDu"}"#.to_string(),
             map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
             created_at_ms: 100,
         })
         .expect("create codex account");
@@ -6182,6 +6267,146 @@ mod tests {
                 "codex refresh token returned 401 Unauthorized: \
                  {\"error\":{\"code\":\"refresh_token_invalidated\"}}"
             )
+        );
+    }
+
+    #[test]
+    fn provider_route_repository_ignores_terminal_refresh_error_when_auto_refresh_is_disabled_and_access_token_is_still_usable(
+    ) {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlStore::new(conn);
+        let future_token = "eyJhbGciOiJub25lIn0.eyJleHAiOjQxMDI0NDQ4MDB9.";
+
+        repo.create_admin_codex_account(&llm_access_core::store::NewAdminCodexAccount {
+            name: "DogDu".to_string(),
+            account_id: Some("acct-DogDu".to_string()),
+            auth_json: format!(r#"{{"access_token":"{future_token}"}}"#),
+            map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: false,
+            created_at_ms: 100,
+        })
+        .expect("create codex account");
+        repo.save_codex_auth_update(&llm_access_core::store::ProviderCodexAuthUpdate {
+            account_name: "DogDu".to_string(),
+            auth_json: format!(r#"{{"access_token":"{future_token}"}}"#),
+            account_id: Some("acct-DogDu".to_string()),
+            status: "active".to_string(),
+            last_error: Some(
+                "codex refresh token returned 401 Unauthorized: \
+                 {\"error\":{\"code\":\"refresh_token_invalidated\"}}"
+                    .to_string(),
+            ),
+            refreshed_at_ms: 300,
+        })
+        .expect("persist local auth error");
+        repo.create_admin_key(&llm_access_core::store::NewAdminKey {
+            id: "key-auto".to_string(),
+            name: "auto key".to_string(),
+            secret: "sfk_auto".to_string(),
+            key_hash: "hash-auto".to_string(),
+            provider_type: "codex".to_string(),
+            protocol_family: "openai".to_string(),
+            public_visible: false,
+            quota_billable_limit: 1000,
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+            created_at_ms: 110,
+        })
+        .expect("create key");
+        repo.upsert_codex_rate_limit_status(
+            &llm_access_core::store::CodexRateLimitStatus {
+                status: "ready".to_string(),
+                refresh_interval_seconds: 300,
+                last_checked_at: Some(400),
+                last_success_at: Some(400),
+                source_url: "https://chatgpt.com/backend-api/wham/usage".to_string(),
+                error_message: None,
+                accounts: vec![codex_public_status("DogDu", 55.0, 66.0)],
+                buckets: Vec::new(),
+            },
+            400,
+        )
+        .expect("persist ready codex status");
+
+        let routes = repo
+            .resolve_provider_codex_routes(&llm_access_core::store::AuthenticatedKey {
+                key_id: "key-auto".to_string(),
+                key_name: "auto key".to_string(),
+                provider_type: "codex".to_string(),
+                protocol_family: "openai".to_string(),
+                status: "active".to_string(),
+                quota_billable_limit: 1000,
+                billable_tokens_used: 0,
+            })
+            .expect("resolve routes");
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(routes[0].cached_error_message, None);
+    }
+
+    #[test]
+    fn provider_route_repository_marks_disabled_auto_refresh_account_unavailable_after_access_token_expires(
+    ) {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlStore::new(conn);
+        let expired_token = "eyJhbGciOiJub25lIn0.eyJleHAiOjF9.";
+
+        repo.create_admin_codex_account(&llm_access_core::store::NewAdminCodexAccount {
+            name: "DogDu".to_string(),
+            account_id: Some("acct-DogDu".to_string()),
+            auth_json: format!(r#"{{"access_token":"{expired_token}"}}"#),
+            map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: false,
+            created_at_ms: 100,
+        })
+        .expect("create codex account");
+        repo.create_admin_key(&llm_access_core::store::NewAdminKey {
+            id: "key-auto".to_string(),
+            name: "auto key".to_string(),
+            secret: "sfk_auto".to_string(),
+            key_hash: "hash-auto".to_string(),
+            provider_type: "codex".to_string(),
+            protocol_family: "openai".to_string(),
+            public_visible: false,
+            quota_billable_limit: 1000,
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+            created_at_ms: 110,
+        })
+        .expect("create key");
+        repo.upsert_codex_rate_limit_status(
+            &llm_access_core::store::CodexRateLimitStatus {
+                status: "ready".to_string(),
+                refresh_interval_seconds: 300,
+                last_checked_at: Some(400),
+                last_success_at: Some(400),
+                source_url: "https://chatgpt.com/backend-api/wham/usage".to_string(),
+                error_message: None,
+                accounts: vec![codex_public_status("DogDu", 55.0, 66.0)],
+                buckets: Vec::new(),
+            },
+            400,
+        )
+        .expect("persist ready codex status");
+
+        let routes = repo
+            .resolve_provider_codex_routes(&llm_access_core::store::AuthenticatedKey {
+                key_id: "key-auto".to_string(),
+                key_name: "auto key".to_string(),
+                provider_type: "codex".to_string(),
+                protocol_family: "openai".to_string(),
+                status: "active".to_string(),
+                quota_billable_limit: 1000,
+                billable_tokens_used: 0,
+            })
+            .expect("resolve routes");
+
+        assert_eq!(routes.len(), 1);
+        assert_eq!(
+            routes[0].cached_error_message.as_deref(),
+            Some("codex auth refresh disabled and current access token expired")
         );
     }
 
@@ -6710,6 +6935,7 @@ mod tests {
             account_id: None,
             auth_json: r#"{"tokens":{"access_token":"access"}}"#.to_string(),
             map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
             created_at_ms: 40,
         })
         .expect("create existing account");
