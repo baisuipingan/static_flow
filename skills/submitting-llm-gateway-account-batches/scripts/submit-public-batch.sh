@@ -143,6 +143,48 @@ require_cmd find
 require_cmd sort
 require_cmd mktemp
 
+extract_sub2api_auth_json() {
+  local file_path account_index
+  file_path=$1
+  account_index=$2
+  jq -c --argjson account_index "$account_index" '
+    .accounts[$account_index] as $account
+    | ($account.credentials // {}) as $credentials
+    | {
+        account_id: (
+          $credentials.chatgpt_account_id
+          // $credentials.account_id
+          // $credentials.accountId
+        ),
+        id_token: ($credentials.id_token // $credentials.idToken),
+        access_token: ($credentials.access_token // $credentials.accessToken),
+        refresh_token: ($credentials.refresh_token // $credentials.refreshToken)
+      }
+      | with_entries(select(.value != null and (.value | tostring | length) > 0))
+  ' "$file_path"
+}
+
+list_file_entries() {
+  local file_path stem base_name total_accounts
+  file_path=$1
+  stem=$(basename "$file_path")
+  stem=${stem%.json}
+  total_accounts=$(jq 'if (.accounts | type) == "array" then (.accounts | length) else 0 end' "$file_path")
+  if [[ "$total_accounts" =~ ^[0-9]+$ ]] && ((total_accounts > 0)); then
+    for ((i=0; i<total_accounts; i++)); do
+      base_name=$(jq -r --argjson account_index "$i" '
+        .accounts[$account_index].name // .accounts[$account_index].credentials.email // empty
+      ' "$file_path")
+      if [[ -z "$base_name" || "$base_name" == "null" ]]; then
+        base_name="${stem}_acct$((i+1))"
+      fi
+      printf '%s\t%s\t%s\n' "$file_path" "$i" "$base_name"
+    done
+    return 0
+  fi
+  printf '%s\t-1\t%s\n' "$file_path" "$stem"
+}
+
 if [[ -z "$dir" || -z "$base_url" || -z "$message" ]]; then
   usage >&2
   exit 1
@@ -172,30 +214,58 @@ if ((${#files[@]} == 0)); then
   exit 1
 fi
 
+entries=()
+for file_path in "${files[@]}"; do
+  while IFS=$'\t' read -r entry_file entry_index entry_base_name; do
+    [[ -n "$entry_file" ]] || continue
+    entries+=("${entry_file}"$'\t'"${entry_index}"$'\t'"${entry_base_name}")
+  done < <(list_file_entries "$file_path")
+done
+
+if ((${#entries[@]} == 0)); then
+  echo "no valid auth entries found under: $dir" >&2
+  exit 1
+fi
+
 timestamp=$(date -u +%Y%m%dT%H%M%SZ)
 summary_file="/tmp/llm-gateway-account-batch-submit-${timestamp}.jsonl"
 : > "$summary_file"
 
 echo "files: ${#files[@]}"
+echo "entries: ${#entries[@]}"
 echo "endpoint: $endpoint"
 echo "summary_file: $summary_file"
 
 start=0
 batch_number=0
-while ((start < ${#files[@]})); do
+while ((start < ${#entries[@]})); do
   batch_number=$((batch_number + 1))
-  batch_files=("${files[@]:start:batch_size}")
-  start=$((start + ${#batch_files[@]}))
+  batch_entries=("${entries[@]:start:batch_size}")
+  start=$((start + ${#batch_entries[@]}))
 
   items_file=$(mktemp)
   payload_file=$(mktemp)
   response_file=$(mktemp)
   trap 'rm -f "$items_file" "$payload_file" "$response_file"' EXIT
 
-  for file_path in "${batch_files[@]}"; do
+  for entry in "${batch_entries[@]}"; do
+    IFS=$'\t' read -r file_path account_index account_base_name <<<"$entry"
     jq -e . "$file_path" >/dev/null
-    account_name=$(derive_account_name "$file_path")
-    build_item_json "$file_path" "$account_name" >>"$items_file"
+    if [[ "$account_index" == "-1" ]]; then
+      auth_json=$(jq -c . "$file_path")
+      account_name=$(derive_account_name "${file_path}:${account_base_name}")
+    else
+      auth_json=$(extract_sub2api_auth_json "$file_path" "$account_index")
+      if [[ -z "$auth_json" || "$auth_json" == "{}" ]]; then
+        echo "missing usable credentials in ${file_path} account index ${account_index}" >&2
+        exit 1
+      fi
+      account_name=$(derive_account_name "${file_path}:${account_base_name}:${account_index}")
+    fi
+    jq -cn \
+      --arg account_name "$account_name" \
+      --argjson auth_json "$auth_json" \
+      '{account_name: $account_name, auth_json: $auth_json}' >>"$items_file"
   done
 
   items_json=$(jq -s '.' "$items_file")
@@ -215,7 +285,7 @@ while ((start < ${#files[@]})); do
       + (if $frontend_page_url != "" then {frontend_page_url: $frontend_page_url} else {} end)
     ' >"$payload_file"
 
-  echo "batch ${batch_number}: ${#batch_files[@]} files"
+  echo "batch ${batch_number}: ${#batch_entries[@]} entries"
   jq -r '.items[] | .account_name' "$payload_file"
 
   if $dry_run; then
@@ -223,7 +293,7 @@ while ((start < ${#files[@]})); do
       --arg type "dry_run" \
       --arg endpoint "$endpoint" \
       --argjson batch_number "$batch_number" \
-      --argjson item_count "${#batch_files[@]}" \
+      --argjson item_count "${#batch_entries[@]}" \
       --slurpfile payload "$payload_file" \
       '{
         type: $type,
