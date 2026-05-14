@@ -287,6 +287,7 @@ fn route_path_for(route: &Route) -> String {
         Route::LlmAccessGuide => config::route_path("/llm-access/help"),
         Route::LlmAccess => config::route_path("/llm-access"),
         Route::LlmAccessUsage => config::route_path("/llm-access/usage"),
+        Route::LlmAccessQuotaStatus => config::route_path("/llm-access/quota-status"),
         Route::KiroAccess => config::route_path("/kiro-access"),
         Route::Admin => config::route_path("/admin"),
         Route::AdminLlmGateway => config::route_path("/admin/llm-gateway"),
@@ -612,6 +613,18 @@ pub fn apply_route_seo(route: Option<&Route>) {
                 &canonical_url,
                 "website",
                 "index,follow",
+                "zh-CN",
+                &og_image,
+            );
+            apply_default_hreflang(&canonical_url);
+        },
+        Route::LlmAccessQuotaStatus => {
+            apply_common_seo(
+                "限额状态 · StaticFlow",
+                "查看所有 LLM Gateway 账号的限额详情、Plan 类型与剩余配额。",
+                &canonical_url,
+                "website",
+                "noindex,follow",
                 "zh-CN",
                 &og_image,
             );

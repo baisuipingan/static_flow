@@ -1,4 +1,4 @@
-use gloo_timers::callback::{Interval, Timeout};
+use gloo_timers::callback::Timeout;
 use serde::Deserialize;
 use wasm_bindgen::{prelude::*, JsCast};
 use web_sys::{HtmlInputElement, HtmlTextAreaElement, KeyboardEvent};
@@ -8,20 +8,17 @@ use yew_router::prelude::Link;
 use crate::{
     api::{
         fetch_llm_gateway_access, fetch_llm_gateway_account_contributions,
-        fetch_llm_gateway_sponsors, fetch_llm_gateway_status, fetch_llm_gateway_support_config,
+        fetch_llm_gateway_sponsors, fetch_llm_gateway_support_config,
         submit_gpt2api_account_contribution_request,
         submit_llm_gateway_account_contribution_request, submit_llm_gateway_sponsor_request,
-        submit_llm_gateway_token_request, LlmGatewayAccessResponse,
-        LlmGatewayPublicAccountStatusView, LlmGatewayPublicKeyView,
-        LlmGatewayRateLimitStatusResponse, LlmGatewayRateLimitWindowView,
+        submit_llm_gateway_token_request, LlmGatewayAccessResponse, LlmGatewayPublicKeyView,
         LlmGatewaySupportConfigView, PublicLlmGatewayAccountContributionView,
         PublicLlmGatewaySponsorView, SubmitGpt2ApiAccountContributionInput,
         SubmitLlmGatewayAccountContributionInput, SubmitLlmGatewaySponsorInput, API_BASE,
     },
     pages::llm_access_shared::{
-        format_ms, format_number_i64, format_number_u64, format_percent, format_reset_hint,
-        format_window_label, pretty_limit_name, resolved_base_url, usage_ratio, MaskedSecretCode,
-        REMOTE_COMPACT_ARTICLE_ID,
+        format_ms, format_number_i64, format_number_u64, resolved_base_url, usage_ratio,
+        MaskedSecretCode, REMOTE_COMPACT_ARTICLE_ID,
     },
     router::Route,
 };
@@ -57,41 +54,6 @@ fn resolve_support_asset_url(path_or_url: &str) -> String {
         format!("{}{}", API_BASE.trim_end_matches("/api"), normalized)
     } else {
         normalized.to_string()
-    }
-}
-
-fn account_accent_class(index: usize) -> &'static str {
-    const ACCENTS: &[&str] = &[
-        "border-l-4 border-l-teal-500/70",
-        "border-l-4 border-l-violet-500/70",
-        "border-l-4 border-l-amber-500/70",
-        "border-l-4 border-l-sky-500/70",
-        "border-l-4 border-l-rose-500/70",
-    ];
-    ACCENTS[index % ACCENTS.len()]
-}
-
-fn codex_account_status_text_class(status: &str) -> &'static str {
-    match status {
-        "active" => "text-emerald-600",
-        "unavailable" => "text-amber-600",
-        _ => "text-[var(--muted)]",
-    }
-}
-
-fn codex_account_status_dot_class(status: &str) -> &'static str {
-    match status {
-        "active" => "bg-emerald-500",
-        "unavailable" => "bg-amber-500",
-        _ => "bg-slate-400",
-    }
-}
-
-fn codex_account_placeholder_message(status: &str) -> &'static str {
-    match status {
-        "active" => "等待限额快照同步。",
-        "unavailable" => "当前账号未参与请求路由，等待下一轮自动刷新恢复。",
-        _ => "当前账号状态未知。",
     }
 }
 
@@ -186,44 +148,6 @@ struct PublicKeyCardProps {
     refreshing: bool,
 }
 
-#[derive(Properties, PartialEq)]
-struct RateLimitWindowPanelProps {
-    label: AttrValue,
-    accent_class: Classes,
-    window: LlmGatewayRateLimitWindowView,
-}
-
-#[function_component(RateLimitWindowPanel)]
-fn rate_limit_window_panel(props: &RateLimitWindowPanelProps) -> Html {
-    let width = props.window.remaining_percent.clamp(0.0, 100.0);
-    html! {
-        <article class={classes!(
-            "overflow-hidden", "rounded-lg", "border", "border-[var(--border)]",
-            "bg-[var(--surface)]", "p-4",
-            "transition-shadow", "duration-200", "hover:shadow-[var(--shadow-sm)]",
-        )}>
-            <div class={classes!("flex", "items-center", "justify-between", "gap-3")}>
-                <h3 class={classes!("m-0", "text-sm", "font-bold", "text-[var(--text)]")}>
-                    { props.label.clone() }
-                </h3>
-                <span class={classes!("font-mono", "text-2xl", "font-black", "tracking-tight", "text-[var(--text)]")}>
-                    { format_percent(props.window.remaining_percent) }
-                </span>
-            </div>
-            <div class={classes!("mt-3", "h-2", "overflow-hidden", "rounded-full", "bg-[var(--surface-alt)]")}>
-                <div
-                    class={classes!("h-full", "rounded-full", "transition-[width]", "duration-500", props.accent_class.clone())}
-                    style={format!("width: {width:.2}%;")}
-                />
-            </div>
-            <div class={classes!("mt-2", "flex", "items-center", "gap-4", "font-mono", "text-[11px]", "text-[var(--muted)]")}>
-                <span>{ format!("已用 {}", format_percent(props.window.used_percent)) }</span>
-                <span>{ format_window_label(props.window.window_duration_mins, "unknown") }</span>
-                <span>{ format_reset_hint(props.window.resets_at) }</span>
-            </div>
-        </article>
-    }
-}
 // PLACEHOLDER_PUBLIC_KEY_CARD
 
 #[function_component(PublicKeyCard)]
@@ -308,21 +232,15 @@ fn public_key_card(props: &PublicKeyCardProps) -> Html {
 #[function_component(LlmAccessPage)]
 pub fn llm_access_page() -> Html {
     let access = use_state(|| None::<LlmGatewayAccessResponse>);
-    let rate_limit_status = use_state(|| None::<LlmGatewayRateLimitStatusResponse>);
     let loading = use_state(|| true);
-    let status_loading = use_state(|| true);
     let error = use_state(|| None::<String>);
-    let status_error = use_state(|| None::<String>);
     let support_config = use_state(|| None::<LlmGatewaySupportConfigView>);
     let support_error = use_state(|| None::<String>);
     let toast = use_state(|| None::<(String, bool)>);
     let toast_timeout = use_mut_ref(|| None::<Timeout>);
     let refreshing_key = use_state(|| None::<String>);
-    let refreshing_status = use_state(|| false);
     let active_modal = use_state(|| ActiveModal::None);
     let qr_zoomed = use_state(|| false);
-    let status_expanded = use_state(|| false);
-    let status_section_ref = use_node_ref();
     // Token wish form
     let wish_quota = use_state(String::new);
     let wish_reason = use_state(String::new);
@@ -386,27 +304,6 @@ pub fn llm_access_page() -> Html {
         });
     }
     {
-        let rate_limit_status = rate_limit_status.clone();
-        let status_loading = status_loading.clone();
-        let status_error = status_error.clone();
-        use_effect_with((), move |_| {
-            wasm_bindgen_futures::spawn_local(async move {
-                match fetch_llm_gateway_status().await {
-                    Ok(data) => {
-                        rate_limit_status.set(Some(data));
-                        status_error.set(None);
-                    },
-                    Err(err) => {
-                        rate_limit_status.set(None);
-                        status_error.set(Some(err));
-                    },
-                }
-                status_loading.set(false);
-            });
-            || ()
-        });
-    }
-    {
         let contributions = contributions.clone();
         let contribution_error = contribution_error.clone();
         use_effect_with((), move |_| {
@@ -461,29 +358,6 @@ pub fn llm_access_page() -> Html {
                 }
             });
             || ()
-        });
-    }
-    // Auto-refresh rate limit status every 30s
-    {
-        let rate_limit_status = rate_limit_status.clone();
-        let status_error = status_error.clone();
-        use_effect_with((), move |_| {
-            let interval = Interval::new(30_000, move || {
-                let rate_limit_status = rate_limit_status.clone();
-                let status_error = status_error.clone();
-                wasm_bindgen_futures::spawn_local(async move {
-                    match fetch_llm_gateway_status().await {
-                        Ok(data) => {
-                            rate_limit_status.set(Some(data));
-                            status_error.set(None);
-                        },
-                        Err(err) => {
-                            status_error.set(Some(err));
-                        },
-                    }
-                });
-            });
-            move || drop(interval)
         });
     }
     // Unified Escape key handler
@@ -578,33 +452,6 @@ pub fn llm_access_page() -> Html {
         })
     };
 
-    let on_refresh_status = {
-        let rate_limit_status = rate_limit_status.clone();
-        let status_error = status_error.clone();
-        let refreshing_status = refreshing_status.clone();
-        let show_toast = show_toast.clone();
-        Callback::from(move |_| {
-            refreshing_status.set(true);
-            let rate_limit_status = rate_limit_status.clone();
-            let status_error = status_error.clone();
-            let refreshing_status = refreshing_status.clone();
-            let show_toast = show_toast.clone();
-            wasm_bindgen_futures::spawn_local(async move {
-                match fetch_llm_gateway_status().await {
-                    Ok(data) => {
-                        rate_limit_status.set(Some(data));
-                        status_error.set(None);
-                    },
-                    Err(err) => {
-                        status_error.set(Some(err.clone()));
-                        show_toast(format!("刷新失败：{}", err), true, 2200);
-                    },
-                }
-                show_toast("已刷新限额快照".to_string(), false, 2200);
-                refreshing_status.set(false);
-            });
-        })
-    };
     // PLACEHOLDER_FORM_CALLBACKS
 
     let on_submit_token_wish = {
@@ -919,286 +766,41 @@ pub fn llm_access_page() -> Html {
             .map(resolve_support_asset_url);
 
         // --- Status view ---
-        let status_view = if *status_loading {
-            html! {
-                <div class={classes!("rounded-lg", "border", "border-dashed", "border-[var(--border)]", "px-5", "py-12", "text-center", "font-mono", "text-sm", "text-[var(--muted)]")}>
-                    { "> loading rate limits..." }
-                </div>
-            }
-        } else if let Some(status) = (*rate_limit_status).clone() {
-            let effective_status_error = (*status_error)
-                .clone()
-                .or_else(|| status.error_message.clone());
-            let mut seen_bucket_order: Vec<Option<String>> = Vec::new();
-            let mut bucket_map: std::collections::HashMap<
-                Option<String>,
-                Vec<crate::api::LlmGatewayRateLimitBucketView>,
-            > = std::collections::HashMap::new();
-            {
-                for bucket in status.buckets.iter() {
-                    let key = bucket.account_name.clone();
-                    if !bucket_map.contains_key(&key) {
-                        seen_bucket_order.push(key.clone());
-                    }
-                    bucket_map.entry(key).or_default().push(bucket.clone());
-                }
-            }
-            let mut rendered_accounts: Vec<(
-                String,
-                Option<LlmGatewayPublicAccountStatusView>,
-                Vec<crate::api::LlmGatewayRateLimitBucketView>,
-            )> = Vec::new();
-            if !status.accounts.is_empty() {
-                for account in status.accounts.iter() {
-                    let key = Some(account.name.clone());
-                    rendered_accounts.push((
-                        account.name.clone(),
-                        Some(account.clone()),
-                        bucket_map.remove(&key).unwrap_or_default(),
-                    ));
-                }
-                for key in seen_bucket_order {
-                    if let Some(buckets) = bucket_map.remove(&key) {
-                        rendered_accounts.push((
-                            key.unwrap_or_else(|| "default".to_string()),
-                            None,
-                            buckets,
-                        ));
-                    }
-                }
-            } else {
-                for key in seen_bucket_order {
-                    if let Some(buckets) = bucket_map.remove(&key) {
-                        rendered_accounts.push((
-                            key.unwrap_or_else(|| "default".to_string()),
-                            None,
-                            buckets,
-                        ));
-                    }
-                }
-            }
-            html! {
-                <section
-                    ref={status_section_ref.clone()}
-                    class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "p-5")}
-                >
-                    <div
-                        class={classes!("flex", "items-center", "justify-between", "gap-3", "flex-wrap", "cursor-pointer")}
-                        onclick={{
-                            let status_expanded = status_expanded.clone();
-                            Callback::from(move |_: MouseEvent| status_expanded.set(!*status_expanded))
-                        }}
-                    >
-                        <div class={classes!("flex", "items-center", "gap-3")}>
-                            <i class={classes!("fas", if *status_expanded { "fa-chevron-down" } else { "fa-chevron-right" }, "text-xs", "text-[var(--muted)]")}></i>
-                            <h2 class={classes!("m-0", "font-mono", "text-base", "font-bold", "text-[var(--text)]")}>
-                                { "限额状态" }
-                            </h2>
-                            <span class={classes!(
-                                "inline-flex", "items-center", "gap-1.5",
-                                "rounded-full", "px-2.5", "py-0.5",
-                                "font-mono", "text-[11px]", "font-semibold", "uppercase", "tracking-wider",
-                                "bg-[var(--surface-alt)]",
-                                match status.status.as_str() {
-                                    "ready" => "text-emerald-600",
-                                    "degraded" => "text-amber-600",
-                                    "error" => "text-red-600",
-                                    _ => "text-[var(--muted)]",
-                                }
-                            )}>
-                                <span class={classes!("inline-block", "h-1.5", "w-1.5", "rounded-full", match status.status.as_str() {
-                                    "ready" => "bg-emerald-500",
-                                    "degraded" => "bg-amber-500",
-                                    "error" => "bg-red-500",
-                                    _ => "bg-slate-400",
-                                })} />
-                                { status.status.clone() }
-                            </span>
-                        </div>
-                        <button
-                            type="button"
-                            class={classes!("btn-terminal")}
-                            onclick={{
-                                let on_refresh_status = on_refresh_status.clone();
-                                Callback::from(move |e: MouseEvent| { e.stop_propagation(); on_refresh_status.emit(()); })
-                            }}
-                            disabled={*refreshing_status}
-                        >
-                            <i class={classes!("fas", if *refreshing_status { "fa-spinner animate-spin" } else { "fa-rotate-right" })}></i>
-                        </button>
+        let status_view = html! {
+            <Link<Route> to={Route::LlmAccessQuotaStatus} classes={classes!(
+                "group", "flex", "items-center", "justify-between", "gap-3",
+                "rounded-lg", "border", "border-[var(--border)]",
+                "bg-[var(--surface)]", "p-5",
+                "transition-all", "duration-200",
+                "hover:border-[var(--primary)]/50", "hover:shadow-md", "hover:shadow-black/5",
+                "cursor-pointer", "no-underline",
+            )}>
+                <div class={classes!("flex", "items-center", "gap-3")}>
+                    <div class={classes!(
+                        "inline-flex", "items-center", "justify-center",
+                        "h-9", "w-9", "rounded-lg",
+                        "bg-[var(--surface-alt)]",
+                        "text-[var(--primary)]",
+                        "group-hover:bg-[var(--primary)]/10",
+                        "transition-colors",
+                    )}>
+                        <i class="fas fa-chart-bar text-sm"></i>
                     </div>
-
-                    if *status_expanded {
-                    // Account groups
-                    { for rendered_accounts.iter().enumerate().map(|(group_idx, (account_name, account_summary, group_buckets))| {
-                        let primary_bucket = group_buckets.iter().find(|b| b.is_primary).cloned()
-                            .or_else(|| group_buckets.first().cloned());
-                        let additional_buckets: Vec<_> = group_buckets.iter().filter(|b| !b.is_primary).cloned().collect();
-                        let summary_status = account_summary.as_ref().map(|value| value.status.as_str()).unwrap_or("active");
-                        let summary_plan = account_summary.as_ref().and_then(|value| value.plan_type.clone());
-                        let summary_primary_remaining = account_summary.as_ref().and_then(|value| value.primary_remaining_percent);
-                        let summary_secondary_remaining = account_summary.as_ref().and_then(|value| value.secondary_remaining_percent);
-                        let summary_last_checked_at = account_summary.as_ref().and_then(|value| value.last_usage_checked_at);
-                        let summary_last_success_at = account_summary.as_ref().and_then(|value| value.last_usage_success_at);
-                        let summary_error_message = account_summary.as_ref().and_then(|value| value.usage_error_message.clone());
-                        let show_account_header = rendered_accounts.len() > 1 || account_summary.is_some();
-                        html! {
-                            <div class={classes!(
-                                "mt-4", "rounded-lg", "border", "border-[var(--border)]",
-                                "bg-[var(--surface-alt)]", "p-4",
-                                account_accent_class(group_idx),
-                            )}>
-                                if show_account_header {
-                                    <div class={classes!("mb-3", "flex", "items-center", "justify-between", "gap-3", "flex-wrap")}>
-                                        <div class={classes!("flex", "items-center", "gap-2", "flex-wrap")}>
-                                            <span class={classes!(
-                                                "font-mono", "text-[11px]", "font-bold", "uppercase", "tracking-wider",
-                                                "text-[var(--primary)]",
-                                            )}>
-                                                { account_name.clone() }
-                                            </span>
-                                            if account_summary.is_some() {
-                                                <span class={classes!(
-                                                    "inline-flex", "items-center", "gap-1.5",
-                                                    "rounded-full", "px-2.5", "py-0.5",
-                                                    "font-mono", "text-[10px]", "font-semibold", "uppercase", "tracking-wider",
-                                                    "bg-[var(--surface)]",
-                                                    codex_account_status_text_class(summary_status),
-                                                )}>
-                                                    <span class={classes!(
-                                                        "inline-block", "h-1.5", "w-1.5", "rounded-full",
-                                                        codex_account_status_dot_class(summary_status),
-                                                    )} />
-                                                    { summary_status }
-                                                </span>
-                                            }
-                                        </div>
-                                        if let Some(plan) = primary_bucket.as_ref().and_then(|bucket| bucket.plan_type.clone()).or(summary_plan) {
-                                            <span class={classes!("font-mono", "text-[11px]", "text-[var(--muted)]")}>
-                                                { plan }
-                                            </span>
-                                        }
-                                    </div>
-                                }
-                                if let Some(primary_bucket) = primary_bucket.clone() {
-                                    <div>
-                                        <div class={classes!("flex", "items-center", "justify-between", "gap-3", "flex-wrap")}>
-                                            <span class={classes!("font-mono", "text-sm", "font-bold", "text-[var(--text)]")}>
-                                                { pretty_limit_name(&primary_bucket.display_name) }
-                                            </span>
-                                            <div class={classes!("flex", "items-center", "gap-3")}>
-                                                if let Some(credits) = primary_bucket.credits.clone() {
-                                                    <span class={classes!("font-mono", "text-[11px]", "text-[var(--muted)]")}>
-                                                        { if !credits.has_credits { "credits:n/a" } else if credits.unlimited { "credits:∞" } else { "credits:✓" } }
-                                                    </span>
-                                                }
-                                                if let Some(ref plan) = primary_bucket.plan_type {
-                                                    <span class={classes!("font-mono", "text-[11px]", "text-[var(--muted)]")}>
-                                                        { plan.clone() }
-                                                    </span>
-                                                }
-                                            </div>
-                                        </div>
-                                        <div class={classes!("mt-3", "grid", "gap-3", "sm:grid-cols-2")}>
-                                            if let Some(w) = primary_bucket.primary.clone() {
-                                                <RateLimitWindowPanel label={"5h"} accent_class={classes!("bg-[linear-gradient(90deg,#0f766e,#14b8a6)]")} window={w} />
-                                            }
-                                            if let Some(w) = primary_bucket.secondary.clone() {
-                                                <RateLimitWindowPanel label={"weekly"} accent_class={classes!("bg-[linear-gradient(90deg,#2563eb,#7c3aed)]")} window={w} />
-                                            }
-                                        </div>
-                                    </div>
-                                }
-                                if primary_bucket.is_none() {
-                                    <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-3")}>
-                                        <div class={classes!("flex", "items-center", "gap-3", "flex-wrap", "font-mono", "text-xs", "text-[var(--text)]")}>
-                                            if let Some(pct) = summary_primary_remaining {
-                                                <span>{ format!("5h {}", format_percent(pct)) }</span>
-                                            }
-                                            if let Some(pct) = summary_secondary_remaining {
-                                                <span>{ format!("wk {}", format_percent(pct)) }</span>
-                                            }
-                                            if summary_primary_remaining.is_none() && summary_secondary_remaining.is_none() {
-                                                <span class={classes!("text-[var(--muted)]")}>
-                                                    { codex_account_placeholder_message(summary_status) }
-                                                </span>
-                                            }
-                                        </div>
-                                        if let Some(error_message) = summary_error_message.clone() {
-                                            <div class={classes!("mt-2", "font-mono", "text-xs", "text-amber-700", "dark:text-amber-200")}>
-                                                { error_message }
-                                            </div>
-                                        }
-                                    </div>
-                                }
-                                if !additional_buckets.is_empty() {
-                                    <div class={classes!("mt-3", "space-y-2")}>
-                                        { for additional_buckets.iter().map(|bucket| {
-                                            let bp = bucket.primary.clone();
-                                            let bs = bucket.secondary.clone();
-                                            html! {
-                                                <div class={classes!("flex", "items-center", "justify-between", "gap-4", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2", "flex-wrap")}>
-                                                    <span class={classes!("font-mono", "text-xs", "font-semibold", "text-[var(--text)]")}>
-                                                        { pretty_limit_name(&bucket.display_name) }
-                                                    </span>
-                                                    <div class={classes!("flex", "items-center", "gap-3", "font-mono", "text-xs")}>
-                                                        if let Some(p) = bp {
-                                                            <span class={classes!("text-[var(--text)]")}>
-                                                                { format!("5h {}", format_percent(p.remaining_percent)) }
-                                                            </span>
-                                                        }
-                                                        if let Some(s) = bs {
-                                                            <span class={classes!("text-[var(--text)]")}>
-                                                                { format!("wk {}", format_percent(s.remaining_percent)) }
-                                                            </span>
-                                                        }
-                                                    </div>
-                                                </div>
-                                            }
-                                        }) }
-                                    </div>
-                                }
-                                if let Some(error_message) = summary_error_message {
-                                    if primary_bucket.is_some() {
-                                        <div class={classes!("mt-3", "font-mono", "text-[11px]", "text-amber-700", "dark:text-amber-200")}>
-                                            { error_message }
-                                        </div>
-                                    }
-                                }
-                                if summary_last_checked_at.is_some() || summary_last_success_at.is_some() {
-                                    <div class={classes!("mt-3", "flex", "items-center", "gap-3", "font-mono", "text-[10px]", "text-[var(--muted)]", "flex-wrap")}>
-                                        if let Some(ts) = summary_last_checked_at {
-                                            <span>{ format!("last_check {}", format_ms(ts)) }</span>
-                                        }
-                                        if let Some(ts) = summary_last_success_at {
-                                            <span>{ format!("last_ok {}", format_ms(ts)) }</span>
-                                        }
-                                    </div>
-                                }
-                            </div>
-                        }
-                    }) }
-
-                    <div class={classes!("mt-4", "flex", "items-center", "gap-4", "font-mono", "text-[11px]", "text-[var(--muted)]", "flex-wrap")}>
-                        <span>{ format!("refresh {}s", status.refresh_interval_seconds) }</span>
-                        if let Some(ts) = status.last_success_at {
-                            <span>{ format!("last_ok {}", format_ms(ts)) }</span>
-                        }
+                    <div>
+                        <h2 class={classes!("m-0", "font-mono", "text-base", "font-bold", "text-[var(--text)]")}>
+                            { "限额状态" }
+                        </h2>
+                        <p class={classes!("m-0", "mt-0.5", "font-mono", "text-[11px]", "text-[var(--muted)]")}>
+                            { "查看所有账号的限额详情" }
+                        </p>
                     </div>
-                    if let Some(error_message) = effective_status_error {
-                        <div class={classes!("mt-3", "llm-access-notice")}>{ error_message }</div>
-                    }
-                    } // end status_expanded
-                </section>
-            }
-        } else if let Some(err) = (*status_error).clone() {
-            html! {
-                <div class={classes!("rounded-lg", "border", "border-red-400/35", "bg-red-500/8", "px-5", "py-5", "font-mono", "text-sm", "text-red-700", "dark:text-red-200")}>
-                    { err }
                 </div>
-            }
-        } else {
-            Html::default()
+                <i class={classes!(
+                    "fas", "fa-arrow-right", "text-sm", "text-[var(--muted)]",
+                    "group-hover:text-[var(--primary)]", "group-hover:translate-x-0.5",
+                    "transition-all",
+                )}></i>
+            </Link<Route>>
         };
         // PLACEHOLDER_FINAL_HTML
 

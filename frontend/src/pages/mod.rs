@@ -22,6 +22,7 @@ pub mod kiro_access;
 pub mod latest_articles;
 pub mod llm_access;
 pub mod llm_access_guide;
+pub mod llm_access_quota_status;
 pub(crate) mod llm_access_shared;
 pub mod llm_access_usage;
 pub mod music_library;
