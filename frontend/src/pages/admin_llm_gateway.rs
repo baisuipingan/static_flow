@@ -5810,7 +5810,7 @@ pub fn admin_llm_gateway_page() -> Html {
 
                 // ── Settings Tab ──
                 if *active_tab == TAB_SETTINGS {
-                <section class={classes!("grid", "gap-4", "xl:grid-cols-2")}>
+                <div class={classes!("space-y-4")}>
                 <section class={classes!("rounded-xl", "border", "border-[var(--border)]", "bg-[var(--surface)]", "p-5")}>
                         <div class={classes!("flex", "items-start", "justify-between", "gap-3", "flex-wrap")}>
                             <div>
@@ -5873,6 +5873,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                     }}
                                 />
                             </label>
+                            <h3 class={classes!("md:col-span-2", "xl:col-span-3", "m-0", "mt-2", "text-xs", "font-semibold", "uppercase", "tracking-wider", "text-[var(--muted)]")}>{ "Codex" }</h3>
                             <label class={classes!("text-sm")}>
                                 <span class={classes!("text-[var(--muted)]")}>{ "codex_client_version" }</span>
                                 <input
@@ -6009,6 +6010,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                     }}
                                 />
                             </label>
+                            <h3 class={classes!("md:col-span-2", "xl:col-span-3", "m-0", "mt-2", "text-xs", "font-semibold", "uppercase", "tracking-wider", "text-[var(--muted)]")}>{ "Kiro" }</h3>
                             <label class={classes!("text-sm")}>
                                 <span class={classes!("text-[var(--muted)]")}>{ "kiro_status_refresh_min_interval_seconds" }</span>
                                 <input
@@ -6060,6 +6062,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                     }}
                                 />
                             </label>
+                            <h3 class={classes!("md:col-span-2", "xl:col-span-3", "m-0", "mt-2", "text-xs", "font-semibold", "uppercase", "tracking-wider", "text-[var(--muted)]")}>{ "Usage / DuckDB" }</h3>
                             <label class={classes!("text-sm")}>
                                 <span class={classes!("text-[var(--muted)]")}>{ "usage_event_flush_batch_size" }</span>
                                 <input
@@ -6147,7 +6150,9 @@ pub fn admin_llm_gateway_page() -> Html {
                                     }}
                                 />
                             </label>
-                            <div class={classes!("rounded-lg", "border", "border-dashed", "border-[var(--border)]", "bg-[var(--bg)]", "px-3", "py-2", "text-xs", "text-[var(--muted)]", "md:col-span-2", "xl:col-span-3")}>
+                            <details class={classes!("rounded-lg", "border", "border-dashed", "border-[var(--border)]", "bg-[var(--bg)]", "px-3", "py-2", "text-xs", "text-[var(--muted)]", "md:col-span-2", "xl:col-span-3")}>
+                                <summary class={classes!("cursor-pointer", "font-semibold", "select-none")}>{ "配置说明" }</summary>
+                                <div class={classes!("mt-2")}>
                                 <p class={classes!("m-0")}>
                                     { format!("默认 Codex models catalog 版本：{}。不带 client_version 的 `/v1/models` 请求会回落到这里。", DEFAULT_LLM_GATEWAY_CODEX_CLIENT_VERSION) }
                                 </p>
@@ -6163,7 +6168,8 @@ pub fn admin_llm_gateway_page() -> Html {
                                 <p class={classes!("m-0", "mt-1")}>
                                     { "llm usage 表现在和其他表共用 /admin 里的 Storage Maintenance 配置：scan interval、fragment threshold、prune 窗口和 worker 数都只有一套。" }
                                 </p>
-                            </div>
+                                </div>
+                            </details>
                             <div class={classes!("flex", "items-end", "md:col-span-2", "xl:col-span-3")}>
                                 <button class={classes!("btn-terminal", "btn-terminal-primary", "w-full", "md:w-auto")} onclick={on_save_runtime_config} disabled={*saving_runtime_config}>
                                     { if *saving_runtime_config { "保存中..." } else { "保存" } }
@@ -6319,9 +6325,7 @@ pub fn admin_llm_gateway_page() -> Html {
                             </div>
                         </div>
                     </section>
-                </section>
 
-                <section class={classes!("grid", "gap-4", "xl:grid-cols-2")}>
                     <section class={classes!("rounded-xl", "border", "border-[var(--border)]", "bg-[var(--surface)]", "p-5")}>
                         <div class={classes!("flex", "items-center", "justify-between", "gap-3", "flex-wrap")}>
                             <h2 class={classes!("m-0", "font-mono", "text-base", "font-bold", "text-[var(--text)]")}>{ "Provider Proxy Bindings" }</h2>
@@ -6518,7 +6522,8 @@ pub fn admin_llm_gateway_page() -> Html {
                             </div>
                         </div>
                         // Search & filter for proxy configs
-                        <div class={classes!("mt-4", "flex", "items-center", "gap-2")}>
+                        <div class={classes!("mt-4", "border-t", "border-[var(--border)]", "pt-4")}>
+                        <div class={classes!("flex", "items-center", "gap-2")}>
                             <div class={classes!("relative", "flex-1")}>
                                 <input
                                     type="text"
@@ -6592,8 +6597,9 @@ pub fn admin_llm_gateway_page() -> Html {
                                 }) }
                             }
                         </div>
+                        </div>
                     </section>
-                </section>
+                </div>
                 } // end TAB_SETTINGS
 
                 // ── Keys Tab ──
