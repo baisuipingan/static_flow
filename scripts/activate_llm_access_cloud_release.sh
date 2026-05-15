@@ -18,6 +18,7 @@ WORKER_HEALTH_URL="${LLM_ACCESS_USAGE_WORKER_HEALTH_URL:-http://127.0.0.1:19081/
 VERSION_URL="${LLM_ACCESS_VERSION_URL:-http://127.0.0.1:19080/version}"
 JOURNAL_LINES="${JOURNAL_LINES:-80}"
 NEON_ENV_PATH="${LLM_ACCESS_CONTROL_DATABASE_URL_FILE:-/mnt/llm-access/config/neon.env}"
+STAGED_NEON_ENV="${LLM_ACCESS_STAGED_NEON_ENV:-$RELEASE_DIR/llm-access-neon.env.latest}"
 STAGED_BIN="${1:-$RELEASE_DIR/llm-access.latest}"
 STAGED_WORKER_BIN="${2:-$RELEASE_DIR/llm-access-usage-worker.latest}"
 MANIFEST="${LLM_ACCESS_RELEASE_MANIFEST:-$RELEASE_DIR/release.latest.env}"
@@ -188,6 +189,19 @@ fi
 
 systemctl is-active juicefs-llm-access.service >/dev/null || fail "juicefs-llm-access.service is not active"
 findmnt -T /mnt/llm-access >/dev/null || fail "/mnt/llm-access is not mounted"
+sudo install -d -m 0755 "$BACKUP_DIR"
+if [[ -e "$STAGED_NEON_ENV" ]]; then
+  [[ -r "$STAGED_NEON_ENV" ]] || fail "staged Neon config is not readable: $STAGED_NEON_ENV"
+  grep -q '^LLM_ACCESS_CONTROL_DATABASE_URL=' "$STAGED_NEON_ENV" \
+    || fail "staged Neon config does not define LLM_ACCESS_CONTROL_DATABASE_URL: $STAGED_NEON_ENV"
+  install -d -m 0755 "$(dirname "$NEON_ENV_PATH")"
+  if test -e "$NEON_ENV_PATH"; then
+    log "backing up shared Neon config to $BACKUP_DIR/neon.env.preinstall"
+    sudo cp -a "$NEON_ENV_PATH" "$BACKUP_DIR/neon.env.preinstall"
+  fi
+  log "installing staged Neon config to $NEON_ENV_PATH"
+  install -m 0600 "$STAGED_NEON_ENV" "$NEON_ENV_PATH"
+fi
 test -r "$NEON_ENV_PATH" || fail "missing shared Neon config: $NEON_ENV_PATH"
 grep -q '^LLM_ACCESS_CONTROL_DATABASE_URL=' "$NEON_ENV_PATH" \
   || fail "shared Neon config does not define LLM_ACCESS_CONTROL_DATABASE_URL: $NEON_ENV_PATH"
@@ -216,14 +230,18 @@ fi
 timestamp="$(date -u +%Y%m%dT%H%M%SZ)"
 backup_path="$BACKUP_DIR/llm-access.$timestamp"
 worker_backup_path="$BACKUP_DIR/llm-access-usage-worker.$timestamp"
+neon_env_backup_path="$BACKUP_DIR/neon.env.$timestamp"
 service_unit_backup_path="$BACKUP_DIR/llm-access.service.$timestamp"
 worker_service_unit_backup_path="$BACKUP_DIR/llm-access-usage-worker.service.$timestamp"
 usage_mount_service_unit_backup_path="$BACKUP_DIR/juicefs-llm-access-usage.service.$timestamp"
 
-sudo install -d -m 0755 "$BACKUP_DIR"
 reload_required=0
 installed_sha=""
 installed_worker_sha=""
+
+if [[ -e "$STAGED_NEON_ENV" && -e "$BACKUP_DIR/neon.env.preinstall" ]]; then
+  sudo mv "$BACKUP_DIR/neon.env.preinstall" "$neon_env_backup_path"
+fi
 
 if [[ "$ACTIVATE_TARGET" == "api" || "$ACTIVATE_TARGET" == "both" ]]; then
   install_binary "$STAGED_BIN" "$INSTALL_PATH" "$backup_path" "$actual_sha"
@@ -310,6 +328,9 @@ fi
 rollback_cmd=""
 if [[ "$ACTIVATE_TARGET" == "both" ]]; then
   rollback_cmd="sudo cp -a \"$backup_path\" \"$INSTALL_PATH\" && sudo cp -a \"$worker_backup_path\" \"$WORKER_INSTALL_PATH\""
+  if [[ -e "$neon_env_backup_path" ]]; then
+    rollback_cmd="sudo cp -a \"$neon_env_backup_path\" \"$NEON_ENV_PATH\" && $rollback_cmd"
+  fi
   if [[ -n "$STAGED_SERVICE_UNIT" ]]; then
     rollback_cmd+=" && sudo cp -a \"$service_unit_backup_path\" \"$SERVICE_UNIT_INSTALL_PATH\""
   fi
@@ -326,12 +347,18 @@ if [[ "$ACTIVATE_TARGET" == "both" ]]; then
   rollback_cmd+=" && sudo systemctl restart \"$WORKER_SERVICE\" \"$SERVICE\""
 elif [[ "$ACTIVATE_TARGET" == "api" ]]; then
   rollback_cmd="sudo cp -a \"$backup_path\" \"$INSTALL_PATH\""
+  if [[ -e "$neon_env_backup_path" ]]; then
+    rollback_cmd="sudo cp -a \"$neon_env_backup_path\" \"$NEON_ENV_PATH\" && $rollback_cmd"
+  fi
   if [[ -n "$STAGED_SERVICE_UNIT" ]]; then
     rollback_cmd+=" && sudo cp -a \"$service_unit_backup_path\" \"$SERVICE_UNIT_INSTALL_PATH\""
   fi
   rollback_cmd+=" && sudo systemctl daemon-reload && sudo systemctl restart \"$SERVICE\""
 else
   rollback_cmd="sudo cp -a \"$worker_backup_path\" \"$WORKER_INSTALL_PATH\""
+  if [[ -e "$neon_env_backup_path" ]]; then
+    rollback_cmd="sudo cp -a \"$neon_env_backup_path\" \"$NEON_ENV_PATH\" && $rollback_cmd"
+  fi
   if [[ -n "$STAGED_WORKER_SERVICE_UNIT" ]]; then
     rollback_cmd+=" && sudo cp -a \"$worker_service_unit_backup_path\" \"$WORKER_SERVICE_UNIT_INSTALL_PATH\""
   fi

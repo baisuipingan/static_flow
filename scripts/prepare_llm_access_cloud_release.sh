@@ -4,6 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REMOTE_SCRIPT="$ROOT_DIR/scripts/activate_llm_access_cloud_release.sh"
 CONFIG_FILE="${LLM_ACCESS_CLOUD_RELEASE_CONFIG:-$ROOT_DIR/.local/llm-access-cloud-release.env}"
+LOCAL_NEON_ENV_FILE="${LLM_ACCESS_LOCAL_NEON_ENV_FILE:-$ROOT_DIR/.local/llm-access-neon.env}"
 
 log() {
   printf '[llm-access-release] %s\n' "$*"
@@ -67,9 +68,13 @@ fi
 
 CARGO_TARGET_DIR="$(expand_path "$CARGO_TARGET_DIR")"
 GCP_SSH_KEY="$(expand_path "$GCP_SSH_KEY")"
+LOCAL_NEON_ENV_FILE="$(expand_path "$LOCAL_NEON_ENV_FILE")"
 
 [[ -x "$REMOTE_SCRIPT" ]] || fail "remote activation script is not executable: $REMOTE_SCRIPT"
 [[ -r "$GCP_SSH_KEY" ]] || fail "SSH key is not readable: $GCP_SSH_KEY"
+[[ -r "$LOCAL_NEON_ENV_FILE" ]] || fail "local Neon config is not readable: $LOCAL_NEON_ENV_FILE"
+grep -q '^LLM_ACCESS_CONTROL_DATABASE_URL=' "$LOCAL_NEON_ENV_FILE" \
+  || fail "local Neon config does not define LLM_ACCESS_CONTROL_DATABASE_URL: $LOCAL_NEON_ENV_FILE"
 
 cd "$ROOT_DIR"
 
@@ -103,13 +108,16 @@ RELEASE_ID="${RELEASE_ID:-$(date -u +%Y%m%dT%H%M%SZ)-$GIT_SHORT}"
 OUT_DIR="${LLM_ACCESS_RELEASE_OUT:-$ROOT_DIR/tmp/llm-access-cloud-release/$RELEASE_ID}"
 STAGED_BIN="$OUT_DIR/llm-access.$RELEASE_ID"
 STAGED_WORKER_BIN="$OUT_DIR/llm-access-usage-worker.$RELEASE_ID"
+STAGED_NEON_ENV="$OUT_DIR/llm-access-neon.env.$RELEASE_ID"
 MANIFEST="$OUT_DIR/release.$RELEASE_ID.env"
 SHA_FILE="$OUT_DIR/SHA256SUMS.$RELEASE_ID"
 
 mkdir -p "$OUT_DIR"
 cp "$API_BIN" "$STAGED_BIN"
 cp "$WORKER_BIN" "$STAGED_WORKER_BIN"
+cp "$LOCAL_NEON_ENV_FILE" "$STAGED_NEON_ENV"
 chmod 0755 "$STAGED_BIN" "$STAGED_WORKER_BIN"
+chmod 0600 "$STAGED_NEON_ENV"
 API_BIN_SHA="$(sha256sum "$STAGED_BIN" | awk '{print $1}')"
 WORKER_BIN_SHA="$(sha256sum "$STAGED_WORKER_BIN" | awk '{print $1}')"
 {
@@ -128,6 +136,7 @@ api_sha256=$API_BIN_SHA
 api_binary=llm-access.$RELEASE_ID
 usage_worker_sha256=$WORKER_BIN_SHA
 usage_worker_binary=llm-access-usage-worker.$RELEASE_ID
+control_neon_env=llm-access-neon.env.$RELEASE_ID
 EOF
 
 SSH_OPTS=(-i "$GCP_SSH_KEY" -o IdentitiesOnly=yes -o BatchMode=yes)
@@ -147,6 +156,7 @@ log "uploading release $RELEASE_ID to $GCP_DEST:$REMOTE_RELEASE_DIR"
 scp "${SSH_OPTS[@]}" \
   "$STAGED_BIN" \
   "$STAGED_WORKER_BIN" \
+  "$STAGED_NEON_ENV" \
   "$MANIFEST" \
   "$SHA_FILE" \
   "$REMOTE_SCRIPT" \
@@ -160,6 +170,7 @@ ssh "${SSH_OPTS[@]}" "$GCP_DEST" "
   sha256sum -c SHA256SUMS.$RELEASE_ID
   ln -sfn llm-access.$RELEASE_ID llm-access.latest
   ln -sfn llm-access-usage-worker.$RELEASE_ID llm-access-usage-worker.latest
+  ln -sfn llm-access-neon.env.$RELEASE_ID llm-access-neon.env.latest
   ln -sfn release.$RELEASE_ID.env release.latest.env
 "
 
@@ -170,6 +181,7 @@ Prepared llm-access cloud release:
   git_commit: $GIT_COMMIT
   api_sha256: $API_BIN_SHA
   usage_worker_sha256: $WORKER_BIN_SHA
+  local_neon_env: $LOCAL_NEON_ENV_FILE
   remote_dir: $REMOTE_RELEASE_DIR
 
 Run this on GCP to activate it:

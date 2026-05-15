@@ -323,6 +323,13 @@ extra swap as an emergency buffer, not as normal working memory.
 
 ## Cloud Release and Post-Release Verification
 
+- Keep a local ignored copy of the shared Neon control config at
+  `.local/llm-access-neon.env`. It must define
+  `LLM_ACCESS_CONTROL_DATABASE_URL=postgresql://...`.
+- `prepare_llm_access_cloud_release.sh` now treats that local file as the
+  release source of truth, uploads it into the staged bundle, and
+  `activate_llm_access_cloud_release.sh` installs it back onto the live JuiceFS
+  path `/mnt/llm-access/config/neon.env` before restarting API/worker.
 - Local release preparation from this checkout:
   ```bash
   export CARGO_TARGET_DIR=/mnt/wsl/data4tb/static-flow-data/cargo-target/static_flow

@@ -1,6 +1,6 @@
 //! Postgres control-plane repository for `llm-access`.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -35,7 +35,7 @@ use llm_access_kiro::cache_policy::{resolve_effective_kiro_cache_policy, KiroCac
 use sha2::{Digest, Sha256};
 use sqlx_core::{
     arguments::Arguments, column::ColumnIndex, decode::Decode, encode::Encode, query::query_with,
-    row::Row as SqlxRowTrait, types::Type,
+    query_builder::QueryBuilder, row::Row as SqlxRowTrait, types::Type,
 };
 use sqlx_postgres::{PgArguments, PgPool, PgPoolOptions, PgRow as SqlxPgRow, Postgres};
 use tokio::sync::Mutex;
@@ -80,6 +80,54 @@ impl PgRow {
             .try_get(index)
             .expect("decode sqlx postgres row column")
     }
+}
+
+const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
+const USAGE_ROLLUP_PARAMS_PER_ROW: usize = 8;
+const USAGE_ROLLUP_BATCH_ROW_LIMIT: usize = POSTGRES_MAX_BIND_PARAMS / USAGE_ROLLUP_PARAMS_PER_ROW;
+
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+struct UsageRollupDelta {
+    input_uncached_tokens: i64,
+    input_cached_tokens: i64,
+    output_tokens: i64,
+    billable_tokens: i64,
+    credit_total: f64,
+    credit_missing_events: i64,
+    last_used_at_ms: i64,
+}
+
+fn aggregate_usage_rollup_deltas<'a>(
+    events: &'a [UsageEvent],
+) -> anyhow::Result<Vec<(&'a str, UsageRollupDelta)>> {
+    let mut deltas = HashMap::<&'a str, UsageRollupDelta>::with_capacity(events.len());
+    for event in events {
+        let credit_delta = event
+            .credit_usage
+            .as_deref()
+            .unwrap_or("0")
+            .parse::<f64>()
+            .context("parse usage event credit usage")?;
+        let delta = deltas.entry(event.key_id.as_str()).or_default();
+        delta.input_uncached_tokens = delta
+            .input_uncached_tokens
+            .saturating_add(event.input_uncached_tokens.max(0));
+        delta.input_cached_tokens = delta
+            .input_cached_tokens
+            .saturating_add(event.input_cached_tokens.max(0));
+        delta.output_tokens = delta
+            .output_tokens
+            .saturating_add(event.output_tokens.max(0));
+        delta.billable_tokens = delta
+            .billable_tokens
+            .saturating_add(event.billable_tokens.max(0));
+        delta.credit_total += credit_delta;
+        delta.credit_missing_events = delta
+            .credit_missing_events
+            .saturating_add(event.credit_usage_missing as i64);
+        delta.last_used_at_ms = delta.last_used_at_ms.max(event.created_at_ms);
+    }
+    Ok(deltas.into_iter().collect())
 }
 
 #[derive(Clone)]
@@ -343,6 +391,40 @@ impl PostgresControlRepository {
         row.map(decode_runtime_config_row).transpose()
     }
 
+    async fn load_authenticated_key_by_hash(
+        &self,
+        key_hash: &str,
+    ) -> anyhow::Result<Option<AuthenticatedKey>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT
+                    k.key_id,
+                    k.name,
+                    k.provider_type,
+                    k.protocol_family,
+                    k.status,
+                    k.quota_billable_limit,
+                    COALESCE(u.billable_tokens, 0)
+                 FROM llm_keys k
+                 LEFT JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 WHERE k.key_hash = $1",
+                &[&key_hash],
+            )
+            .await
+            .context("load authenticated key by hash")?;
+        Ok(row.map(|row| AuthenticatedKey {
+            key_id: row.get(0),
+            key_name: row.get(1),
+            provider_type: row.get(2),
+            protocol_family: row.get(3),
+            status: row.get(4),
+            quota_billable_limit: row.get(5),
+            billable_tokens_used: row.get::<_, i64>(6),
+        }))
+    }
+
     fn ensure_connection_alive(&self) -> anyhow::Result<()> {
         if self.client.is_closed() {
             anyhow::bail!("sqlx postgres control pool is closed");
@@ -350,39 +432,67 @@ impl PostgresControlRepository {
         Ok(())
     }
 
-    async fn load_key_bundle_by_hash(&self, key_hash: &str) -> anyhow::Result<Option<KeyBundle>> {
+    async fn apply_usage_rollups_batch(&self, events: &[UsageEvent]) -> anyhow::Result<()> {
         self.ensure_connection_alive()?;
-        let row = self
-            .client
-            .query_opt(
-                "SELECT
-                    k.key_id, k.name, k.secret, k.key_hash, k.status, k.provider_type,
-                    k.protocol_family, k.public_visible, k.quota_billable_limit,
-                    k.created_at_ms, k.updated_at_ms,
-                    r.route_strategy, r.fixed_account_name, r.auto_account_names_json::text,
-                    r.account_group_id, r.model_name_map_json::text,
-                    r.request_max_concurrency, r.request_min_start_interval_ms,
-                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
-                    r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
-                    r.kiro_cache_policy_override_json::text,
-                    r.kiro_billable_model_multipliers_override_json::text,
-                    COALESCE(u.input_uncached_tokens, 0),
-                    COALESCE(u.input_cached_tokens, 0),
-                    COALESCE(u.output_tokens, 0),
-                    COALESCE(u.billable_tokens, 0),
-                    COALESCE(u.credit_total, '0'),
-                    COALESCE(u.credit_missing_events, 0),
-                    u.last_used_at_ms,
-                    COALESCE(u.updated_at_ms, 0)
-                 FROM llm_keys k
-                 LEFT JOIN llm_key_route_config r ON r.key_id = k.key_id
-                 LEFT JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
-                 WHERE k.key_hash = $1",
-                &[&key_hash],
-            )
-            .await
-            .context("load key bundle by hash")?;
-        row.map(decode_key_bundle_row).transpose()
+        if events.is_empty() {
+            return Ok(());
+        }
+        let deltas = aggregate_usage_rollup_deltas(events)?;
+        for chunk in deltas.chunks(USAGE_ROLLUP_BATCH_ROW_LIMIT.max(1)) {
+            let mut builder = QueryBuilder::<Postgres>::new(
+                "UPDATE llm_key_usage_rollups AS u
+                 SET input_uncached_tokens = u.input_uncached_tokens + v.input_uncached_tokens,
+                     input_cached_tokens = u.input_cached_tokens + v.input_cached_tokens,
+                     output_tokens = u.output_tokens + v.output_tokens,
+                     billable_tokens = u.billable_tokens + v.billable_tokens,
+                     credit_total = ((u.credit_total)::numeric + (v.credit_total::double \
+                 precision)::numeric)::text,
+                     credit_missing_events = u.credit_missing_events + v.credit_missing_events,
+                     last_used_at_ms = CASE
+                         WHEN u.last_used_at_ms IS NULL THEN v.last_used_at_ms
+                         ELSE GREATEST(u.last_used_at_ms, v.last_used_at_ms)
+                     END,
+                     updated_at_ms = GREATEST(u.updated_at_ms, v.last_used_at_ms)
+                 FROM (",
+            );
+            builder.push_values(chunk.iter(), |mut row, (key_id, delta)| {
+                row.push_bind(*key_id)
+                    .push_bind(delta.input_uncached_tokens)
+                    .push_bind(delta.input_cached_tokens)
+                    .push_bind(delta.output_tokens)
+                    .push_bind(delta.billable_tokens)
+                    .push_bind(delta.credit_total)
+                    .push_bind(delta.credit_missing_events)
+                    .push_bind(delta.last_used_at_ms);
+            });
+            builder.push(
+                ") AS v(
+                    key_id,
+                    input_uncached_tokens,
+                    input_cached_tokens,
+                    output_tokens,
+                    billable_tokens,
+                    credit_total,
+                    credit_missing_events,
+                    last_used_at_ms
+                 )
+                 WHERE u.key_id = v.key_id",
+            );
+            let changed = builder
+                .build()
+                .persistent(false)
+                .execute(&self.client.pool)
+                .await
+                .context("batch update postgres usage rollups")?
+                .rows_affected();
+            if changed != chunk.len() as u64 {
+                anyhow::bail!(
+                    "usage rollup rows missing for {} key(s) in postgres batch update",
+                    chunk.len().saturating_sub(changed as usize)
+                );
+            }
+        }
+        Ok(())
     }
 
     async fn load_key_bundle_by_id(&self, key_id: &str) -> anyhow::Result<Option<KeyBundle>> {
@@ -4181,78 +4291,24 @@ impl ControlStore for PostgresControlRepository {
         &self,
         secret: &str,
     ) -> anyhow::Result<Option<AuthenticatedKey>> {
-        Ok(self
-            .load_key_bundle_by_hash(&hash_bearer_secret(secret))
-            .await?
-            .map(|bundle| AuthenticatedKey {
-                key_id: bundle.key.key_id,
-                key_name: bundle.key.name,
-                provider_type: bundle.key.provider_type,
-                protocol_family: bundle.key.protocol_family,
-                status: bundle.key.status,
-                quota_billable_limit: bundle.key.quota_billable_limit,
-                billable_tokens_used: bundle.rollup.billable_tokens,
-            }))
+        self.load_authenticated_key_by_hash(&hash_bearer_secret(secret))
+            .await
     }
 
     async fn apply_usage_rollup(&self, event: &UsageEvent) -> anyhow::Result<()> {
-        self.ensure_connection_alive()?;
-        let credit_delta = event
-            .credit_usage
-            .as_deref()
-            .and_then(|raw| raw.parse::<f64>().ok())
-            .unwrap_or(0.0);
-        let last_used_at_ms = event.created_at_ms;
-        let changed = self
-            .client
-            .execute(
-                "UPDATE llm_key_usage_rollups
-                 SET input_uncached_tokens = input_uncached_tokens + $2,
-                     input_cached_tokens = input_cached_tokens + $3,
-                     output_tokens = output_tokens + $4,
-                     billable_tokens = billable_tokens + $5,
-                     credit_total = ((credit_total)::numeric + ($6::double \
-                 precision)::numeric)::text,
-                     credit_missing_events = credit_missing_events + $7,
-                     last_used_at_ms = CASE
-                         WHEN last_used_at_ms IS NULL THEN $8
-                         ELSE GREATEST(last_used_at_ms, $8)
-                     END,
-                     updated_at_ms = GREATEST(updated_at_ms, $8)
-                 WHERE key_id = $1",
-                &[
-                    &event.key_id,
-                    &event.input_uncached_tokens.max(0),
-                    &event.input_cached_tokens.max(0),
-                    &event.output_tokens.max(0),
-                    &event.billable_tokens.max(0),
-                    &credit_delta,
-                    &(event.credit_usage_missing as i64),
-                    &last_used_at_ms,
-                ],
-            )
+        self.apply_usage_rollups_batch(std::slice::from_ref(event))
             .await
-            .with_context(|| {
-                format!("increment postgres usage rollup for key `{}`", event.key_id)
-            })?;
-        if changed == 0 {
-            anyhow::bail!("usage rollup not found for key `{}`", event.key_id);
-        }
-        Ok(())
     }
 }
 
 #[async_trait]
 impl UsageEventSink for PostgresControlRepository {
     async fn append_usage_events(&self, events: &[UsageEvent]) -> anyhow::Result<()> {
-        self.append_usage_events_owned(events.to_vec()).await
+        self.apply_usage_rollups_batch(events).await
     }
 
     async fn append_usage_events_owned(&self, events: Vec<UsageEvent>) -> anyhow::Result<()> {
-        for event in &events {
-            self.apply_usage_rollup(event).await?;
-        }
-        Ok(())
+        self.apply_usage_rollups_batch(&events).await
     }
 }
 
@@ -5026,6 +5082,7 @@ mod tests {
         store::{
             AdminConfigStore, AdminReviewQueueStore, ControlStore,
             NewPublicAccountContributionRequest, PublicSubmissionStore, PublicUsageStore,
+            UsageEventSink,
         },
     };
     use sha2::{Digest, Sha256};
@@ -5264,5 +5321,180 @@ mod tests {
         assert_eq!(created.status, "pending");
         assert_eq!(created.account_name, "acct-1");
         assert_eq!(created.account_id.as_deref(), Some("acct-id-1"));
+    }
+
+    #[test]
+    fn aggregate_usage_rollup_deltas_merges_events() {
+        let events = vec![
+            llm_access_core::usage::UsageEvent {
+                event_id: "evt-1".to_string(),
+                created_at_ms: 10,
+                provider_type: ProviderType::Codex,
+                protocol_family: ProtocolFamily::OpenAi,
+                key_id: "key-1".to_string(),
+                key_name: "external".to_string(),
+                account_name: None,
+                account_group_id_at_event: None,
+                route_strategy_at_event: None,
+                request_method: "POST".to_string(),
+                request_url: "https://ackingliu.top/v1/chat/completions".to_string(),
+                endpoint: "/v1/chat/completions".to_string(),
+                model: None,
+                mapped_model: None,
+                status_code: 200,
+                request_body_bytes: None,
+                quota_failover_count: 0,
+                routing_diagnostics_json: None,
+                input_uncached_tokens: 10,
+                input_cached_tokens: 1,
+                output_tokens: 5,
+                billable_tokens: 15,
+                credit_usage: Some("1.25".to_string()),
+                usage_missing: false,
+                credit_usage_missing: false,
+                client_ip: "127.0.0.1".to_string(),
+                ip_region: "local".to_string(),
+                request_headers_json: "{}".to_string(),
+                last_message_content: None,
+                client_request_body_json: None,
+                upstream_request_body_json: None,
+                full_request_json: None,
+                timing: llm_access_core::usage::UsageTiming::default(),
+                stream: llm_access_core::usage::UsageStreamDetails::default(),
+            },
+            llm_access_core::usage::UsageEvent {
+                event_id: "evt-2".to_string(),
+                created_at_ms: 25,
+                provider_type: ProviderType::Codex,
+                protocol_family: ProtocolFamily::OpenAi,
+                key_id: "key-1".to_string(),
+                key_name: "external".to_string(),
+                account_name: None,
+                account_group_id_at_event: None,
+                route_strategy_at_event: None,
+                request_method: "POST".to_string(),
+                request_url: "https://ackingliu.top/v1/chat/completions".to_string(),
+                endpoint: "/v1/chat/completions".to_string(),
+                model: None,
+                mapped_model: None,
+                status_code: 200,
+                request_body_bytes: None,
+                quota_failover_count: 0,
+                routing_diagnostics_json: None,
+                input_uncached_tokens: 4,
+                input_cached_tokens: 0,
+                output_tokens: 1,
+                billable_tokens: 5,
+                credit_usage: Some("0.5".to_string()),
+                usage_missing: false,
+                credit_usage_missing: true,
+                client_ip: "127.0.0.1".to_string(),
+                ip_region: "local".to_string(),
+                request_headers_json: "{}".to_string(),
+                last_message_content: None,
+                client_request_body_json: None,
+                upstream_request_body_json: None,
+                full_request_json: None,
+                timing: llm_access_core::usage::UsageTiming::default(),
+                stream: llm_access_core::usage::UsageStreamDetails::default(),
+            },
+        ];
+
+        let deltas = super::aggregate_usage_rollup_deltas(&events).expect("aggregate usage deltas");
+        assert_eq!(deltas.len(), 1);
+        let (key_id, delta) = deltas[0];
+        assert_eq!(key_id, "key-1");
+        assert_eq!(delta.input_uncached_tokens, 14);
+        assert_eq!(delta.input_cached_tokens, 1);
+        assert_eq!(delta.output_tokens, 6);
+        assert_eq!(delta.billable_tokens, 20);
+        assert_eq!(delta.credit_total, 1.75);
+        assert_eq!(delta.credit_missing_events, 1);
+        assert_eq!(delta.last_used_at_ms, 25);
+    }
+
+    #[tokio::test]
+    async fn postgres_repository_batches_key_usage_rollups() {
+        let Ok(database_url) = std::env::var("TEST_POSTGRES_URL") else {
+            eprintln!("skipping postgres integration test: TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let _guard = test_db_guard().await;
+        reset_test_db(&database_url)
+            .await
+            .expect("reset postgres test database");
+        seed_test_key_bundle(&database_url)
+            .await
+            .expect("seed postgres test key bundle");
+        let repo = super::PostgresControlRepository::connect(&database_url)
+            .await
+            .expect("connect postgres repository");
+
+        let first = llm_access_core::usage::UsageEvent {
+            event_id: "evt-1".to_string(),
+            created_at_ms: 1_700_000_000_001,
+            provider_type: ProviderType::Codex,
+            protocol_family: ProtocolFamily::OpenAi,
+            key_id: "key-1".to_string(),
+            key_name: "external".to_string(),
+            account_name: Some("acct-1".to_string()),
+            account_group_id_at_event: None,
+            route_strategy_at_event: Some(RouteStrategy::Auto),
+            request_method: "POST".to_string(),
+            request_url: "https://ackingliu.top/v1/chat/completions".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            model: Some("gpt-4.1".to_string()),
+            mapped_model: Some("gpt-4.1".to_string()),
+            status_code: 200,
+            request_body_bytes: Some(256),
+            quota_failover_count: 0,
+            routing_diagnostics_json: None,
+            input_uncached_tokens: 10,
+            input_cached_tokens: 2,
+            output_tokens: 5,
+            billable_tokens: 15,
+            credit_usage: Some("1.25".to_string()),
+            usage_missing: false,
+            credit_usage_missing: false,
+            client_ip: "127.0.0.1".to_string(),
+            ip_region: "local".to_string(),
+            request_headers_json: "{}".to_string(),
+            last_message_content: None,
+            client_request_body_json: None,
+            upstream_request_body_json: None,
+            full_request_json: None,
+            timing: llm_access_core::usage::UsageTiming {
+                latency_ms: Some(120),
+                ..Default::default()
+            },
+            stream: llm_access_core::usage::UsageStreamDetails::default(),
+        };
+        let second = llm_access_core::usage::UsageEvent {
+            event_id: "evt-2".to_string(),
+            created_at_ms: 1_700_000_000_101,
+            input_uncached_tokens: 4,
+            input_cached_tokens: 2,
+            output_tokens: 1,
+            billable_tokens: 5,
+            credit_usage: Some("0.50".to_string()),
+            ..first.clone()
+        };
+
+        repo.append_usage_events(&[first, second])
+            .await
+            .expect("append usage events");
+
+        let key = repo
+            .get_public_usage_key_by_secret("secret")
+            .await
+            .expect("load usage lookup key")
+            .expect("public usage lookup row");
+        assert_eq!(key.usage_input_uncached_tokens, 14);
+        assert_eq!(key.usage_input_cached_tokens, 4);
+        assert_eq!(key.usage_output_tokens, 6);
+        assert_eq!(key.usage_billable_tokens, 20);
+        assert_eq!(key.usage_credit_total, 1.75);
+        assert_eq!(key.usage_credit_missing_events, 0);
+        assert_eq!(key.last_used_at_ms, Some(1_700_000_000_101));
     }
 }
