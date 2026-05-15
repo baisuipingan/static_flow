@@ -10,13 +10,42 @@ use anyhow::{anyhow, Context};
 
 const DEFAULT_TIERED_DUCKDB_ROLLOVER_BYTES: u64 = 64 * 1024 * 1024;
 
+/// Backing store used for the llm-access control plane.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ControlStoreConfig {
+    /// SQLite control-plane database path.
+    Sqlite {
+        /// Filesystem path to the SQLite control database.
+        path: PathBuf,
+    },
+    /// Env var that contains the Postgres database URL.
+    Postgres {
+        /// Env var name that carries the Postgres database URL.
+        database_url_env: String,
+    },
+}
+
+impl ControlStoreConfig {
+    /// Return the SQLite path when the control plane uses SQLite.
+    pub fn sqlite_path(&self) -> Option<&Path> {
+        match self {
+            Self::Sqlite {
+                path,
+            } => Some(path.as_path()),
+            Self::Postgres {
+                ..
+            } => None,
+        }
+    }
+}
+
 /// Storage paths used by `llm-access`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct StorageConfig {
     /// Root of the mounted persistent service state.
     pub state_root: PathBuf,
-    /// SQLite control-plane database path.
-    pub sqlite_control: PathBuf,
+    /// Control-plane backing store configuration.
+    pub control_store: ControlStoreConfig,
     /// DuckDB analytics database path.
     pub duckdb: PathBuf,
     /// Hot local usage journal directory.
@@ -123,6 +152,7 @@ where
 {
     let mut state_root = None;
     let mut sqlite_control = None;
+    let mut postgres_control_database_url_env = None;
     let mut duckdb = None;
     let mut duckdb_active_dir = None;
     let mut duckdb_archive_dir = None;
@@ -144,6 +174,16 @@ where
                     args.next()
                         .ok_or_else(|| anyhow!("--sqlite-control requires a path"))?,
                 ));
+            },
+            "--postgres-control-database-url-env" => {
+                postgres_control_database_url_env = Some(
+                    args.next()
+                        .ok_or_else(|| {
+                            anyhow!("--postgres-control-database-url-env requires an env name")
+                        })?
+                        .to_string_lossy()
+                        .to_string(),
+                );
             },
             "--duckdb" => {
                 duckdb = Some(PathBuf::from(
@@ -196,7 +236,15 @@ where
         }
     }
     let state_root = state_root.ok_or_else(usage_error)?;
-    let sqlite_control = sqlite_control.ok_or_else(usage_error)?;
+    let control_store = match (sqlite_control, postgres_control_database_url_env) {
+        (Some(path), None) => ControlStoreConfig::Sqlite {
+            path,
+        },
+        (None, Some(database_url_env)) => ControlStoreConfig::Postgres {
+            database_url_env,
+        },
+        _ => return Err(anyhow!("exactly one control backend must be configured")),
+    };
     let duckdb = duckdb.unwrap_or_else(|| state_root.join("analytics/usage.duckdb"));
     let usage_journal_dir = usage_journal_dir.unwrap_or_else(|| state_root.join("usage-journal"));
     let duckdb_tiered = parse_tiered_duckdb_config(
@@ -207,7 +255,12 @@ where
         usage_details_dir,
     )?;
     if duckdb_tiered.is_none() {
-        ensure_under_root(&state_root, &sqlite_control)?;
+        if let ControlStoreConfig::Sqlite {
+            path,
+        } = &control_store
+        {
+            ensure_under_root(&state_root, path)?;
+        }
     }
     ensure_under_root(&state_root, &duckdb)?;
     if let Some(tiered) = &duckdb_tiered {
@@ -222,7 +275,7 @@ where
         codex_auths_dir: state_root.join("auths/codex"),
         logs_dir: state_root.join("logs"),
         state_root,
-        sqlite_control,
+        control_store,
         duckdb,
         usage_journal_dir,
         duckdb_tiered,
@@ -268,11 +321,12 @@ fn ensure_under_root(root: &Path, path: &Path) -> anyhow::Result<()> {
 
 fn usage_error() -> anyhow::Error {
     anyhow!(
-        "usage: llm-access init --state-root <path> --sqlite-control <path> --duckdb \
-         <path>\nusage: llm-access serve [--bind <addr>] --state-root <path> --sqlite-control \
-         <path> [--duckdb <path>] [--usage-journal-dir <path>] [--duckdb-active-dir <path> \
-         --duckdb-archive-dir <path> --duckdb-catalog-dir <path> --duckdb-rollover-bytes <bytes> \
-         --usage-details-dir <path>]"
+        "usage: llm-access init --state-root <path> (--sqlite-control <path> | \
+         --postgres-control-database-url-env <env>) --duckdb <path>\nusage: llm-access serve \
+         [--bind <addr>] --state-root <path> (--sqlite-control <path> | \
+         --postgres-control-database-url-env <env>) [--duckdb <path>] [--usage-journal-dir \
+         <path>] [--duckdb-active-dir <path> --duckdb-archive-dir <path> --duckdb-catalog-dir \
+         <path> --duckdb-rollover-bytes <bytes> --usage-details-dir <path>]"
     )
 }
 
@@ -302,10 +356,11 @@ mod tests {
 
         assert_eq!(config.bind_addr.to_string(), "127.0.0.1:19080");
         assert_eq!(config.storage.state_root, PathBuf::from("/mnt/llm-access"));
-        assert_eq!(
-            config.storage.sqlite_control,
-            PathBuf::from("/mnt/llm-access/control/llm-access.sqlite3")
-        );
+        assert!(matches!(
+            config.storage.control_store,
+            super::ControlStoreConfig::Sqlite { ref path }
+            if path == &PathBuf::from("/mnt/llm-access/control/llm-access.sqlite3")
+        ));
         assert_eq!(config.storage.duckdb, PathBuf::from("/mnt/llm-access/analytics/usage.duckdb"));
         assert_eq!(config.storage.duckdb_tiered, None);
         assert_eq!(
@@ -314,6 +369,51 @@ mod tests {
         );
         assert_eq!(config.storage.kiro_auths_dir, PathBuf::from("/mnt/llm-access/auths/kiro"));
         assert_eq!(config.storage.codex_auths_dir, PathBuf::from("/mnt/llm-access/auths/codex"));
+    }
+
+    #[test]
+    fn parses_postgres_control_backend_from_env_name() {
+        let command = super::CliCommand::parse([
+            "llm-access",
+            "serve",
+            "--state-root",
+            "/mnt/llm-access",
+            "--postgres-control-database-url-env",
+            "LLM_ACCESS_CONTROL_DATABASE_URL",
+            "--usage-journal-dir",
+            "/var/lib/staticflow/llm-access/usage-journal",
+        ])
+        .expect("parse serve config");
+
+        let super::CliCommand::Serve(config) = command else {
+            panic!("expected serve command");
+        };
+        assert!(matches!(
+            config.storage.control_store,
+            super::ControlStoreConfig::Postgres { ref database_url_env }
+            if database_url_env == "LLM_ACCESS_CONTROL_DATABASE_URL"
+        ));
+        assert_eq!(
+            config.storage.usage_journal_dir,
+            PathBuf::from("/var/lib/staticflow/llm-access/usage-journal")
+        );
+    }
+
+    #[test]
+    fn rejects_sqlite_and_postgres_control_flags_together() {
+        let err = super::CliCommand::parse([
+            "llm-access",
+            "serve",
+            "--state-root",
+            "/mnt/llm-access",
+            "--sqlite-control",
+            "/mnt/llm-access/control/llm-access.sqlite3",
+            "--postgres-control-database-url-env",
+            "LLM_ACCESS_CONTROL_DATABASE_URL",
+        ])
+        .expect_err("mixed backend flags must fail");
+
+        assert!(err.to_string().contains("exactly one control backend"));
     }
 
     #[test]
@@ -401,10 +501,11 @@ mod tests {
             panic!("expected serve command");
         };
         assert_eq!(config.storage.state_root, PathBuf::from("/mnt/llm-access-usage"));
-        assert_eq!(
-            config.storage.sqlite_control,
-            PathBuf::from("/mnt/llm-access/control/llm-access.sqlite3")
-        );
+        assert!(matches!(
+            config.storage.control_store,
+            super::ControlStoreConfig::Sqlite { ref path }
+            if path == &PathBuf::from("/mnt/llm-access/control/llm-access.sqlite3")
+        ));
         let tiered = config.storage.duckdb_tiered.expect("tiered config");
         assert_eq!(tiered.archive_dir, PathBuf::from("/mnt/llm-access-usage/analytics/segments"));
         assert_eq!(tiered.catalog_dir, PathBuf::from("/mnt/llm-access-usage/analytics/catalog"));

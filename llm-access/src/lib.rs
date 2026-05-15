@@ -43,7 +43,7 @@ use axum::{
     routing::{any, get, post},
     Json, Router,
 };
-use config::{CliCommand, ServeConfig, StorageConfig};
+use config::{CliCommand, ControlStoreConfig, ServeConfig, StorageConfig};
 use llm_access_core::store::{
     AdminAccountGroupStore, AdminCodexAccountStore, AdminConfigStore, AdminKeyStore,
     AdminKiroAccountStore, AdminProxyStore, AdminReviewQueueStore, PublicAccessStore,
@@ -100,14 +100,24 @@ pub fn run_from_env() -> anyhow::Result<()> {
 /// Initialize llm-access storage paths.
 pub fn bootstrap_api_storage(config: &StorageConfig) -> anyhow::Result<()> {
     runtime::validate_state_root(config)?;
-    llm_access_store::initialize_sqlite_target_path(&config.sqlite_control)?;
+    if let ControlStoreConfig::Sqlite {
+        path,
+    } = &config.control_store
+    {
+        llm_access_store::initialize_sqlite_target_path(path)?;
+    }
     Ok(())
 }
 
 /// Initialize only the storage paths required by the standalone usage worker.
 pub fn bootstrap_usage_worker_storage(config: &StorageConfig) -> anyhow::Result<()> {
     runtime::validate_usage_worker_state_root(config)?;
-    llm_access_store::initialize_sqlite_target_path(&config.sqlite_control)?;
+    if let ControlStoreConfig::Sqlite {
+        path,
+    } = &config.control_store
+    {
+        llm_access_store::initialize_sqlite_target_path(path)?;
+    }
     Ok(())
 }
 
@@ -576,7 +586,9 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create state root");
         let config = crate::config::StorageConfig {
             state_root: root.clone(),
-            sqlite_control: root.join("control/llm-access.sqlite3"),
+            control_store: crate::config::ControlStoreConfig::Sqlite {
+                path: root.join("control/llm-access.sqlite3"),
+            },
             duckdb: root.join("analytics/usage.duckdb"),
             usage_journal_dir: root.join("usage-journal"),
             duckdb_tiered: None,
@@ -1331,7 +1343,9 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create state root");
         let config = crate::config::StorageConfig {
             state_root: root.clone(),
-            sqlite_control: root.join("control/llm-access.sqlite3"),
+            control_store: crate::config::ControlStoreConfig::Sqlite {
+                path: root.join("control/llm-access.sqlite3"),
+            },
             duckdb: root.join("analytics/usage.duckdb"),
             usage_journal_dir: root.join("usage-journal"),
             duckdb_tiered: None,
@@ -1396,7 +1410,9 @@ mod tests {
 
         let config = crate::config::StorageConfig {
             state_root: root.clone(),
-            sqlite_control: control_root.join("control/llm-access.sqlite3"),
+            control_store: crate::config::ControlStoreConfig::Sqlite {
+                path: control_root.join("control/llm-access.sqlite3"),
+            },
             duckdb: root.join("analytics/usage.duckdb"),
             usage_journal_dir: root.join("usage-journal"),
             duckdb_tiered: None,

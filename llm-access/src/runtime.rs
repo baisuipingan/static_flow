@@ -37,7 +37,10 @@ use tokio::{
 
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use crate::usage_journal::JournalUsageEventSink;
-use crate::{config::StorageConfig, geoip::GeoIpResolver};
+use crate::{
+    config::{ControlStoreConfig, StorageConfig},
+    geoip::GeoIpResolver,
+};
 
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 const USAGE_EVENT_CHANNEL_CAPACITY: usize = 1_024;
@@ -155,7 +158,16 @@ impl LlmAccessRuntime {
         let geoip = GeoIpResolver::from_env()?;
         geoip.warmup().await;
         let email_notifier = crate::email::EmailNotifier::from_env()?.map(Arc::new);
-        let repository = Arc::new(SqliteControlRepository::open_path(&config.sqlite_control)?);
+        let repository = Arc::new(match &config.control_store {
+            ControlStoreConfig::Sqlite {
+                path,
+            } => SqliteControlRepository::open_path(path)?,
+            ControlStoreConfig::Postgres {
+                ..
+            } => {
+                return Err(anyhow!("postgres control backend is not wired yet"));
+            },
+        });
         #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
         let initial_runtime_config = repository.get_admin_runtime_config().await?;
         #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
@@ -1241,7 +1253,9 @@ mod tests {
             std::env::temp_dir().join(format!("llm-access-{name}-{}-{unique}", std::process::id()));
         crate::config::StorageConfig {
             state_root: root.clone(),
-            sqlite_control: root.join("control/llm-access.sqlite3"),
+            control_store: crate::config::ControlStoreConfig::Sqlite {
+                path: root.join("control/llm-access.sqlite3"),
+            },
             duckdb: root.join("analytics/usage.duckdb"),
             usage_journal_dir: root.join("usage-journal"),
             duckdb_tiered: None,
@@ -1273,8 +1287,13 @@ mod tests {
         let root = config.state_root.clone();
         let _ = std::fs::remove_dir_all(&root);
         std::fs::create_dir_all(&root).expect("create root");
-        llm_access_store::initialize_sqlite_target_path(&config.sqlite_control)
-            .expect("initialize sqlite");
+        llm_access_store::initialize_sqlite_target_path(
+            config
+                .control_store
+                .sqlite_path()
+                .expect("sqlite control path must exist for sqlite test config"),
+        )
+        .expect("initialize sqlite");
 
         let runtime = super::LlmAccessRuntime::from_storage_config(&config)
             .await

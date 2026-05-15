@@ -26,7 +26,7 @@ fn run() -> anyhow::Result<()> {
     };
 
     use llm_access::{
-        config::CliCommand,
+        config::{CliCommand, ControlStoreConfig},
         usage_worker::{router, UsageWorker},
     };
     use llm_access_core::store::AdminConfigStore;
@@ -46,10 +46,20 @@ fn run() -> anyhow::Result<()> {
         CliCommand::Serve(config) => (config.bind_addr, config.storage),
     };
     llm_access::bootstrap_usage_worker_storage(&storage)?;
-    let control = SqliteControlRepository::open_path(&storage.sqlite_control)?;
+    let control_path = match &storage.control_store {
+        ControlStoreConfig::Sqlite {
+            path,
+        } => path.clone(),
+        ControlStoreConfig::Postgres {
+            ..
+        } => {
+            anyhow::bail!("postgres control backend is not wired for usage worker yet");
+        },
+    };
+    let control = SqliteControlRepository::open_path(&control_path)?;
     let runtime = tokio::runtime::Runtime::new()?;
     let runtime_config = runtime.block_on(control.get_admin_runtime_config())?;
-    let sqlite_control_path = storage.sqlite_control.clone();
+    let sqlite_control_path = control_path;
     let bind_addr = if explicit_bind {
         bind_addr
     } else {
