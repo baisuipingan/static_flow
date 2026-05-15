@@ -105,10 +105,12 @@ Persist worker-owned historical artifacts on the dedicated usage mount:
 - catalog:
   `/mnt/llm-access-usage/analytics/catalog/...`
 - details:
-  `/mnt/llm-access-usage/details/YYYY-MM-DD/<event-id>.json.zst`
+  `/mnt/llm-access-usage/details/packs/<provider>/<YYYY>/<MM>/<DD>/<event-id>-<hash>.detailpack-v1`
 
-Time-bucket directories are mandatory for `segments` and `details`. Cleanup is
-directory-oriented, not content-oriented.
+The packed detail payload format stays as-is; only the backing path changes from
+direct R2 to the dedicated JuiceFS usage mount. Time-bucket directories are
+mandatory for `segments` and `details`. Cleanup is directory-oriented, not
+content-oriented.
 
 ## Cleanup I/O contract
 
