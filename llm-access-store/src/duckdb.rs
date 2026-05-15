@@ -1616,6 +1616,18 @@ fn tiered_catalog_path(config: &TieredDuckDbUsageConfig) -> PathBuf {
 }
 
 #[cfg(feature = "duckdb-runtime")]
+fn open_tiered_catalog_connection(
+    config: &TieredDuckDbUsageConfig,
+    purpose: &str,
+) -> anyhow::Result<rusqlite::Connection> {
+    let conn = rusqlite::Connection::open(tiered_catalog_path(config))
+        .with_context(|| format!("failed to open tiered usage catalog for {purpose}"))?;
+    conn.busy_timeout(Duration::from_secs(30))
+        .with_context(|| format!("configure tiered usage catalog busy timeout for {purpose}"))?;
+    Ok(conn)
+}
+
+#[cfg(feature = "duckdb-runtime")]
 fn tiered_pending_dir(config: &TieredDuckDbUsageConfig) -> PathBuf {
     config.active_dir.join("pending")
 }
@@ -1791,8 +1803,8 @@ fn initialize_tiered_catalog(config: &TieredDuckDbUsageConfig) -> anyhow::Result
             format!("failed to create tiered catalog directory `{}`", parent.display())
         })?;
     }
-    let conn = rusqlite::Connection::open(&path)
-        .with_context(|| format!("failed to open tiered usage catalog `{}`", path.display()))?;
+    let conn = open_tiered_catalog_connection(config, "initialization")
+        .with_context(|| format!("tiered usage catalog path `{}`", path.display()))?;
     conn.execute_batch(
         "
         PRAGMA journal_mode=DELETE;
@@ -1863,8 +1875,7 @@ fn choose_active_segment(config: &TieredDuckDbUsageConfig) -> anyhow::Result<(Pa
 
 #[cfg(feature = "duckdb-runtime")]
 fn next_catalog_sequence(config: &TieredDuckDbUsageConfig) -> anyhow::Result<u64> {
-    let catalog = rusqlite::Connection::open(tiered_catalog_path(config))
-        .context("failed to open tiered catalog for sequence lookup")?;
+    let catalog = open_tiered_catalog_connection(config, "sequence lookup")?;
     let max_segment_id: Option<String> = catalog
         .query_row(
             "SELECT segment_id FROM usage_segments ORDER BY sealed_at_ms DESC LIMIT 1",
@@ -2210,8 +2221,7 @@ fn publish_segment_catalog(
     stats: &SegmentStats,
     size_bytes: u64,
 ) -> anyhow::Result<()> {
-    let mut catalog = rusqlite::Connection::open(tiered_catalog_path(config))
-        .context("failed to open tiered usage catalog for publication")?;
+    let mut catalog = open_tiered_catalog_connection(config, "publication")?;
     let tx = catalog
         .transaction()
         .context("begin tiered catalog transaction")?;
@@ -2397,8 +2407,7 @@ fn merge_key_rollup(
 fn archived_key_usage_rollups(
     config: &TieredDuckDbUsageConfig,
 ) -> anyhow::Result<Vec<KeyUsageRollupSummary>> {
-    let catalog = rusqlite::Connection::open(tiered_catalog_path(config))
-        .context("failed to open tiered catalog for archived rollups")?;
+    let catalog = open_tiered_catalog_connection(config, "archived rollups")?;
     let mut stmt = catalog
         .prepare(
             "SELECT
@@ -2601,8 +2610,7 @@ fn delete_expired_segments_from_catalog(
     config: &TieredDuckDbUsageConfig,
     cutoff_ms: i64,
 ) -> anyhow::Result<Vec<RetentionSegmentCandidate>> {
-    let mut catalog = rusqlite::Connection::open(tiered_catalog_path(config))
-        .context("failed to open tiered usage catalog for retention prune")?;
+    let mut catalog = open_tiered_catalog_connection(config, "retention prune")?;
     let candidates = {
         let mut stmt = catalog
             .prepare(
@@ -2689,8 +2697,7 @@ fn prune_orphan_archived_duckdb_files(config: &TieredDuckDbUsageConfig) -> anyho
 fn catalog_archived_duckdb_paths(
     config: &TieredDuckDbUsageConfig,
 ) -> anyhow::Result<HashSet<PathBuf>> {
-    let catalog = rusqlite::Connection::open(tiered_catalog_path(config))
-        .context("failed to open tiered usage catalog for orphan prune")?;
+    let catalog = open_tiered_catalog_connection(config, "orphan prune")?;
     let mut stmt = catalog
         .prepare("SELECT archive_path FROM usage_segments WHERE state = 'archived'")
         .context("prepare archived path lookup")?;
@@ -3173,8 +3180,7 @@ fn archived_segments_with_catalog_counts(
                 .collect()
         });
     }
-    let catalog = rusqlite::Connection::open(tiered_catalog_path(config))
-        .context("failed to open tiered usage catalog for filtered segment lookup")?;
+    let catalog = open_tiered_catalog_connection(config, "filtered segment lookup")?;
     let mut stmt = catalog
         .prepare(
             "SELECT
@@ -3224,8 +3230,7 @@ fn archived_segments_for_query(
     config: &TieredDuckDbUsageConfig,
     query: &UsageEventQuery,
 ) -> anyhow::Result<Vec<ArchivedUsageSegment>> {
-    let catalog = rusqlite::Connection::open(tiered_catalog_path(config))
-        .context("failed to open tiered usage catalog for segment lookup")?;
+    let catalog = open_tiered_catalog_connection(config, "segment lookup")?;
     let mut stmt = catalog
         .prepare(
             "SELECT archive_path, start_ms, end_ms, row_count
@@ -3425,8 +3430,7 @@ fn locate_archived_segment(
     config: &TieredDuckDbUsageConfig,
     event_id: &str,
 ) -> anyhow::Result<Option<ArchivedUsageSegment>> {
-    let catalog = rusqlite::Connection::open(tiered_catalog_path(config))
-        .context("failed to open tiered catalog for event locator")?;
+    let catalog = open_tiered_catalog_connection(config, "event locator")?;
     let row = catalog
         .query_row(
             "SELECT s.archive_path, s.start_ms, s.end_ms, s.row_count

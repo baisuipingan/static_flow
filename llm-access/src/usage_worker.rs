@@ -461,8 +461,7 @@ pub async fn run_forever(worker: UsageWorker) -> anyhow::Result<()> {
             .unwrap_or(true)
         {
             if let Err(err) = worker.run_maintenance(now_ms()).await {
-                worker.record_error(&err);
-                return Err(err);
+                tracing::warn!("llm access usage analytics maintenance failed: {err:#}");
             }
             last_maintenance = Some(std::time::Instant::now());
         }

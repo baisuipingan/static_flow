@@ -163,8 +163,7 @@ async fn run_forever_with_runtime_config(
             .unwrap_or(true)
         {
             if let Err(err) = worker.run_maintenance(now_ms()).await {
-                worker.record_error(&err);
-                return Err(err);
+                tracing::warn!("llm access usage analytics maintenance failed: {err:#}");
             }
             last_maintenance = Some(Instant::now());
         }
