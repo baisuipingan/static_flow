@@ -256,6 +256,7 @@ if [[ "$ACTIVATE_TARGET" == "worker" || "$ACTIVATE_TARGET" == "both" ]]; then
     sudo systemctl daemon-reload
   fi
   sudo install -d -o ts_user -g ts_user -m 0755 /mnt/llm-access-usage
+  sudo install -d -o ts_user -g ts_user -m 0755 /var/cache/juicefs/llm-access-usage
   ensure_mount_service "$USAGE_MOUNT_SERVICE" /mnt/llm-access-usage
 fi
 
