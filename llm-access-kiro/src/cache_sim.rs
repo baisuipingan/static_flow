@@ -10,7 +10,7 @@
 //! anchors append the finalized current turn plus assistant response.
 
 use std::{
-    collections::{BTreeMap, HashMap},
+    collections::BTreeMap,
     num::NonZeroUsize,
     time::{Duration, Instant},
 };
@@ -289,43 +289,36 @@ struct PrefixTree {
     resident_tokens: u64,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct PrefixNode {
-    token_count: u64,
-    last_touched_at: Instant,
-    children: HashMap<u128, PrefixNode>,
-}
-
-impl Default for PrefixNode {
-    fn default() -> Self {
-        Self {
-            token_count: 0,
-            last_touched_at: Instant::now(),
-            children: HashMap::new(),
-        }
-    }
+    children: Vec<PrefixEdge>,
 }
 
 impl Drop for PrefixNode {
     fn drop(&mut self) {
-        // Deep prefix paths can legitimately reach tens of thousands of pages.
-        // Clearing children iteratively prevents subtree destruction from
-        // recursing on the thread stack when a large branch is evicted.
-        let mut stack = std::mem::take(&mut self.children)
-            .into_values()
-            .collect::<Vec<_>>();
-        while let Some(mut child) = stack.pop() {
-            stack.extend(std::mem::take(&mut child.children).into_values());
+        let mut stack = std::mem::take(&mut self.children);
+        while let Some(mut edge) = stack.pop() {
+            stack.extend(std::mem::take(&mut edge.child.children));
         }
     }
 }
 
-impl PrefixNode {
-    fn new(token_count: u64, now: Instant) -> Self {
+#[derive(Debug)]
+struct PrefixEdge {
+    pages: Box<[CanonicalTokenPage]>,
+    token_count: u64,
+    last_touched_at: Instant,
+    child: PrefixNode,
+}
+
+impl PrefixEdge {
+    fn new(pages: &[CanonicalTokenPage], now: Instant) -> Self {
+        debug_assert!(!pages.is_empty());
         Self {
-            token_count,
+            pages: pages.to_vec().into_boxed_slice(),
+            token_count: prefix_pages_token_count(pages),
             last_touched_at: now,
-            children: HashMap::new(),
+            child: PrefixNode::default(),
         }
     }
 }
@@ -342,14 +335,27 @@ impl PrefixTree {
         self.prune_expired(now, ttl);
         let mut current = &mut self.root;
         let mut matched = PrefixCacheMatch::default();
-        for page in pages {
-            let Some(child) = current.children.get_mut(&page.key) else {
+        let mut offset = 0usize;
+        while offset < pages.len() {
+            let Some(edge_index) = find_child_edge_index(current, pages[offset].key) else {
                 break;
             };
-            child.last_touched_at = now;
-            matched.matched_pages += 1;
-            matched.matched_tokens += child.token_count;
-            current = child;
+            let edge = &mut current.children[edge_index];
+            let common = common_prefix_len(&edge.pages, &pages[offset..]);
+            if common == 0 {
+                break;
+            }
+            matched.matched_pages = matched.matched_pages.saturating_add(common);
+            matched.matched_tokens = matched
+                .matched_tokens
+                .saturating_add(prefix_pages_token_count(&edge.pages[..common]));
+            if common < edge.pages.len() {
+                split_edge_at(edge, common, now);
+                break;
+            }
+            edge.last_touched_at = now;
+            offset += common;
+            current = &mut edge.child;
         }
         matched
     }
@@ -386,19 +392,26 @@ impl PrefixTree {
         let mut leaf_count = 0usize;
         let mut edge_count = 0usize;
         let mut child_capacity = 0usize;
+        let mut page_count = 0usize;
         let mut stack = vec![(&self.root, true)];
 
         while let Some((node, is_root)) = stack.pop() {
             node_count = node_count.saturating_add(1);
             edge_count = edge_count.saturating_add(node.children.len());
             child_capacity = child_capacity.saturating_add(node.children.capacity());
+            page_count = page_count.saturating_add(
+                node.children
+                    .iter()
+                    .map(|edge| edge.pages.len())
+                    .sum::<usize>(),
+            );
             if node.children.is_empty() && !is_root {
                 leaf_count = leaf_count.saturating_add(1);
             }
-            stack.extend(node.children.values().map(|child| (child, false)));
+            stack.extend(node.children.iter().map(|edge| (&edge.child, false)));
         }
 
-        let estimated_memory_bytes = estimate_prefix_tree_memory_bytes(node_count, child_capacity);
+        let estimated_memory_bytes = estimate_prefix_tree_memory_bytes(child_capacity, page_count);
         PrefixTreeRuntimeStats {
             resident_tokens: self.resident_tokens,
             max_tokens,
@@ -503,12 +516,13 @@ impl ConversationAnchorIndex {
     }
 }
 
-fn estimate_prefix_tree_memory_bytes(node_count: usize, child_capacity: usize) -> u64 {
-    let root_bytes = if node_count == 0 { 0 } else { std::mem::size_of::<PrefixNode>() };
-    let edge_bytes = child_capacity.saturating_mul(
-        std::mem::size_of::<u128>().saturating_add(std::mem::size_of::<PrefixNode>()),
-    );
-    root_bytes.saturating_add(edge_bytes) as u64
+fn estimate_prefix_tree_memory_bytes(child_capacity: usize, page_count: usize) -> u64 {
+    let root_bytes = std::mem::size_of::<PrefixNode>();
+    let edge_bytes = child_capacity.saturating_mul(std::mem::size_of::<PrefixEdge>());
+    let page_bytes = page_count.saturating_mul(std::mem::size_of::<CanonicalTokenPage>());
+    root_bytes
+        .saturating_add(edge_bytes)
+        .saturating_add(page_bytes) as u64
 }
 
 fn estimate_anchor_index_memory_bytes(entries: usize) -> u64 {
@@ -520,13 +534,33 @@ fn estimate_anchor_index_memory_bytes(entries: usize) -> u64 {
 fn insert_prefix_path(node: &mut PrefixNode, pages: &[CanonicalTokenPage], now: Instant) -> u64 {
     let mut added_tokens: u64 = 0;
     let mut current = node;
-    for page in pages {
-        let child = current.children.entry(page.key).or_insert_with(|| {
-            added_tokens = added_tokens.saturating_add(u64::from(page.token_count));
-            PrefixNode::new(u64::from(page.token_count), now)
-        });
-        child.last_touched_at = now;
-        current = child;
+    let mut offset = 0usize;
+    while offset < pages.len() {
+        let Some(edge_index) = find_child_edge_index(current, pages[offset].key) else {
+            let edge = PrefixEdge::new(&pages[offset..], now);
+            added_tokens = added_tokens.saturating_add(edge.token_count);
+            current.children.push(edge);
+            return added_tokens;
+        };
+
+        let edge = &mut current.children[edge_index];
+        let common = common_prefix_len(&edge.pages, &pages[offset..]);
+        if common == 0 {
+            let edge = PrefixEdge::new(&pages[offset..], now);
+            added_tokens = added_tokens.saturating_add(edge.token_count);
+            current.children.push(edge);
+            return added_tokens;
+        }
+        if common < edge.pages.len() {
+            split_edge_at(edge, common, now);
+        } else {
+            edge.last_touched_at = now;
+        }
+        offset += common;
+        if offset == pages.len() {
+            return added_tokens;
+        }
+        current = &mut current.children[edge_index].child;
     }
     added_tokens
 }
@@ -547,21 +581,19 @@ fn prune_expired_children(node: &mut PrefixNode, now: Instant, ttl: Duration) ->
             let current = &mut *node_ptr;
             if !visited_children {
                 stack.push((node_ptr, true));
-                for child in current.children.values_mut() {
-                    stack.push((child as *mut PrefixNode, false));
+                for edge in &mut current.children {
+                    stack.push((&mut edge.child as *mut PrefixNode, false));
                 }
                 continue;
             }
 
-            let expired_keys = current
-                .children
-                .iter()
-                .filter(|(_, child)| now.duration_since(child.last_touched_at) > ttl)
-                .map(|(key, _)| *key)
-                .collect::<Vec<_>>();
-            for key in expired_keys {
-                if let Some(child) = current.children.remove(&key) {
-                    removed_tokens = removed_tokens.saturating_add(subtree_token_count(&child));
+            let mut index = 0usize;
+            while index < current.children.len() {
+                if now.duration_since(current.children[index].last_touched_at) > ttl {
+                    let edge = current.children.remove(index);
+                    removed_tokens = removed_tokens.saturating_add(subtree_token_count_edge(&edge));
+                } else {
+                    index += 1;
                 }
             }
         }
@@ -570,38 +602,39 @@ fn prune_expired_children(node: &mut PrefixNode, now: Instant, ttl: Duration) ->
     removed_tokens
 }
 
-fn subtree_token_count(node: &PrefixNode) -> u64 {
-    let mut total: u64 = 0;
-    let mut stack = vec![node];
+fn subtree_token_count_edge(edge: &PrefixEdge) -> u64 {
+    let mut total = edge.token_count;
+    let mut stack = vec![&edge.child];
     while let Some(current) = stack.pop() {
-        total = total.saturating_add(current.token_count);
-        stack.extend(current.children.values());
+        for edge in &current.children {
+            total = total.saturating_add(edge.token_count);
+            stack.push(&edge.child);
+        }
     }
     total
 }
 
-fn find_coldest_leaf_path(node: &PrefixNode) -> Option<Vec<u128>> {
+fn find_coldest_leaf_path(node: &PrefixNode) -> Option<Vec<usize>> {
     struct Frame<'a> {
         node: &'a PrefixNode,
-        child_keys: Vec<u128>,
+        incoming_last_touched_at: Option<Instant>,
         next_child: usize,
     }
 
-    let mut best: Option<(Instant, Vec<u128>)> = None;
-    let mut path = Vec::<u128>::new();
+    let mut best: Option<(Instant, Vec<usize>)> = None;
+    let mut path = Vec::<usize>::new();
     let mut stack = vec![Frame {
         node,
-        child_keys: node.children.keys().copied().collect(),
+        incoming_last_touched_at: None,
         next_child: 0,
     }];
 
     while let Some(frame) = stack.last_mut() {
-        if frame.child_keys.is_empty() {
-            if !path.is_empty() {
+        if frame.node.children.is_empty() {
+            if let Some(last_touched_at) = frame.incoming_last_touched_at {
                 match &best {
-                    Some((current_oldest, _)) if frame.node.last_touched_at >= *current_oldest => {
-                    },
-                    _ => best = Some((frame.node.last_touched_at, path.clone())),
+                    Some((current_oldest, _)) if last_touched_at >= *current_oldest => {},
+                    _ => best = Some((last_touched_at, path.clone())),
                 }
             }
             stack.pop();
@@ -611,7 +644,7 @@ fn find_coldest_leaf_path(node: &PrefixNode) -> Option<Vec<u128>> {
             continue;
         }
 
-        if frame.next_child >= frame.child_keys.len() {
+        if frame.next_child >= frame.node.children.len() {
             stack.pop();
             if !path.is_empty() {
                 path.pop();
@@ -619,17 +652,13 @@ fn find_coldest_leaf_path(node: &PrefixNode) -> Option<Vec<u128>> {
             continue;
         }
 
-        let page_key = frame.child_keys[frame.next_child];
+        let edge_index = frame.next_child;
         frame.next_child += 1;
-        let child = frame
-            .node
-            .children
-            .get(&page_key)
-            .expect("frame child key should resolve");
-        path.push(page_key);
+        let edge = &frame.node.children[edge_index];
+        path.push(edge_index);
         stack.push(Frame {
-            node: child,
-            child_keys: child.children.keys().copied().collect(),
+            node: &edge.child,
+            incoming_last_touched_at: Some(edge.last_touched_at),
             next_child: 0,
         });
     }
@@ -637,7 +666,7 @@ fn find_coldest_leaf_path(node: &PrefixNode) -> Option<Vec<u128>> {
     best.map(|(_, path)| path)
 }
 
-fn remove_leaf_path(node: &mut PrefixNode, path: &[u128]) -> u64 {
+fn remove_leaf_path(node: &mut PrefixNode, path: &[usize]) -> u64 {
     if path.is_empty() {
         return 0;
     }
@@ -645,7 +674,7 @@ fn remove_leaf_path(node: &mut PrefixNode, path: &[u128]) -> u64 {
     let mut lineage = Vec::with_capacity(path.len());
     let mut current_ptr = node as *mut PrefixNode;
 
-    // The lineage stores each parent pointer plus the child key used to descend
+    // The lineage stores each parent pointer plus the child index used to descend
     // one level. This lets us prune empty ancestors iteratively on the way back
     // up without recursive calls.
     // SAFETY: `lineage` stores parent pointers discovered by walking the tree
@@ -655,44 +684,85 @@ fn remove_leaf_path(node: &mut PrefixNode, path: &[u128]) -> u64 {
     unsafe {
         for key in path {
             let current = &mut *current_ptr;
-            let Some(child) = current.children.get_mut(key) else {
+            let Some(edge) = current.children.get_mut(*key) else {
                 return 0;
             };
             lineage.push((current_ptr, *key));
-            current_ptr = child as *mut PrefixNode;
+            current_ptr = &mut edge.child as *mut PrefixNode;
         }
 
-        let removed_subtree_tokens = subtree_token_count(&*current_ptr);
+        let (leaf_parent_ptr, leaf_index) = *lineage
+            .last()
+            .expect("non-empty path should always record one lineage entry");
+        let leaf_parent = &mut *leaf_parent_ptr;
+        if leaf_index >= leaf_parent.children.len() {
+            return 0;
+        }
+        let removed_edge = leaf_parent.children.remove(leaf_index);
+        let removed_subtree_tokens = subtree_token_count_edge(&removed_edge);
         if removed_subtree_tokens == 0 {
             return 0;
         }
 
-        let (leaf_parent_ptr, leaf_key) = *lineage
-            .last()
-            .expect("non-empty path should always record one lineage entry");
-        let leaf_parent = &mut *leaf_parent_ptr;
-        if leaf_parent.children.remove(&leaf_key).is_none() {
-            return 0;
-        }
-
         let mut removed_tokens = removed_subtree_tokens;
-        for &(parent_ptr, child_key) in lineage[..lineage.len().saturating_sub(1)].iter().rev() {
+        for &(parent_ptr, child_index) in lineage[..lineage.len().saturating_sub(1)].iter().rev() {
             let parent = &mut *parent_ptr;
-            let Some(child) = parent.children.get(&child_key) else {
+            let Some(edge) = parent.children.get(child_index) else {
                 break;
             };
-            if !child.children.is_empty() {
+            if !edge.child.children.is_empty() {
                 break;
             }
-            let ancestor_token_count = child.token_count;
-            if parent.children.remove(&child_key).is_none() {
-                break;
-            }
-            removed_tokens = removed_tokens.saturating_add(ancestor_token_count);
+            let edge = parent.children.remove(child_index);
+            removed_tokens = removed_tokens.saturating_add(edge.token_count);
         }
 
         removed_tokens
     }
+}
+
+fn find_child_edge_index(node: &PrefixNode, first_page_key: u128) -> Option<usize> {
+    node.children.iter().position(|edge| {
+        edge.pages
+            .first()
+            .is_some_and(|page| page.key == first_page_key)
+    })
+}
+
+fn common_prefix_len(left: &[CanonicalTokenPage], right: &[CanonicalTokenPage]) -> usize {
+    left.iter()
+        .zip(right)
+        .take_while(|(left, right)| left.key == right.key)
+        .count()
+}
+
+fn split_edge_at(edge: &mut PrefixEdge, split_at: usize, prefix_last_touched_at: Instant) {
+    debug_assert!(split_at > 0);
+    debug_assert!(split_at < edge.pages.len());
+
+    let old_pages = std::mem::take(&mut edge.pages).into_vec();
+    let old_last_touched_at = edge.last_touched_at;
+    let old_child = std::mem::take(&mut edge.child);
+    let mut prefix_pages = old_pages;
+    let suffix_pages = prefix_pages.split_off(split_at);
+    let prefix_token_count = prefix_pages_token_count(&prefix_pages);
+    let suffix_token_count = prefix_pages_token_count(&suffix_pages);
+
+    edge.pages = prefix_pages.into_boxed_slice();
+    edge.token_count = prefix_token_count;
+    edge.last_touched_at = prefix_last_touched_at;
+    edge.child = PrefixNode {
+        children: vec![PrefixEdge {
+            pages: suffix_pages.into_boxed_slice(),
+            token_count: suffix_token_count,
+            last_touched_at: old_last_touched_at,
+            child: old_child,
+        }],
+    };
+}
+
+fn prefix_pages_token_count(pages: &[CanonicalTokenPage]) -> u64 {
+    pages.iter().map(|page| u64::from(page.token_count)).sum()
 }
 
 fn canonicalize_history(history: &[Message]) -> Vec<CanonicalInputUnit> {
@@ -1348,7 +1418,7 @@ mod tests {
         assert_eq!(snapshot.page_size_tokens, PREFIX_CACHE_PAGE_SIZE);
         assert_eq!(snapshot.prefix_tree.resident_tokens, projection.stable_prefix_token_count());
         assert_eq!(snapshot.prefix_tree.max_tokens, config.prefix_cache_max_tokens);
-        assert_eq!(snapshot.prefix_tree.node_count, projection.stable_prefix_pages.len() + 1);
+        assert!(snapshot.prefix_tree.node_count <= 2);
         assert_eq!(snapshot.prefix_tree.leaf_count, 1);
         assert!(snapshot.prefix_tree.estimated_memory_bytes > 0);
         assert_eq!(snapshot.conversation_anchors.entries, 1);
@@ -1356,6 +1426,104 @@ mod tests {
             snapshot.conversation_anchors.max_entries,
             config.conversation_anchor_max_entries
         );
+    }
+
+    #[test]
+    fn prefix_tree_compresses_long_single_branch() {
+        let pages = numbered_pages(512, 10_000);
+        let mut tree = PrefixTree::default();
+        let now = Instant::now();
+        let ttl = Duration::from_secs(300);
+
+        tree.insert(&pages, now, ttl, u64::MAX);
+
+        let snapshot = tree.snapshot_stats(u64::MAX);
+        assert_eq!(snapshot.resident_tokens, pages_token_count(&pages));
+        assert_eq!(snapshot.node_count, 2);
+        assert_eq!(snapshot.edge_count, 1);
+        assert_eq!(snapshot.leaf_count, 1);
+        let matched = tree.match_prefix(&pages, now + Duration::from_secs(1), ttl);
+        assert_eq!(matched.matched_pages, pages.len());
+        assert_eq!(matched.matched_tokens, pages_token_count(&pages));
+    }
+
+    #[test]
+    fn prefix_tree_splits_compressed_edges_on_divergence() {
+        let first = pages_from_keys(&[1, 2, 3, 4]);
+        let second = pages_from_keys(&[1, 2, 9, 10]);
+        let divergent = pages_from_keys(&[1, 2, 3, 99]);
+        let mut tree = PrefixTree::default();
+        let now = Instant::now();
+        let ttl = Duration::from_secs(300);
+
+        tree.insert(&first, now, ttl, u64::MAX);
+        tree.insert(&second, now + Duration::from_secs(1), ttl, u64::MAX);
+
+        let snapshot = tree.snapshot_stats(u64::MAX);
+        assert_eq!(
+            snapshot.resident_tokens,
+            pages_token_count(&first) + pages_token_count(&second[2..])
+        );
+        assert_eq!(snapshot.node_count, 4);
+        assert_eq!(snapshot.edge_count, 3);
+        assert_eq!(snapshot.leaf_count, 2);
+
+        let matched_first = tree.match_prefix(&first, now + Duration::from_secs(2), ttl);
+        assert_eq!(matched_first.matched_pages, first.len());
+        assert_eq!(matched_first.matched_tokens, pages_token_count(&first));
+
+        let matched_second = tree.match_prefix(&second, now + Duration::from_secs(3), ttl);
+        assert_eq!(matched_second.matched_pages, second.len());
+        assert_eq!(matched_second.matched_tokens, pages_token_count(&second));
+
+        let matched_divergent = tree.match_prefix(&divergent, now + Duration::from_secs(4), ttl);
+        assert_eq!(matched_divergent.matched_pages, 3);
+        assert_eq!(matched_divergent.matched_tokens, pages_token_count(&divergent[..3]));
+    }
+
+    #[test]
+    fn prefix_tree_partial_match_only_refreshes_touched_prefix() {
+        let first = pages_from_keys(&[1, 2, 3, 4]);
+        let second = pages_from_keys(&[1, 2, 9, 10]);
+        let divergent = pages_from_keys(&[1, 2, 3, 99]);
+        let mut tree = PrefixTree::default();
+        let now = Instant::now();
+        let ttl = Duration::from_secs(30);
+
+        tree.insert(&first, now, ttl, u64::MAX);
+        tree.insert(&second, now, ttl, u64::MAX);
+        let matched = tree.match_prefix(&divergent, now + Duration::from_secs(10), ttl);
+        assert_eq!(matched.matched_pages, 3);
+
+        tree.prune_expired(now + Duration::from_secs(35), ttl);
+
+        assert_eq!(tree.resident_tokens, pages_token_count(&divergent[..3]));
+        let retained = tree.match_prefix(&divergent[..3], now + Duration::from_secs(36), ttl);
+        assert_eq!(retained.matched_pages, 3);
+        let expired_branch = tree.match_prefix(&second, now + Duration::from_secs(37), ttl);
+        assert_eq!(expired_branch.matched_pages, 2);
+    }
+
+    fn numbered_pages(count: usize, start: u128) -> Vec<CanonicalTokenPage> {
+        (0..count)
+            .map(|index| CanonicalTokenPage {
+                key: start + index as u128,
+                token_count: 64,
+            })
+            .collect()
+    }
+
+    fn pages_from_keys(keys: &[u128]) -> Vec<CanonicalTokenPage> {
+        keys.iter()
+            .map(|key| CanonicalTokenPage {
+                key: *key,
+                token_count: 10,
+            })
+            .collect()
+    }
+
+    fn pages_token_count(pages: &[CanonicalTokenPage]) -> u64 {
+        pages.iter().map(|page| u64::from(page.token_count)).sum()
     }
 
     #[test]
