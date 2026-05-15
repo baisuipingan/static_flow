@@ -27,7 +27,7 @@ use llm_access_core::store::{
 };
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use llm_access_core::usage::UsageEvent;
-use llm_access_store::repository::SqliteControlRepository;
+use llm_access_store::{postgres::PostgresControlRepository, repository::SqliteControlRepository};
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use tokio::{
     sync::{mpsc, watch, Mutex},
@@ -97,6 +97,92 @@ struct LlmAccessStores {
     usage_event_flusher: Option<Arc<UsageEventFlusherHandle>>,
 }
 
+#[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
+trait RuntimeRepository:
+    ControlStore
+    + ProviderRouteStore
+    + AdminConfigStore
+    + AdminKeyStore
+    + AdminAccountGroupStore
+    + AdminProxyStore
+    + AdminCodexAccountStore
+    + AdminKiroAccountStore
+    + AdminReviewQueueStore
+    + PublicAccessStore
+    + PublicCommunityStore
+    + PublicUsageStore
+    + PublicSubmissionStore
+    + PublicStatusStore
+    + UsageEventSink
+    + Send
+    + Sync
+{
+}
+
+#[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
+impl<T> RuntimeRepository for T where
+    T: ControlStore
+        + ProviderRouteStore
+        + AdminConfigStore
+        + AdminKeyStore
+        + AdminAccountGroupStore
+        + AdminProxyStore
+        + AdminCodexAccountStore
+        + AdminKiroAccountStore
+        + AdminReviewQueueStore
+        + PublicAccessStore
+        + PublicCommunityStore
+        + PublicUsageStore
+        + PublicSubmissionStore
+        + PublicStatusStore
+        + UsageEventSink
+        + Send
+        + Sync
+{
+}
+
+#[cfg(not(any(feature = "duckdb-runtime", feature = "duckdb-bundled")))]
+trait RuntimeRepository:
+    ControlStore
+    + ProviderRouteStore
+    + AdminConfigStore
+    + AdminKeyStore
+    + AdminAccountGroupStore
+    + AdminProxyStore
+    + AdminCodexAccountStore
+    + AdminKiroAccountStore
+    + AdminReviewQueueStore
+    + PublicAccessStore
+    + PublicCommunityStore
+    + PublicUsageStore
+    + PublicSubmissionStore
+    + PublicStatusStore
+    + Send
+    + Sync
+{
+}
+
+#[cfg(not(any(feature = "duckdb-runtime", feature = "duckdb-bundled")))]
+impl<T> RuntimeRepository for T where
+    T: ControlStore
+        + ProviderRouteStore
+        + AdminConfigStore
+        + AdminKeyStore
+        + AdminAccountGroupStore
+        + AdminProxyStore
+        + AdminCodexAccountStore
+        + AdminKiroAccountStore
+        + AdminReviewQueueStore
+        + PublicAccessStore
+        + PublicCommunityStore
+        + PublicUsageStore
+        + PublicSubmissionStore
+        + PublicStatusStore
+        + Send
+        + Sync
+{
+}
+
 impl LlmAccessRuntime {
     /// Create runtime dependencies from explicit storage adapters.
     pub fn new(control_store: Arc<dyn ControlStore>) -> Self {
@@ -158,16 +244,34 @@ impl LlmAccessRuntime {
         let geoip = GeoIpResolver::from_env()?;
         geoip.warmup().await;
         let email_notifier = crate::email::EmailNotifier::from_env()?.map(Arc::new);
-        let repository = Arc::new(match &config.control_store {
+        match &config.control_store {
             ControlStoreConfig::Sqlite {
                 path,
-            } => SqliteControlRepository::open_path(path)?,
-            ControlStoreConfig::Postgres {
-                ..
             } => {
-                return Err(anyhow!("postgres control backend is not wired yet"));
+                let repository = Arc::new(SqliteControlRepository::open_path(path)?);
+                Self::from_open_repository(config, geoip, email_notifier, repository).await
             },
-        });
+            ControlStoreConfig::Postgres {
+                database_url_env,
+            } => {
+                let database_url = std::env::var(database_url_env).with_context(|| {
+                    format!("missing control database env `{database_url_env}`")
+                })?;
+                let repository = Arc::new(PostgresControlRepository::connect(&database_url).await?);
+                Self::from_open_repository(config, geoip, email_notifier, repository).await
+            },
+        }
+    }
+
+    async fn from_open_repository<R>(
+        config: &StorageConfig,
+        geoip: GeoIpResolver,
+        email_notifier: Option<Arc<crate::email::EmailNotifier>>,
+        repository: Arc<R>,
+    ) -> anyhow::Result<Self>
+    where
+        R: RuntimeRepository + 'static,
+    {
         #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
         let initial_runtime_config = repository.get_admin_runtime_config().await?;
         #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
@@ -1201,6 +1305,7 @@ pub fn validate_state_root(config: &StorageConfig) -> anyhow::Result<()> {
     if !metadata.is_dir() {
         return Err(anyhow!("state root `{}` is not a directory", config.state_root.display()));
     }
+    validate_usage_journal_dir(&config.usage_journal_dir)?;
     for dir in [
         &config.kiro_auths_dir,
         &config.codex_auths_dir,
@@ -1221,9 +1326,25 @@ pub fn validate_usage_worker_state_root(config: &StorageConfig) -> anyhow::Resul
     if !metadata.is_dir() {
         return Err(anyhow!("state root `{}` is not a directory", config.state_root.display()));
     }
+    validate_usage_journal_dir(&config.usage_journal_dir)?;
     std::fs::create_dir_all(&config.usage_journal_dir).with_context(|| {
         format!("failed to create usage journal dir `{}`", config.usage_journal_dir.display())
     })?;
+    Ok(())
+}
+
+fn validate_usage_journal_dir(path: &std::path::Path) -> anyhow::Result<()> {
+    for shared_root in
+        [std::path::Path::new("/mnt/llm-access"), std::path::Path::new("/mnt/llm-access-usage")]
+    {
+        if path.starts_with(shared_root) {
+            anyhow::bail!(
+                "usage journal dir `{}` must stay on local disk, not under shared mount `{}`",
+                path.display(),
+                shared_root.display()
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1278,6 +1399,39 @@ mod tests {
         assert!(config.codex_auths_dir.is_dir());
         assert!(config.logs_dir.is_dir());
         assert!(config.usage_journal_dir.is_dir());
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn validate_state_root_rejects_usage_journal_under_control_mount() {
+        let mut config = temp_storage_config("state-root-shared-journal");
+        let root = config.state_root.clone();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        config.usage_journal_dir = std::path::PathBuf::from("/mnt/llm-access/usage-journal");
+
+        let err = super::validate_state_root(&config).expect_err("shared journal must fail");
+        assert!(err
+            .to_string()
+            .contains("usage journal dir `/mnt/llm-access/usage-journal` must stay on local disk"));
+
+        std::fs::remove_dir_all(&root).expect("cleanup");
+    }
+
+    #[test]
+    fn validate_usage_worker_state_root_rejects_usage_journal_under_usage_mount() {
+        let mut config = temp_storage_config("worker-state-root-shared-journal");
+        let root = config.state_root.clone();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create root");
+        config.usage_journal_dir = std::path::PathBuf::from("/mnt/llm-access-usage/usage-journal");
+
+        let err = super::validate_usage_worker_state_root(&config)
+            .expect_err("shared usage journal must fail");
+        assert!(err.to_string().contains(
+            "usage journal dir `/mnt/llm-access-usage/usage-journal` must stay on local disk"
+        ));
+
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 

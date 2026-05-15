@@ -1,0 +1,5268 @@
+//! Postgres control-plane repository for `llm-access`.
+
+use std::collections::BTreeMap;
+
+use anyhow::Context;
+use async_trait::async_trait;
+use llm_access_core::{
+    provider::RouteStrategy,
+    store::{
+        self as core_store, default_proxy_bindings, AdminAccountContributionRequest,
+        AdminAccountContributionRequestsPage, AdminAccountGroup, AdminAccountGroupPatch,
+        AdminAccountGroupStore, AdminCodexAccount, AdminCodexAccountPatch, AdminCodexAccountStore,
+        AdminCodexImportJobDetail, AdminCodexImportJobItem, AdminCodexImportJobItemResult,
+        AdminCodexImportJobSummary, AdminConfigStore, AdminKey, AdminKeyPatch, AdminKeyStore,
+        AdminKiroAccount, AdminKiroAccountPatch, AdminKiroAccountStore, AdminKiroBalanceView,
+        AdminKiroCacheView, AdminKiroStatusCacheUpdate, AdminLegacyKiroProxyMigration,
+        AdminProxyBinding, AdminProxyConfig, AdminProxyConfigPatch, AdminProxyStore,
+        AdminReviewQueueAction, AdminReviewQueueQuery, AdminReviewQueueStore, AdminRuntimeConfig,
+        AdminSponsorRequest, AdminSponsorRequestsPage, AdminTokenRequest, AdminTokenRequestsPage,
+        AuthenticatedKey, CodexPublicAccountStatus, CodexRateLimitStatus, ControlStore,
+        NewAdminAccountGroup, NewAdminCodexAccount, NewAdminCodexImportJob, NewAdminKey,
+        NewAdminKiroAccount, NewAdminProxyConfig, NewPublicAccountContributionRequest,
+        NewPublicSponsorRequest, NewPublicTokenRequest, ProviderCodexAuthUpdate,
+        ProviderCodexRoute, ProviderKiroAuthUpdate, ProviderKiroRoute, ProviderProxyConfig,
+        ProviderRouteStore, PublicAccessKey, PublicAccessStore, PublicAccountContribution,
+        PublicCommunityStore, PublicSponsor, PublicStatusStore, PublicSubmissionStore,
+        PublicUsageLookupKey, PublicUsageStore, UsageEventSink, DEFAULT_AUTH_CACHE_TTL_SECONDS,
+        DEFAULT_CODEX_STATUS_REFRESH_SECONDS, PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED,
+        PUBLIC_SPONSOR_REQUEST_STATUS_PAYMENT_EMAIL_SENT, PUBLIC_SPONSOR_REQUEST_STATUS_SUBMITTED,
+        PUBLIC_TOKEN_REQUEST_STATUS_PENDING,
+    },
+    usage::UsageEvent,
+};
+use llm_access_kiro::cache_policy::{resolve_effective_kiro_cache_policy, KiroCachePolicy};
+use sha2::{Digest, Sha256};
+use sqlx_core::{
+    arguments::Arguments, column::ColumnIndex, decode::Decode, encode::Encode, query::query_with,
+    row::Row as SqlxRowTrait, types::Type,
+};
+use sqlx_postgres::{PgArguments, PgPool, PgPoolOptions, PgRow as SqlxPgRow, Postgres};
+use tokio::sync::Mutex;
+
+use crate::sqlite::{
+    CodexAccountRecord, KeyBundle, KeyRecord, KeyRouteConfig, KeyUsageRollup, KiroAccountRecord,
+    RuntimeConfigRecord,
+};
+
+trait SqlxBindParam {
+    fn add_to(&self, args: &mut PgArguments) -> anyhow::Result<()>;
+}
+
+impl<T> SqlxBindParam for T
+where
+    T: Clone + Send + Sync + for<'q> Encode<'q, Postgres> + Type<Postgres>,
+{
+    fn add_to(&self, args: &mut PgArguments) -> anyhow::Result<()> {
+        args.add(self.clone())
+            .map_err(|err| anyhow::anyhow!("encode sqlx postgres bind parameter: {err}"))?;
+        Ok(())
+    }
+}
+
+fn build_pg_arguments(params: &[&(dyn SqlxBindParam + Sync)]) -> anyhow::Result<PgArguments> {
+    let mut args = PgArguments::default();
+    for param in params {
+        param.add_to(&mut args)?;
+    }
+    Ok(args)
+}
+
+struct PgRow(SqlxPgRow);
+
+impl PgRow {
+    fn get<'r, I, T>(&'r self, index: I) -> T
+    where
+        I: ColumnIndex<SqlxPgRow>,
+        T: Decode<'r, Postgres> + Type<Postgres>,
+    {
+        self.0
+            .try_get(index)
+            .expect("decode sqlx postgres row column")
+    }
+}
+
+#[derive(Clone)]
+struct SqlxClient {
+    pool: PgPool,
+}
+
+impl SqlxClient {
+    async fn connect(database_url: &str) -> anyhow::Result<Self> {
+        let pool = PgPoolOptions::new()
+            .max_connections(8)
+            .connect(database_url)
+            .await
+            .context("connect sqlx postgres control repository")?;
+        Ok(Self {
+            pool,
+        })
+    }
+
+    fn is_closed(&self) -> bool {
+        self.pool.is_closed()
+    }
+
+    async fn query_opt(
+        &self,
+        sql: &str,
+        params: &[&(dyn SqlxBindParam + Sync)],
+    ) -> anyhow::Result<Option<PgRow>> {
+        let args = build_pg_arguments(params)?;
+        Ok(query_with(sql, args)
+            .fetch_optional(&self.pool)
+            .await
+            .context("query optional sqlx postgres row")?
+            .map(PgRow))
+    }
+
+    async fn query_one(
+        &self,
+        sql: &str,
+        params: &[&(dyn SqlxBindParam + Sync)],
+    ) -> anyhow::Result<PgRow> {
+        let args = build_pg_arguments(params)?;
+        let row = query_with(sql, args)
+            .fetch_one(&self.pool)
+            .await
+            .context("query one sqlx postgres row")?;
+        Ok(PgRow(row))
+    }
+
+    async fn query(
+        &self,
+        sql: &str,
+        params: &[&(dyn SqlxBindParam + Sync)],
+    ) -> anyhow::Result<Vec<PgRow>> {
+        let args = build_pg_arguments(params)?;
+        let rows = query_with(sql, args)
+            .fetch_all(&self.pool)
+            .await
+            .context("query many sqlx postgres rows")?;
+        Ok(rows.into_iter().map(PgRow).collect())
+    }
+
+    async fn execute(
+        &self,
+        sql: &str,
+        params: &[&(dyn SqlxBindParam + Sync)],
+    ) -> anyhow::Result<u64> {
+        let args = build_pg_arguments(params)?;
+        let result = query_with(sql, args)
+            .execute(&self.pool)
+            .await
+            .context("execute sqlx postgres statement")?;
+        Ok(result.rows_affected())
+    }
+
+    #[cfg(test)]
+    async fn batch_execute(&self, sql: &str) -> anyhow::Result<()> {
+        sqlx_core::raw_sql::raw_sql(sql)
+            .execute(&self.pool)
+            .await
+            .context("execute raw sqlx postgres statement")?;
+        Ok(())
+    }
+
+    async fn transaction(&self) -> anyhow::Result<SqlxTransaction<'_>> {
+        let tx = self
+            .pool
+            .begin()
+            .await
+            .context("begin sqlx postgres transaction")?;
+        Ok(SqlxTransaction {
+            inner: Mutex::new(Some(tx)),
+        })
+    }
+
+    #[cfg(test)]
+    async fn close(&self) {
+        self.pool.close().await;
+    }
+}
+
+struct SqlxTransaction<'a> {
+    inner: Mutex<Option<sqlx_postgres::PgTransaction<'a>>>,
+}
+
+impl<'a> SqlxTransaction<'a> {
+    async fn execute(
+        &self,
+        sql: &str,
+        params: &[&(dyn SqlxBindParam + Sync)],
+    ) -> anyhow::Result<u64> {
+        let args = build_pg_arguments(params)?;
+        let mut guard = self.inner.lock().await;
+        let tx = guard
+            .as_mut()
+            .context("sqlx postgres transaction is already finished")?;
+        let result = query_with(sql, args)
+            .execute(&mut **tx)
+            .await
+            .context("execute sqlx postgres transaction statement")?;
+        Ok(result.rows_affected())
+    }
+
+    async fn commit(self) -> anyhow::Result<()> {
+        let mut guard = self.inner.lock().await;
+        let tx = guard
+            .take()
+            .context("sqlx postgres transaction is already finished")?;
+        drop(guard);
+        tx.commit()
+            .await
+            .context("commit sqlx postgres transaction")?;
+        Ok(())
+    }
+}
+
+/// Async Postgres-backed control-plane repository.
+pub struct PostgresControlRepository {
+    client: SqlxClient,
+}
+
+type KiroCachedStatusParts = (Option<AdminKiroBalanceView>, AdminKiroCacheView);
+
+struct KiroAdminAccountViewContext {
+    default_cache: AdminKiroCacheView,
+    status_by_account: BTreeMap<String, KiroCachedStatusParts>,
+    proxy_configs_by_id: BTreeMap<String, AdminProxyConfig>,
+    kiro_proxy_binding: AdminProxyBinding,
+}
+
+struct CodexAdminAccountViewContext {
+    proxy_configs_by_id: BTreeMap<String, AdminProxyConfig>,
+    codex_proxy_binding: AdminProxyBinding,
+}
+
+struct ProviderProxyResolutionContext {
+    proxy_configs_by_id: BTreeMap<String, AdminProxyConfig>,
+    binding: AdminProxyBinding,
+}
+
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(default)]
+struct CodexAccountSettings {
+    map_gpt53_codex_to_spark: bool,
+    auth_refresh_enabled: bool,
+    route_weight_tier: Option<String>,
+    proxy_mode: String,
+    proxy_config_id: Option<String>,
+    request_max_concurrency: Option<u64>,
+    request_min_start_interval_ms: Option<u64>,
+}
+
+impl Default for CodexAccountSettings {
+    fn default() -> Self {
+        Self {
+            map_gpt53_codex_to_spark: false,
+            auth_refresh_enabled: true,
+            route_weight_tier: None,
+            proxy_mode: "inherit".to_string(),
+            proxy_config_id: None,
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+        }
+    }
+}
+
+impl PostgresControlRepository {
+    /// Connect to the Postgres control plane and run pending migrations.
+    pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
+        let client = SqlxClient::connect(database_url).await?;
+        llm_access_migrations::run_postgres_migrations(&client.pool).await?;
+        Ok(Self {
+            client,
+        })
+    }
+
+    async fn connect_fresh_client(&self) -> anyhow::Result<SqlxClient> {
+        Ok(self.client.clone())
+    }
+
+    async fn load_runtime_config_record(&self) -> anyhow::Result<Option<RuntimeConfigRecord>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT
+                    id,
+                    auth_cache_ttl_seconds,
+                    max_request_body_bytes,
+                    account_failure_retry_limit,
+                    codex_client_version,
+                    kiro_channel_max_concurrency,
+                    kiro_channel_min_start_interval_ms,
+                    codex_status_refresh_min_interval_seconds,
+                    codex_status_refresh_max_interval_seconds,
+                    codex_status_account_jitter_max_seconds,
+                    codex_weight_free,
+                    codex_weight_plus,
+                    codex_weight_pro5x,
+                    codex_weight_pro20x,
+                    kiro_status_refresh_min_interval_seconds,
+                    kiro_status_refresh_max_interval_seconds,
+                    kiro_status_account_jitter_max_seconds,
+                    usage_event_flush_batch_size,
+                    usage_event_flush_interval_seconds,
+                    usage_event_flush_max_buffer_bytes,
+                    duckdb_usage_memory_limit_mib,
+                    duckdb_usage_checkpoint_threshold_mib,
+                    usage_analytics_retention_days,
+                    usage_journal_enabled,
+                    usage_journal_max_file_bytes,
+                    usage_journal_max_file_age_ms,
+                    usage_journal_max_files,
+                    usage_journal_block_target_uncompressed_bytes,
+                    usage_journal_block_max_events,
+                    usage_journal_fsync_interval_ms,
+                    usage_journal_zstd_level,
+                    usage_journal_consumer_lease_ms,
+                    usage_journal_delete_bad_files,
+                    usage_query_bind_addr,
+                    usage_query_base_url,
+                    usage_event_maintenance_enabled,
+                    usage_event_maintenance_interval_seconds,
+                    usage_event_detail_retention_days,
+                    kiro_cache_kmodels_json::text AS kiro_cache_kmodels_json,
+                    kiro_billable_model_multipliers_json::text
+                        AS kiro_billable_model_multipliers_json,
+                    kiro_cache_policy_json::text AS kiro_cache_policy_json,
+                    kiro_prefix_cache_mode,
+                    kiro_prefix_cache_max_tokens,
+                    kiro_prefix_cache_entry_ttl_seconds,
+                    kiro_conversation_anchor_max_entries,
+                    kiro_conversation_anchor_ttl_seconds,
+                    updated_at_ms
+                 FROM llm_runtime_config
+                 WHERE id = 'default'",
+                &[],
+            )
+            .await
+            .context("load runtime config")?;
+        row.map(decode_runtime_config_row).transpose()
+    }
+
+    fn ensure_connection_alive(&self) -> anyhow::Result<()> {
+        if self.client.is_closed() {
+            anyhow::bail!("sqlx postgres control pool is closed");
+        }
+        Ok(())
+    }
+
+    async fn load_key_bundle_by_hash(&self, key_hash: &str) -> anyhow::Result<Option<KeyBundle>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT
+                    k.key_id, k.name, k.secret, k.key_hash, k.status, k.provider_type,
+                    k.protocol_family, k.public_visible, k.quota_billable_limit,
+                    k.created_at_ms, k.updated_at_ms,
+                    r.route_strategy, r.fixed_account_name, r.auto_account_names_json::text,
+                    r.account_group_id, r.model_name_map_json::text,
+                    r.request_max_concurrency, r.request_min_start_interval_ms,
+                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
+                    r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.kiro_cache_policy_override_json::text,
+                    r.kiro_billable_model_multipliers_override_json::text,
+                    COALESCE(u.input_uncached_tokens, 0),
+                    COALESCE(u.input_cached_tokens, 0),
+                    COALESCE(u.output_tokens, 0),
+                    COALESCE(u.billable_tokens, 0),
+                    COALESCE(u.credit_total, '0'),
+                    COALESCE(u.credit_missing_events, 0),
+                    u.last_used_at_ms,
+                    COALESCE(u.updated_at_ms, 0)
+                 FROM llm_keys k
+                 LEFT JOIN llm_key_route_config r ON r.key_id = k.key_id
+                 LEFT JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 WHERE k.key_hash = $1",
+                &[&key_hash],
+            )
+            .await
+            .context("load key bundle by hash")?;
+        row.map(decode_key_bundle_row).transpose()
+    }
+
+    async fn load_key_bundle_by_id(&self, key_id: &str) -> anyhow::Result<Option<KeyBundle>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT
+                    k.key_id, k.name, k.secret, k.key_hash, k.status, k.provider_type,
+                    k.protocol_family, k.public_visible, k.quota_billable_limit,
+                    k.created_at_ms, k.updated_at_ms,
+                    r.route_strategy, r.fixed_account_name, r.auto_account_names_json::text,
+                    r.account_group_id, r.model_name_map_json::text,
+                    r.request_max_concurrency, r.request_min_start_interval_ms,
+                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
+                    r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.kiro_cache_policy_override_json::text,
+                    r.kiro_billable_model_multipliers_override_json::text,
+                    COALESCE(u.input_uncached_tokens, 0),
+                    COALESCE(u.input_cached_tokens, 0),
+                    COALESCE(u.output_tokens, 0),
+                    COALESCE(u.billable_tokens, 0),
+                    COALESCE(u.credit_total, '0'),
+                    COALESCE(u.credit_missing_events, 0),
+                    u.last_used_at_ms,
+                    COALESCE(u.updated_at_ms, 0)
+                 FROM llm_keys k
+                 LEFT JOIN llm_key_route_config r ON r.key_id = k.key_id
+                 LEFT JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 WHERE k.key_id = $1",
+                &[&key_id],
+            )
+            .await
+            .context("load key bundle by id")?;
+        row.map(decode_key_bundle_row).transpose()
+    }
+
+    async fn list_key_bundles(&self) -> anyhow::Result<Vec<KeyBundle>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    k.key_id, k.name, k.secret, k.key_hash, k.status, k.provider_type,
+                    k.protocol_family, k.public_visible, k.quota_billable_limit,
+                    k.created_at_ms, k.updated_at_ms,
+                    r.route_strategy, r.fixed_account_name, r.auto_account_names_json::text,
+                    r.account_group_id, r.model_name_map_json::text,
+                    r.request_max_concurrency, r.request_min_start_interval_ms,
+                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
+                    r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.kiro_cache_policy_override_json::text,
+                    r.kiro_billable_model_multipliers_override_json::text,
+                    u.input_uncached_tokens, u.input_cached_tokens, u.output_tokens,
+                    u.billable_tokens, u.credit_total, u.credit_missing_events,
+                    u.last_used_at_ms, u.updated_at_ms
+                 FROM llm_keys k
+                 JOIN llm_key_route_config r ON r.key_id = k.key_id
+                 JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 ORDER BY k.created_at_ms DESC, k.key_id DESC",
+                &[],
+            )
+            .await
+            .context("list key bundles")?;
+        rows.into_iter()
+            .map(decode_key_bundle_row)
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    async fn list_public_access_keys_rows(&self) -> anyhow::Result<Vec<PublicAccessKey>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    k.key_id,
+                    k.name,
+                    k.secret,
+                    k.quota_billable_limit,
+                    COALESCE(u.input_uncached_tokens, 0),
+                    COALESCE(u.input_cached_tokens, 0),
+                    COALESCE(u.output_tokens, 0),
+                    COALESCE(u.billable_tokens, 0),
+                    u.last_used_at_ms
+                 FROM llm_keys k
+                 LEFT JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 WHERE k.status = 'active' AND k.public_visible = TRUE
+                 ORDER BY lower(k.name)",
+                &[],
+            )
+            .await
+            .context("list public access keys")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PublicAccessKey {
+                key_id: row.get(0),
+                key_name: row.get(1),
+                secret: row.get(2),
+                quota_billable_limit: row.get::<_, i64>(3).max(0) as u64,
+                usage_input_uncached_tokens: row.get::<_, i64>(4).max(0) as u64,
+                usage_input_cached_tokens: row.get::<_, i64>(5).max(0) as u64,
+                usage_output_tokens: row.get::<_, i64>(6).max(0) as u64,
+                usage_billable_tokens: row.get::<_, i64>(7).max(0) as u64,
+                last_used_at_ms: row.get(8),
+            })
+            .collect())
+    }
+
+    async fn load_public_usage_key_by_hash(
+        &self,
+        key_hash: &str,
+    ) -> anyhow::Result<Option<PublicUsageLookupKey>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT
+                    k.key_id,
+                    k.name,
+                    k.provider_type,
+                    k.status,
+                    k.public_visible,
+                    k.quota_billable_limit,
+                    COALESCE(u.input_uncached_tokens, 0),
+                    COALESCE(u.input_cached_tokens, 0),
+                    COALESCE(u.output_tokens, 0),
+                    COALESCE(u.billable_tokens, 0),
+                    COALESCE(u.credit_total, '0'),
+                    COALESCE(u.credit_missing_events, 0),
+                    u.last_used_at_ms
+                 FROM llm_keys k
+                 LEFT JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 WHERE k.key_hash = $1",
+                &[&key_hash],
+            )
+            .await
+            .context("load public usage key by hash")?;
+        row.map(decode_public_usage_lookup_row).transpose()
+    }
+
+    async fn list_public_account_contributions_rows(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<PublicAccountContribution>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    request_id,
+                    COALESCE(imported_account_name, account_name),
+                    contributor_message,
+                    github_id,
+                    processed_at_ms
+                 FROM llm_account_contribution_requests
+                 WHERE status = 'issued'
+                   AND show_on_public_wall = TRUE
+                 ORDER BY COALESCE(processed_at_ms, created_at_ms) DESC
+                 LIMIT $1",
+                &[&(limit.max(1) as i64)],
+            )
+            .await
+            .context("list public account contributions")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PublicAccountContribution {
+                request_id: row.get(0),
+                account_name: row.get(1),
+                contributor_message: row.get(2),
+                github_id: row.get(3),
+                processed_at_ms: row.get(4),
+            })
+            .collect())
+    }
+
+    async fn list_public_sponsors_rows(&self, limit: usize) -> anyhow::Result<Vec<PublicSponsor>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    request_id,
+                    display_name,
+                    sponsor_message,
+                    github_id,
+                    processed_at_ms
+                 FROM llm_sponsor_requests
+                 WHERE status = 'approved'
+                 ORDER BY COALESCE(processed_at_ms, created_at_ms) DESC
+                 LIMIT $1",
+                &[&(limit.max(1) as i64)],
+            )
+            .await
+            .context("list public sponsors")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| PublicSponsor {
+                request_id: row.get(0),
+                display_name: row.get(1),
+                sponsor_message: row.get(2),
+                github_id: row.get(3),
+                processed_at_ms: row.get(4),
+            })
+            .collect())
+    }
+
+    async fn list_admin_account_groups_rows(
+        &self,
+        provider_type: &str,
+    ) -> anyhow::Result<Vec<AdminAccountGroup>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT group_id, provider_type, name, account_names_json::text,
+                    created_at_ms, updated_at_ms
+                 FROM llm_account_groups
+                 WHERE provider_type = $1
+                 ORDER BY created_at_ms DESC, group_id DESC",
+                &[&provider_type],
+            )
+            .await
+            .context("list admin account groups")?;
+        rows.into_iter()
+            .map(decode_admin_account_group_row)
+            .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    async fn get_admin_account_group_row(
+        &self,
+        group_id: &str,
+    ) -> anyhow::Result<Option<AdminAccountGroup>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT group_id, provider_type, name, account_names_json::text,
+                    created_at_ms, updated_at_ms
+                 FROM llm_account_groups
+                 WHERE group_id = $1",
+                &[&group_id],
+            )
+            .await
+            .context("load admin account group")?;
+        row.map(decode_admin_account_group_row).transpose()
+    }
+
+    async fn list_admin_proxy_configs_rows(&self) -> anyhow::Result<Vec<AdminProxyConfig>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT proxy_config_id, name, proxy_url, proxy_username, proxy_password,
+                    status, created_at_ms, updated_at_ms
+                 FROM llm_proxy_configs
+                 ORDER BY created_at_ms DESC, proxy_config_id DESC",
+                &[],
+            )
+            .await
+            .context("list admin proxy configs")?;
+        Ok(rows
+            .into_iter()
+            .map(decode_admin_proxy_config_row)
+            .collect())
+    }
+
+    async fn get_admin_proxy_config_row(
+        &self,
+        proxy_id: &str,
+    ) -> anyhow::Result<Option<AdminProxyConfig>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT proxy_config_id, name, proxy_url, proxy_username, proxy_password,
+                    status, created_at_ms, updated_at_ms
+                 FROM llm_proxy_configs
+                 WHERE proxy_config_id = $1",
+                &[&proxy_id],
+            )
+            .await
+            .context("load admin proxy config")?;
+        Ok(row.map(decode_admin_proxy_config_row))
+    }
+
+    async fn load_admin_proxy_binding_row(
+        &self,
+        provider_type: &str,
+    ) -> anyhow::Result<AdminProxyBinding> {
+        let proxy_configs_by_id = self
+            .list_admin_proxy_configs_rows()
+            .await?
+            .into_iter()
+            .map(|proxy| (proxy.id.clone(), proxy))
+            .collect::<BTreeMap<_, _>>();
+        self.load_admin_proxy_binding_from_configs(provider_type, &proxy_configs_by_id)
+            .await
+    }
+
+    async fn load_admin_proxy_binding_from_configs(
+        &self,
+        provider_type: &str,
+        proxy_configs_by_id: &BTreeMap<String, AdminProxyConfig>,
+    ) -> anyhow::Result<AdminProxyBinding> {
+        self.ensure_connection_alive()?;
+        let binding = self
+            .client
+            .query_opt(
+                "SELECT provider_type, proxy_config_id, updated_at_ms
+                 FROM llm_proxy_bindings
+                 WHERE provider_type = $1",
+                &[&provider_type],
+            )
+            .await
+            .context("load proxy binding row")?;
+        let Some(row) = binding else {
+            return Ok(default_proxy_bindings()
+                .into_iter()
+                .find(|binding| binding.provider_type == provider_type)
+                .unwrap_or_else(|| AdminProxyBinding {
+                    provider_type: provider_type.to_string(),
+                    effective_source: "none".to_string(),
+                    bound_proxy_config_id: None,
+                    effective_proxy_config_name: None,
+                    effective_proxy_url: None,
+                    effective_proxy_username: None,
+                    effective_proxy_password: None,
+                    binding_updated_at: None,
+                    error_message: None,
+                }));
+        };
+        let provider_type: String = row.get(0);
+        let proxy_config_id: String = row.get(1);
+        let updated_at_ms: i64 = row.get(2);
+        let Some(proxy) = proxy_configs_by_id.get(&proxy_config_id).cloned() else {
+            return Ok(AdminProxyBinding {
+                provider_type,
+                effective_source: "invalid".to_string(),
+                bound_proxy_config_id: Some(proxy_config_id),
+                effective_proxy_config_name: None,
+                effective_proxy_url: None,
+                effective_proxy_username: None,
+                effective_proxy_password: None,
+                binding_updated_at: Some(updated_at_ms),
+                error_message: Some("bound proxy config is missing".to_string()),
+            });
+        };
+        if proxy.status != core_store::KEY_STATUS_ACTIVE {
+            return Ok(AdminProxyBinding {
+                provider_type,
+                effective_source: "invalid".to_string(),
+                bound_proxy_config_id: Some(proxy.id),
+                effective_proxy_config_name: Some(proxy.name),
+                effective_proxy_url: None,
+                effective_proxy_username: None,
+                effective_proxy_password: None,
+                binding_updated_at: Some(updated_at_ms),
+                error_message: Some("bound proxy config is disabled".to_string()),
+            });
+        }
+        Ok(AdminProxyBinding {
+            provider_type,
+            effective_source: "binding".to_string(),
+            bound_proxy_config_id: Some(proxy.id),
+            effective_proxy_config_name: Some(proxy.name),
+            effective_proxy_url: Some(proxy.proxy_url),
+            effective_proxy_username: proxy.proxy_username,
+            effective_proxy_password: proxy.proxy_password,
+            binding_updated_at: Some(updated_at_ms),
+            error_message: None,
+        })
+    }
+
+    async fn load_codex_rate_limit_status_row(
+        &self,
+    ) -> anyhow::Result<Option<CodexRateLimitStatus>> {
+        self.ensure_connection_alive()?;
+        let snapshot_json = self
+            .client
+            .query_opt(
+                "SELECT snapshot_json::text FROM llm_codex_status_cache WHERE id = 'default'",
+                &[],
+            )
+            .await
+            .context("load codex rate-limit status snapshot")?
+            .map(|row| row.get::<_, String>(0));
+        snapshot_json
+            .map(|json| {
+                serde_json::from_str::<CodexRateLimitStatus>(&json)
+                    .context("decode codex rate-limit status snapshot")
+            })
+            .transpose()
+    }
+
+    async fn get_admin_token_request_row(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<Option<AdminTokenRequest>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT
+                    request_id, requester_email, requested_quota_billable_limit,
+                    request_reason, frontend_page_url, status, client_ip, ip_region,
+                    admin_note, failure_reason, issued_key_id, issued_key_name,
+                    created_at_ms, updated_at_ms, processed_at_ms
+                 FROM llm_token_requests
+                 WHERE request_id = $1",
+                &[&request_id],
+            )
+            .await
+            .context("load admin token request")?;
+        Ok(row.map(decode_admin_token_request_row))
+    }
+
+    async fn get_admin_account_contribution_request_row(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT
+                    request_id, account_name, account_id, id_token, access_token,
+                    refresh_token, requester_email, contributor_message, github_id,
+                    frontend_page_url, status, client_ip, ip_region, admin_note,
+                    failure_reason, imported_account_name, issued_key_id, issued_key_name,
+                    created_at_ms, updated_at_ms, processed_at_ms
+                 FROM llm_account_contribution_requests
+                 WHERE request_id = $1",
+                &[&request_id],
+            )
+            .await
+            .context("load admin account contribution request")?;
+        Ok(row.map(decode_admin_account_contribution_request_row))
+    }
+
+    async fn get_admin_sponsor_request_row(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<Option<AdminSponsorRequest>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT
+                    request_id, requester_email, sponsor_message, display_name, github_id,
+                    frontend_page_url, status, client_ip, ip_region, admin_note,
+                    failure_reason, payment_email_sent_at_ms, created_at_ms, updated_at_ms,
+                    processed_at_ms
+                 FROM llm_sponsor_requests
+                 WHERE request_id = $1",
+                &[&request_id],
+            )
+            .await
+            .context("load admin sponsor request")?;
+        Ok(row.map(decode_admin_sponsor_request_row))
+    }
+
+    async fn count_rows(
+        &self,
+        count_all_sql: &str,
+        count_status_sql: &str,
+        status: Option<&str>,
+    ) -> anyhow::Result<usize> {
+        self.ensure_connection_alive()?;
+        let count: i64 = if let Some(status) = status {
+            self.client
+                .query_one(count_status_sql, &[&status])
+                .await
+                .context("count filtered rows")?
+                .get(0)
+        } else {
+            self.client
+                .query_one(count_all_sql, &[])
+                .await
+                .context("count rows")?
+                .get(0)
+        };
+        Ok(count.max(0) as usize)
+    }
+
+    async fn list_codex_accounts_rows(&self) -> anyhow::Result<Vec<CodexAccountRecord>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    account_name, account_id, email, status, auth_json::text, settings_json::text,
+                    last_refresh_at_ms, last_error, created_at_ms, updated_at_ms
+                 FROM llm_codex_accounts
+                 ORDER BY created_at_ms DESC, account_name DESC",
+                &[],
+            )
+            .await
+            .context("list codex accounts")?;
+        Ok(rows.into_iter().map(decode_codex_account_row).collect())
+    }
+
+    async fn get_codex_account_row(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<CodexAccountRecord>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT
+                    account_name, account_id, email, status, auth_json::text, settings_json::text,
+                    last_refresh_at_ms, last_error, created_at_ms, updated_at_ms
+                 FROM llm_codex_accounts
+                 WHERE account_name = $1",
+                &[&name],
+            )
+            .await
+            .context("load codex account")?;
+        Ok(row.map(decode_codex_account_row))
+    }
+
+    async fn list_kiro_accounts_rows(&self) -> anyhow::Result<Vec<KiroAccountRecord>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    account_name, auth_method, account_id, profile_arn, user_id, status,
+                    auth_json::text, max_concurrency, min_start_interval_ms, proxy_config_id,
+                    last_refresh_at_ms, last_error, created_at_ms, updated_at_ms
+                 FROM llm_kiro_accounts
+                 ORDER BY created_at_ms DESC, account_name DESC",
+                &[],
+            )
+            .await
+            .context("list kiro accounts")?;
+        Ok(rows.into_iter().map(decode_kiro_account_row).collect())
+    }
+
+    async fn get_kiro_account_row(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<Option<KiroAccountRecord>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT
+                    account_name, auth_method, account_id, profile_arn, user_id, status,
+                    auth_json::text, max_concurrency, min_start_interval_ms, proxy_config_id,
+                    last_refresh_at_ms, last_error, created_at_ms, updated_at_ms
+                 FROM llm_kiro_accounts
+                 WHERE account_name = $1",
+                &[&account_name],
+            )
+            .await
+            .context("load kiro account")?;
+        Ok(row.map(decode_kiro_account_row))
+    }
+
+    async fn list_kiro_cached_status_parts_rows(
+        &self,
+    ) -> anyhow::Result<BTreeMap<String, KiroCachedStatusParts>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT account_name, balance_json::text, cache_json::text
+                 FROM llm_kiro_status_cache",
+                &[],
+            )
+            .await
+            .context("list kiro cached status")?;
+        let mut status_by_account = BTreeMap::new();
+        for row in rows {
+            let account_name: String = row.get(0);
+            let balance_json: String = row.get(1);
+            let cache_json: String = row.get(2);
+            let balance = serde_json::from_str::<Option<AdminKiroBalanceView>>(&balance_json)
+                .context("decode kiro cached balance")?;
+            let cache = serde_json::from_str::<AdminKiroCacheView>(&cache_json)
+                .context("decode kiro cached cache view")?;
+            status_by_account.insert(account_name, (balance, cache));
+        }
+        Ok(status_by_account)
+    }
+
+    async fn get_kiro_cached_status_parts_row(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<Option<KiroCachedStatusParts>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT balance_json::text, cache_json::text
+                 FROM llm_kiro_status_cache
+                 WHERE account_name = $1",
+                &[&account_name],
+            )
+            .await
+            .context("load kiro cached status")?;
+        row.map(|row| {
+            let balance_json: String = row.get(0);
+            let cache_json: String = row.get(1);
+            let balance = serde_json::from_str::<Option<AdminKiroBalanceView>>(&balance_json)
+                .context("decode kiro cached balance")?;
+            let cache = serde_json::from_str::<AdminKiroCacheView>(&cache_json)
+                .context("decode kiro cached cache view")?;
+            Ok((balance, cache))
+        })
+        .transpose()
+    }
+
+    async fn load_provider_proxy_resolution_context(
+        &self,
+        provider_type: &str,
+    ) -> anyhow::Result<ProviderProxyResolutionContext> {
+        let proxy_configs_by_id = self
+            .list_admin_proxy_configs_rows()
+            .await?
+            .into_iter()
+            .map(|proxy| (proxy.id.clone(), proxy))
+            .collect::<BTreeMap<_, _>>();
+        let binding = self
+            .load_admin_proxy_binding_from_configs(provider_type, &proxy_configs_by_id)
+            .await?;
+        Ok(ProviderProxyResolutionContext {
+            proxy_configs_by_id,
+            binding,
+        })
+    }
+
+    async fn resolve_route_account_names(
+        &self,
+        provider_type: &str,
+        route: &KeyRouteConfig,
+        default_active_account_names: Vec<String>,
+    ) -> anyhow::Result<Vec<String>> {
+        let strategy = route.route_strategy.as_deref().unwrap_or("auto");
+        match strategy {
+            "fixed" => {
+                let account_name = if let Some(group_id) = route.account_group_id.as_deref() {
+                    let group = self
+                        .get_admin_account_group_row(group_id)
+                        .await?
+                        .with_context(|| {
+                            format!("configured account_group_id `{group_id}` does not exist")
+                        })?;
+                    if group.provider_type != provider_type {
+                        anyhow::bail!(
+                            "configured account_group_id belongs to a different provider"
+                        );
+                    }
+                    if group.account_names.len() != 1 {
+                        anyhow::bail!(
+                            "fixed route_strategy requires an account group with exactly one \
+                             account"
+                        );
+                    }
+                    group.account_names[0].clone()
+                } else {
+                    route
+                        .fixed_account_name
+                        .clone()
+                        .filter(|value| !value.trim().is_empty())
+                        .context("fixed route_strategy requires account_group_id")?
+                };
+                Ok(vec![account_name])
+            },
+            "auto" => {
+                if let Some(group_id) = route.account_group_id.as_deref() {
+                    let group = self
+                        .get_admin_account_group_row(group_id)
+                        .await?
+                        .with_context(|| {
+                            format!("configured account_group_id `{group_id}` does not exist")
+                        })?;
+                    if group.provider_type != provider_type {
+                        anyhow::bail!(
+                            "configured account_group_id belongs to a different provider"
+                        );
+                    }
+                    if !group.account_names.is_empty() {
+                        return Ok(group.account_names);
+                    }
+                }
+                if let Some(account_names) =
+                    decode_optional_json::<Vec<String>>(route.auto_account_names_json.as_deref())
+                {
+                    if !account_names.is_empty() {
+                        return Ok(account_names);
+                    }
+                }
+                Ok(default_active_account_names)
+            },
+            other => anyhow::bail!("unsupported route strategy `{other}`"),
+        }
+    }
+
+    async fn load_codex_admin_account_view_context(
+        &self,
+    ) -> anyhow::Result<CodexAdminAccountViewContext> {
+        let proxy_configs_by_id = self
+            .list_admin_proxy_configs_rows()
+            .await?
+            .into_iter()
+            .map(|proxy| (proxy.id.clone(), proxy))
+            .collect::<BTreeMap<_, _>>();
+        let codex_proxy_binding = self
+            .load_admin_proxy_binding_from_configs(core_store::PROVIDER_CODEX, &proxy_configs_by_id)
+            .await?;
+        Ok(CodexAdminAccountViewContext {
+            proxy_configs_by_id,
+            codex_proxy_binding,
+        })
+    }
+
+    fn resolve_codex_account_proxy_view_with_context(
+        &self,
+        settings: &CodexAccountSettings,
+        context: &CodexAdminAccountViewContext,
+    ) -> (String, Option<String>, Option<String>) {
+        match settings.proxy_mode.as_str() {
+            "none" => ("none".to_string(), None, None),
+            "fixed" => {
+                let Some(proxy_id) = settings.proxy_config_id.as_deref() else {
+                    return ("invalid".to_string(), None, None);
+                };
+                match context.proxy_configs_by_id.get(proxy_id) {
+                    Some(proxy) if proxy.status == core_store::KEY_STATUS_ACTIVE => (
+                        "fixed".to_string(),
+                        Some(proxy.proxy_url.clone()),
+                        Some(proxy.name.clone()),
+                    ),
+                    Some(proxy) => ("invalid".to_string(), None, Some(proxy.name.clone())),
+                    None => ("invalid".to_string(), None, None),
+                }
+            },
+            _ => (
+                context.codex_proxy_binding.effective_source.clone(),
+                context.codex_proxy_binding.effective_proxy_url.clone(),
+                context
+                    .codex_proxy_binding
+                    .effective_proxy_config_name
+                    .clone(),
+            ),
+        }
+    }
+
+    fn admin_codex_account_from_record_with_context(
+        &self,
+        record: &CodexAccountRecord,
+        context: &CodexAdminAccountViewContext,
+    ) -> anyhow::Result<AdminCodexAccount> {
+        let settings = decode_codex_account_settings(&record.settings_json)?;
+        let (effective_proxy_source, effective_proxy_url, effective_proxy_config_name) =
+            self.resolve_codex_account_proxy_view_with_context(&settings, context);
+        Ok(AdminCodexAccount {
+            name: record.account_name.clone(),
+            status: record.status.clone(),
+            account_id: record.account_id.clone(),
+            plan_type: None,
+            route_weight_tier: settings
+                .route_weight_tier
+                .clone()
+                .unwrap_or_else(|| "auto".to_string()),
+            primary_remaining_percent: None,
+            secondary_remaining_percent: None,
+            map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
+            auto_refresh_enabled: settings.auth_refresh_enabled,
+            request_max_concurrency: settings.request_max_concurrency,
+            request_min_start_interval_ms: settings.request_min_start_interval_ms,
+            proxy_mode: settings.proxy_mode,
+            proxy_config_id: settings.proxy_config_id,
+            effective_proxy_source,
+            effective_proxy_url,
+            effective_proxy_config_name,
+            last_refresh: record.last_refresh_at_ms,
+            access_token_expires_at: core_store::codex_auth_access_token_expires_at_ms(
+                &record.auth_json,
+            ),
+            auth_refresh_error_message: record.last_error.clone(),
+            last_usage_checked_at: None,
+            last_usage_success_at: None,
+            usage_error_message: None,
+        })
+    }
+
+    async fn admin_codex_account_from_record(
+        &self,
+        record: &CodexAccountRecord,
+    ) -> anyhow::Result<AdminCodexAccount> {
+        let context = self.load_codex_admin_account_view_context().await?;
+        self.admin_codex_account_from_record_with_context(record, &context)
+    }
+
+    async fn load_kiro_admin_account_view_context(
+        &self,
+    ) -> anyhow::Result<KiroAdminAccountViewContext> {
+        let refresh_interval_seconds = self
+            .load_runtime_config_record()
+            .await?
+            .map(|config| config.kiro_status_refresh_max_interval_seconds.max(0) as u64)
+            .unwrap_or(core_store::DEFAULT_KIRO_STATUS_REFRESH_MAX_INTERVAL_SECONDS);
+        let default_cache = AdminKiroCacheView {
+            refresh_interval_seconds,
+            ..AdminKiroCacheView::default()
+        };
+        let status_by_account = self.list_kiro_cached_status_parts_rows().await?;
+        let proxy_configs_by_id = self
+            .list_admin_proxy_configs_rows()
+            .await?
+            .into_iter()
+            .map(|proxy| (proxy.id.clone(), proxy))
+            .collect::<BTreeMap<_, _>>();
+        let kiro_proxy_binding = self
+            .load_admin_proxy_binding_from_configs(core_store::PROVIDER_KIRO, &proxy_configs_by_id)
+            .await?;
+        Ok(KiroAdminAccountViewContext {
+            default_cache,
+            status_by_account,
+            proxy_configs_by_id,
+            kiro_proxy_binding,
+        })
+    }
+
+    fn resolve_kiro_account_proxy_view_with_context(
+        &self,
+        proxy_mode: &str,
+        proxy_config_id: Option<&str>,
+        context: &KiroAdminAccountViewContext,
+    ) -> (String, Option<String>, Option<String>) {
+        match proxy_mode {
+            "none" => ("none".to_string(), None, None),
+            "fixed" => {
+                let Some(proxy_id) = proxy_config_id else {
+                    return ("invalid".to_string(), None, None);
+                };
+                match context.proxy_configs_by_id.get(proxy_id) {
+                    Some(proxy) if proxy.status == core_store::KEY_STATUS_ACTIVE => (
+                        "fixed".to_string(),
+                        Some(proxy.proxy_url.clone()),
+                        Some(proxy.name.clone()),
+                    ),
+                    Some(proxy) => ("invalid".to_string(), None, Some(proxy.name.clone())),
+                    None => ("invalid".to_string(), None, None),
+                }
+            },
+            _ => (
+                context.kiro_proxy_binding.effective_source.clone(),
+                context.kiro_proxy_binding.effective_proxy_url.clone(),
+                context
+                    .kiro_proxy_binding
+                    .effective_proxy_config_name
+                    .clone(),
+            ),
+        }
+    }
+
+    fn admin_kiro_account_from_record_with_context(
+        &self,
+        record: &KiroAccountRecord,
+        context: &KiroAdminAccountViewContext,
+    ) -> anyhow::Result<AdminKiroAccount> {
+        let auth = serde_json::from_str::<serde_json::Value>(&record.auth_json)
+            .context("parse kiro auth json for admin view")?;
+        let (balance, cache) = context
+            .status_by_account
+            .get(&record.account_name)
+            .cloned()
+            .unwrap_or_else(|| (None, context.default_cache.clone()));
+        let proxy_mode = optional_json_string_any(&auth, &["proxyMode", "proxy_mode"])
+            .unwrap_or_else(|| {
+                if record.proxy_config_id.is_some() {
+                    "fixed".to_string()
+                } else {
+                    "inherit".to_string()
+                }
+            });
+        let proxy_config_id = record
+            .proxy_config_id
+            .clone()
+            .or_else(|| optional_json_string_any(&auth, &["proxyConfigId", "proxy_config_id"]));
+        let (effective_proxy_source, effective_proxy_url, effective_proxy_config_name) = self
+            .resolve_kiro_account_proxy_view_with_context(
+                &proxy_mode,
+                proxy_config_id.as_deref(),
+                context,
+            );
+        let disabled_json = optional_json_bool_any(&auth, &["disabled"]).unwrap_or(false);
+        let disabled = disabled_json || record.status != core_store::KEY_STATUS_ACTIVE;
+        let disabled_reason =
+            optional_json_string_any(&auth, &["disabledReason", "disabled_reason"])
+                .or_else(|| record.last_error.clone());
+        let balance = if disabled { None } else { balance };
+        let subscription_title = balance
+            .as_ref()
+            .and_then(|value| value.subscription_title.clone())
+            .or_else(|| {
+                optional_json_string_any(&auth, &["subscriptionTitle", "subscription_title"])
+            });
+        Ok(AdminKiroAccount {
+            name: record.account_name.clone(),
+            auth_method: record.auth_method.clone(),
+            provider: optional_json_string_any(&auth, &["provider"]),
+            upstream_user_id: balance
+                .as_ref()
+                .and_then(|value| value.user_id.clone())
+                .or_else(|| record.user_id.clone()),
+            email: optional_json_string_any(&auth, &["email"]),
+            expires_at: optional_json_string_any(&auth, &["expiresAt", "expires_at"]),
+            profile_arn: record
+                .profile_arn
+                .clone()
+                .or_else(|| optional_json_string_any(&auth, &["profileArn", "profile_arn"])),
+            has_refresh_token: optional_json_string_any(&auth, &["refreshToken", "refresh_token"])
+                .is_some(),
+            disabled,
+            disabled_reason,
+            source: optional_json_string_any(&auth, &["source"]),
+            source_db_path: optional_json_string_any(&auth, &["sourceDbPath", "source_db_path"]),
+            last_imported_at: optional_json_i64_any(&auth, &["lastImportedAt", "last_imported_at"]),
+            subscription_title,
+            region: optional_json_string_any(&auth, &["region"]),
+            auth_region: optional_json_string_any(&auth, &["authRegion", "auth_region"]),
+            api_region: optional_json_string_any(&auth, &["apiRegion", "api_region"]),
+            machine_id: optional_json_string_any(&auth, &["machineId", "machine_id"]),
+            kiro_channel_max_concurrency: record
+                .max_concurrency
+                .and_then(non_negative_i64_to_u64)
+                .or_else(|| {
+                    optional_json_u64_any(&auth, &[
+                        "kiroChannelMaxConcurrency",
+                        "kiro_channel_max_concurrency",
+                    ])
+                })
+                .unwrap_or(core_store::DEFAULT_KIRO_CHANNEL_MAX_CONCURRENCY)
+                .max(1),
+            kiro_channel_min_start_interval_ms: record
+                .min_start_interval_ms
+                .and_then(non_negative_i64_to_u64)
+                .or_else(|| {
+                    optional_json_u64_any(&auth, &[
+                        "kiroChannelMinStartIntervalMs",
+                        "kiro_channel_min_start_interval_ms",
+                    ])
+                })
+                .unwrap_or(core_store::DEFAULT_KIRO_CHANNEL_MIN_START_INTERVAL_MS),
+            minimum_remaining_credits_before_block: optional_json_f64_any(&auth, &[
+                "minimumRemainingCreditsBeforeBlock",
+                "minimum_remaining_credits_before_block",
+            ])
+            .filter(|value| value.is_finite())
+            .unwrap_or(0.0)
+            .max(0.0),
+            proxy_mode,
+            proxy_config_id,
+            effective_proxy_source,
+            effective_proxy_url,
+            effective_proxy_config_name,
+            proxy_url: optional_json_string_any(&auth, &["proxyUrl", "proxy_url"]),
+            balance,
+            cache,
+        })
+    }
+
+    async fn admin_kiro_account_from_record(
+        &self,
+        record: &KiroAccountRecord,
+    ) -> anyhow::Result<AdminKiroAccount> {
+        let context = self.load_kiro_admin_account_view_context().await?;
+        self.admin_kiro_account_from_record_with_context(record, &context)
+    }
+
+    async fn upsert_key_bundle_client(
+        client: &SqlxClient,
+        key: &KeyRecord,
+        route: &KeyRouteConfig,
+        rollup: &KeyUsageRollup,
+    ) -> anyhow::Result<()> {
+        client
+            .execute(
+                "INSERT INTO llm_keys (
+                    key_id, name, secret, key_hash, status, provider_type, protocol_family,
+                    public_visible, quota_billable_limit, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)
+                 ON CONFLICT(key_id) DO UPDATE SET
+                    name = EXCLUDED.name,
+                    secret = EXCLUDED.secret,
+                    key_hash = EXCLUDED.key_hash,
+                    status = EXCLUDED.status,
+                    provider_type = EXCLUDED.provider_type,
+                    protocol_family = EXCLUDED.protocol_family,
+                    public_visible = EXCLUDED.public_visible,
+                    quota_billable_limit = EXCLUDED.quota_billable_limit,
+                    created_at_ms = EXCLUDED.created_at_ms,
+                    updated_at_ms = EXCLUDED.updated_at_ms",
+                &[
+                    &key.key_id,
+                    &key.name,
+                    &key.secret,
+                    &key.key_hash,
+                    &key.status,
+                    &key.provider_type,
+                    &key.protocol_family,
+                    &key.public_visible,
+                    &key.quota_billable_limit,
+                    &key.created_at_ms,
+                    &key.updated_at_ms,
+                ],
+            )
+            .await
+            .context("upsert postgres llm key")?;
+        client
+            .execute(
+                "INSERT INTO llm_key_route_config (
+                    key_id, route_strategy, fixed_account_name, auto_account_names_json,
+                    account_group_id, model_name_map_json, request_max_concurrency,
+                    request_min_start_interval_ms, kiro_request_validation_enabled,
+                    kiro_cache_estimation_enabled, kiro_zero_cache_debug_enabled,
+                    kiro_full_request_logging_enabled, kiro_cache_policy_override_json,
+                    kiro_billable_model_multipliers_override_json
+                 ) VALUES (
+                    $1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, $8, $9, $10, $11, $12,
+                    $13::jsonb, $14::jsonb
+                 )
+                 ON CONFLICT(key_id) DO UPDATE SET
+                    route_strategy = EXCLUDED.route_strategy,
+                    fixed_account_name = EXCLUDED.fixed_account_name,
+                    auto_account_names_json = EXCLUDED.auto_account_names_json,
+                    account_group_id = EXCLUDED.account_group_id,
+                    model_name_map_json = EXCLUDED.model_name_map_json,
+                    request_max_concurrency = EXCLUDED.request_max_concurrency,
+                    request_min_start_interval_ms = EXCLUDED.request_min_start_interval_ms,
+                    kiro_request_validation_enabled = EXCLUDED.kiro_request_validation_enabled,
+                    kiro_cache_estimation_enabled = EXCLUDED.kiro_cache_estimation_enabled,
+                    kiro_zero_cache_debug_enabled = EXCLUDED.kiro_zero_cache_debug_enabled,
+                    kiro_full_request_logging_enabled =
+                        EXCLUDED.kiro_full_request_logging_enabled,
+                    kiro_cache_policy_override_json =
+                        EXCLUDED.kiro_cache_policy_override_json,
+                    kiro_billable_model_multipliers_override_json =
+                        EXCLUDED.kiro_billable_model_multipliers_override_json",
+                &[
+                    &route.key_id,
+                    &route.route_strategy,
+                    &route.fixed_account_name,
+                    &route.auto_account_names_json,
+                    &route.account_group_id,
+                    &route.model_name_map_json,
+                    &route.request_max_concurrency,
+                    &route.request_min_start_interval_ms,
+                    &route.kiro_request_validation_enabled,
+                    &route.kiro_cache_estimation_enabled,
+                    &route.kiro_zero_cache_debug_enabled,
+                    &route.kiro_full_request_logging_enabled,
+                    &route.kiro_cache_policy_override_json,
+                    &route.kiro_billable_model_multipliers_override_json,
+                ],
+            )
+            .await
+            .context("upsert postgres key route config")?;
+        client
+            .execute(
+                "INSERT INTO llm_key_usage_rollups (
+                    key_id, input_uncached_tokens, input_cached_tokens, output_tokens,
+                    billable_tokens, credit_total, credit_missing_events, last_used_at_ms,
+                    updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT(key_id) DO UPDATE SET
+                    input_uncached_tokens = EXCLUDED.input_uncached_tokens,
+                    input_cached_tokens = EXCLUDED.input_cached_tokens,
+                    output_tokens = EXCLUDED.output_tokens,
+                    billable_tokens = EXCLUDED.billable_tokens,
+                    credit_total = EXCLUDED.credit_total,
+                    credit_missing_events = EXCLUDED.credit_missing_events,
+                    last_used_at_ms = EXCLUDED.last_used_at_ms,
+                    updated_at_ms = EXCLUDED.updated_at_ms",
+                &[
+                    &rollup.key_id,
+                    &rollup.input_uncached_tokens,
+                    &rollup.input_cached_tokens,
+                    &rollup.output_tokens,
+                    &rollup.billable_tokens,
+                    &rollup.credit_total.to_string(),
+                    &rollup.credit_missing_events,
+                    &rollup.last_used_at_ms,
+                    &rollup.updated_at_ms,
+                ],
+            )
+            .await
+            .context("upsert postgres key usage rollup")?;
+        Ok(())
+    }
+
+    async fn upsert_runtime_config_record(
+        &self,
+        record: &RuntimeConfigRecord,
+    ) -> anyhow::Result<()> {
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "INSERT INTO llm_runtime_config (
+                    id, auth_cache_ttl_seconds, max_request_body_bytes,
+                    account_failure_retry_limit, codex_client_version,
+                    kiro_channel_max_concurrency, kiro_channel_min_start_interval_ms,
+                    codex_status_refresh_min_interval_seconds,
+                    codex_status_refresh_max_interval_seconds,
+                    codex_status_account_jitter_max_seconds,
+                    codex_weight_free, codex_weight_plus, codex_weight_pro5x,
+                    codex_weight_pro20x, kiro_status_refresh_min_interval_seconds,
+                    kiro_status_refresh_max_interval_seconds,
+                    kiro_status_account_jitter_max_seconds,
+                    usage_event_flush_batch_size, usage_event_flush_interval_seconds,
+                    usage_event_flush_max_buffer_bytes, duckdb_usage_memory_limit_mib,
+                    duckdb_usage_checkpoint_threshold_mib, usage_analytics_retention_days,
+                    usage_journal_enabled, usage_journal_max_file_bytes,
+                    usage_journal_max_file_age_ms, usage_journal_max_files,
+                    usage_journal_block_target_uncompressed_bytes,
+                    usage_journal_block_max_events, usage_journal_fsync_interval_ms,
+                    usage_journal_zstd_level, usage_journal_consumer_lease_ms,
+                    usage_journal_delete_bad_files, usage_query_bind_addr,
+                    usage_query_base_url, usage_event_maintenance_enabled,
+                    usage_event_maintenance_interval_seconds,
+                    usage_event_detail_retention_days, kiro_cache_kmodels_json,
+                    kiro_billable_model_multipliers_json, kiro_cache_policy_json,
+                    kiro_prefix_cache_mode, kiro_prefix_cache_max_tokens,
+                    kiro_prefix_cache_entry_ttl_seconds,
+                    kiro_conversation_anchor_max_entries,
+                    kiro_conversation_anchor_ttl_seconds, updated_at_ms
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13,
+                    $14, $15, $16, $17, $18, $19, $20, $21, $22, $23, $24,
+                    $25, $26, $27, $28, $29, $30, $31, $32, $33, $34, $35,
+                    $36, $37, $38, $39::jsonb, $40::jsonb, $41::jsonb, $42,
+                    $43, $44, $45, $46, $47
+                )
+                ON CONFLICT(id) DO UPDATE SET
+                    auth_cache_ttl_seconds = EXCLUDED.auth_cache_ttl_seconds,
+                    max_request_body_bytes = EXCLUDED.max_request_body_bytes,
+                    account_failure_retry_limit = EXCLUDED.account_failure_retry_limit,
+                    codex_client_version = EXCLUDED.codex_client_version,
+                    kiro_channel_max_concurrency = EXCLUDED.kiro_channel_max_concurrency,
+                    kiro_channel_min_start_interval_ms =
+                        EXCLUDED.kiro_channel_min_start_interval_ms,
+                    codex_status_refresh_min_interval_seconds =
+                        EXCLUDED.codex_status_refresh_min_interval_seconds,
+                    codex_status_refresh_max_interval_seconds =
+                        EXCLUDED.codex_status_refresh_max_interval_seconds,
+                    codex_status_account_jitter_max_seconds =
+                        EXCLUDED.codex_status_account_jitter_max_seconds,
+                    codex_weight_free = EXCLUDED.codex_weight_free,
+                    codex_weight_plus = EXCLUDED.codex_weight_plus,
+                    codex_weight_pro5x = EXCLUDED.codex_weight_pro5x,
+                    codex_weight_pro20x = EXCLUDED.codex_weight_pro20x,
+                    kiro_status_refresh_min_interval_seconds =
+                        EXCLUDED.kiro_status_refresh_min_interval_seconds,
+                    kiro_status_refresh_max_interval_seconds =
+                        EXCLUDED.kiro_status_refresh_max_interval_seconds,
+                    kiro_status_account_jitter_max_seconds =
+                        EXCLUDED.kiro_status_account_jitter_max_seconds,
+                    usage_event_flush_batch_size = EXCLUDED.usage_event_flush_batch_size,
+                    usage_event_flush_interval_seconds =
+                        EXCLUDED.usage_event_flush_interval_seconds,
+                    usage_event_flush_max_buffer_bytes =
+                        EXCLUDED.usage_event_flush_max_buffer_bytes,
+                    duckdb_usage_memory_limit_mib =
+                        EXCLUDED.duckdb_usage_memory_limit_mib,
+                    duckdb_usage_checkpoint_threshold_mib =
+                        EXCLUDED.duckdb_usage_checkpoint_threshold_mib,
+                    usage_analytics_retention_days =
+                        EXCLUDED.usage_analytics_retention_days,
+                    usage_journal_enabled = EXCLUDED.usage_journal_enabled,
+                    usage_journal_max_file_bytes = EXCLUDED.usage_journal_max_file_bytes,
+                    usage_journal_max_file_age_ms = EXCLUDED.usage_journal_max_file_age_ms,
+                    usage_journal_max_files = EXCLUDED.usage_journal_max_files,
+                    usage_journal_block_target_uncompressed_bytes =
+                        EXCLUDED.usage_journal_block_target_uncompressed_bytes,
+                    usage_journal_block_max_events =
+                        EXCLUDED.usage_journal_block_max_events,
+                    usage_journal_fsync_interval_ms =
+                        EXCLUDED.usage_journal_fsync_interval_ms,
+                    usage_journal_zstd_level = EXCLUDED.usage_journal_zstd_level,
+                    usage_journal_consumer_lease_ms =
+                        EXCLUDED.usage_journal_consumer_lease_ms,
+                    usage_journal_delete_bad_files =
+                        EXCLUDED.usage_journal_delete_bad_files,
+                    usage_query_bind_addr = EXCLUDED.usage_query_bind_addr,
+                    usage_query_base_url = EXCLUDED.usage_query_base_url,
+                    usage_event_maintenance_enabled =
+                        EXCLUDED.usage_event_maintenance_enabled,
+                    usage_event_maintenance_interval_seconds =
+                        EXCLUDED.usage_event_maintenance_interval_seconds,
+                    usage_event_detail_retention_days =
+                        EXCLUDED.usage_event_detail_retention_days,
+                    kiro_cache_kmodels_json = EXCLUDED.kiro_cache_kmodels_json,
+                    kiro_billable_model_multipliers_json =
+                        EXCLUDED.kiro_billable_model_multipliers_json,
+                    kiro_cache_policy_json = EXCLUDED.kiro_cache_policy_json,
+                    kiro_prefix_cache_mode = EXCLUDED.kiro_prefix_cache_mode,
+                    kiro_prefix_cache_max_tokens = EXCLUDED.kiro_prefix_cache_max_tokens,
+                    kiro_prefix_cache_entry_ttl_seconds =
+                        EXCLUDED.kiro_prefix_cache_entry_ttl_seconds,
+                    kiro_conversation_anchor_max_entries =
+                        EXCLUDED.kiro_conversation_anchor_max_entries,
+                    kiro_conversation_anchor_ttl_seconds =
+                        EXCLUDED.kiro_conversation_anchor_ttl_seconds,
+                    updated_at_ms = EXCLUDED.updated_at_ms",
+                &[
+                    &record.id,
+                    &record.auth_cache_ttl_seconds,
+                    &record.max_request_body_bytes,
+                    &record.account_failure_retry_limit,
+                    &record.codex_client_version,
+                    &record.kiro_channel_max_concurrency,
+                    &record.kiro_channel_min_start_interval_ms,
+                    &record.codex_status_refresh_min_interval_seconds,
+                    &record.codex_status_refresh_max_interval_seconds,
+                    &record.codex_status_account_jitter_max_seconds,
+                    &record.codex_weight_free,
+                    &record.codex_weight_plus,
+                    &record.codex_weight_pro5x,
+                    &record.codex_weight_pro20x,
+                    &record.kiro_status_refresh_min_interval_seconds,
+                    &record.kiro_status_refresh_max_interval_seconds,
+                    &record.kiro_status_account_jitter_max_seconds,
+                    &record.usage_event_flush_batch_size,
+                    &record.usage_event_flush_interval_seconds,
+                    &record.usage_event_flush_max_buffer_bytes,
+                    &record.duckdb_usage_memory_limit_mib,
+                    &record.duckdb_usage_checkpoint_threshold_mib,
+                    &record.usage_analytics_retention_days,
+                    &record.usage_journal_enabled,
+                    &record.usage_journal_max_file_bytes,
+                    &record.usage_journal_max_file_age_ms,
+                    &record.usage_journal_max_files,
+                    &record.usage_journal_block_target_uncompressed_bytes,
+                    &record.usage_journal_block_max_events,
+                    &record.usage_journal_fsync_interval_ms,
+                    &record.usage_journal_zstd_level,
+                    &record.usage_journal_consumer_lease_ms,
+                    &(record.usage_journal_delete_bad_files as i64),
+                    &record.usage_query_bind_addr,
+                    &record.usage_query_base_url,
+                    &record.usage_event_maintenance_enabled,
+                    &record.usage_event_maintenance_interval_seconds,
+                    &record.usage_event_detail_retention_days,
+                    &record.kiro_cache_kmodels_json,
+                    &record.kiro_billable_model_multipliers_json,
+                    &record.kiro_cache_policy_json,
+                    &record.kiro_prefix_cache_mode,
+                    &record.kiro_prefix_cache_max_tokens,
+                    &record.kiro_prefix_cache_entry_ttl_seconds,
+                    &record.kiro_conversation_anchor_max_entries,
+                    &record.kiro_conversation_anchor_ttl_seconds,
+                    &record.updated_at_ms,
+                ],
+            )
+            .await
+            .context("upsert postgres runtime config")?;
+        Ok(())
+    }
+
+    async fn upsert_codex_account(&self, record: &CodexAccountRecord) -> anyhow::Result<()> {
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "INSERT INTO llm_codex_accounts (
+                    account_name, account_id, email, status, auth_json, settings_json,
+                    last_refresh_at_ms, last_error, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5::jsonb, $6::jsonb, $7, $8, $9, $10)
+                 ON CONFLICT(account_name) DO UPDATE SET
+                    account_id = EXCLUDED.account_id,
+                    email = EXCLUDED.email,
+                    status = EXCLUDED.status,
+                    auth_json = EXCLUDED.auth_json,
+                    settings_json = EXCLUDED.settings_json,
+                    last_refresh_at_ms = EXCLUDED.last_refresh_at_ms,
+                    last_error = EXCLUDED.last_error,
+                    created_at_ms = EXCLUDED.created_at_ms,
+                    updated_at_ms = EXCLUDED.updated_at_ms",
+                &[
+                    &record.account_name,
+                    &record.account_id,
+                    &record.email,
+                    &record.status,
+                    &record.auth_json,
+                    &record.settings_json,
+                    &record.last_refresh_at_ms,
+                    &record.last_error,
+                    &record.created_at_ms,
+                    &record.updated_at_ms,
+                ],
+            )
+            .await
+            .context("upsert postgres codex account")?;
+        Ok(())
+    }
+
+    async fn upsert_kiro_account(&self, record: &KiroAccountRecord) -> anyhow::Result<()> {
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "INSERT INTO llm_kiro_accounts (
+                    account_name, auth_method, account_id, profile_arn, user_id,
+                    status, auth_json, max_concurrency, min_start_interval_ms,
+                    proxy_config_id, last_refresh_at_ms, last_error, created_at_ms,
+                    updated_at_ms
+                 ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7::jsonb, $8, $9, $10, $11, $12, $13, $14
+                 )
+                 ON CONFLICT(account_name) DO UPDATE SET
+                    auth_method = EXCLUDED.auth_method,
+                    account_id = EXCLUDED.account_id,
+                    profile_arn = EXCLUDED.profile_arn,
+                    user_id = EXCLUDED.user_id,
+                    status = EXCLUDED.status,
+                    auth_json = EXCLUDED.auth_json,
+                    max_concurrency = EXCLUDED.max_concurrency,
+                    min_start_interval_ms = EXCLUDED.min_start_interval_ms,
+                    proxy_config_id = EXCLUDED.proxy_config_id,
+                    last_refresh_at_ms = EXCLUDED.last_refresh_at_ms,
+                    last_error = EXCLUDED.last_error,
+                    created_at_ms = EXCLUDED.created_at_ms,
+                    updated_at_ms = EXCLUDED.updated_at_ms",
+                &[
+                    &record.account_name,
+                    &record.auth_method,
+                    &record.account_id,
+                    &record.profile_arn,
+                    &record.user_id,
+                    &record.status,
+                    &record.auth_json,
+                    &record.max_concurrency,
+                    &record.min_start_interval_ms,
+                    &record.proxy_config_id,
+                    &record.last_refresh_at_ms,
+                    &record.last_error,
+                    &record.created_at_ms,
+                    &record.updated_at_ms,
+                ],
+            )
+            .await
+            .context("upsert postgres kiro account")?;
+        Ok(())
+    }
+
+    async fn disable_admin_key_if_present(
+        &self,
+        key_id: &str,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        if self.load_key_bundle_by_id(key_id).await?.is_some() {
+            self.patch_admin_key(key_id, AdminKeyPatch {
+                status: Some(core_store::KEY_STATUS_DISABLED.to_string()),
+                updated_at_ms,
+                ..AdminKeyPatch::default()
+            })
+            .await?;
+        }
+        Ok(())
+    }
+
+    async fn load_codex_import_job_summary_row(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<Option<AdminCodexImportJobSummary>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT
+                    job_id, provider_type, source_type, validate_before_import, status,
+                    total_count, completed_count, succeeded_count, skipped_count, failed_count,
+                    batch_error_message, created_at_ms, updated_at_ms, finished_at_ms
+                 FROM llm_account_import_jobs
+                 WHERE job_id = $1",
+                &[&job_id],
+            )
+            .await
+            .context("load postgres codex import job summary")?;
+        Ok(row.map(decode_codex_import_job_summary_row))
+    }
+
+    async fn load_codex_import_job_items_rows(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<Vec<AdminCodexImportJobItem>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    item_index, requested_name, requested_account_id, status,
+                    error_message, imported_account_name, final_account_id,
+                    validated_at_ms, imported_at_ms
+                 FROM llm_account_import_job_items
+                 WHERE job_id = $1
+                 ORDER BY item_index",
+                &[&job_id],
+            )
+            .await
+            .context("load postgres codex import job items")?;
+        Ok(rows
+            .into_iter()
+            .map(decode_codex_import_job_item_row)
+            .collect())
+    }
+}
+
+fn hash_bearer_secret(secret: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(secret.as_bytes());
+    format!("{:x}", hasher.finalize())
+}
+
+fn decode_runtime_config_row(row: PgRow) -> anyhow::Result<RuntimeConfigRecord> {
+    Ok(RuntimeConfigRecord {
+        id: row.get(0),
+        auth_cache_ttl_seconds: row.get(1),
+        max_request_body_bytes: row.get(2),
+        account_failure_retry_limit: row.get(3),
+        codex_client_version: row.get(4),
+        kiro_channel_max_concurrency: row.get(5),
+        kiro_channel_min_start_interval_ms: row.get(6),
+        codex_status_refresh_min_interval_seconds: row.get(7),
+        codex_status_refresh_max_interval_seconds: row.get(8),
+        codex_status_account_jitter_max_seconds: row.get(9),
+        codex_weight_free: row.get(10),
+        codex_weight_plus: row.get(11),
+        codex_weight_pro5x: row.get(12),
+        codex_weight_pro20x: row.get(13),
+        kiro_status_refresh_min_interval_seconds: row.get(14),
+        kiro_status_refresh_max_interval_seconds: row.get(15),
+        kiro_status_account_jitter_max_seconds: row.get(16),
+        usage_event_flush_batch_size: row.get(17),
+        usage_event_flush_interval_seconds: row.get(18),
+        usage_event_flush_max_buffer_bytes: row.get(19),
+        duckdb_usage_memory_limit_mib: row.get(20),
+        duckdb_usage_checkpoint_threshold_mib: row.get(21),
+        usage_analytics_retention_days: row.get(22),
+        usage_journal_enabled: row.get(23),
+        usage_journal_max_file_bytes: row.get(24),
+        usage_journal_max_file_age_ms: row.get(25),
+        usage_journal_max_files: row.get(26),
+        usage_journal_block_target_uncompressed_bytes: row.get(27),
+        usage_journal_block_max_events: row.get(28),
+        usage_journal_fsync_interval_ms: row.get(29),
+        usage_journal_zstd_level: row.get(30),
+        usage_journal_consumer_lease_ms: row.get(31),
+        usage_journal_delete_bad_files: row.get::<_, i64>(32) != 0,
+        usage_query_bind_addr: row.get(33),
+        usage_query_base_url: row.get(34),
+        usage_event_maintenance_enabled: row.get(35),
+        usage_event_maintenance_interval_seconds: row.get(36),
+        usage_event_detail_retention_days: row.get(37),
+        kiro_cache_kmodels_json: row.get(38),
+        kiro_billable_model_multipliers_json: row.get(39),
+        kiro_cache_policy_json: row.get(40),
+        kiro_prefix_cache_mode: row.get(41),
+        kiro_prefix_cache_max_tokens: row.get(42),
+        kiro_prefix_cache_entry_ttl_seconds: row.get(43),
+        kiro_conversation_anchor_max_entries: row.get(44),
+        kiro_conversation_anchor_ttl_seconds: row.get(45),
+        updated_at_ms: row.get(46),
+    })
+}
+
+fn decode_key_bundle_row(row: PgRow) -> anyhow::Result<KeyBundle> {
+    let key_id: String = row.get(0);
+    let credit_total_raw: String = row.get(28);
+    let credit_total = credit_total_raw
+        .parse::<f64>()
+        .with_context(|| format!("parse key rollup credit_total `{credit_total_raw}`"))?;
+    Ok(KeyBundle {
+        key: KeyRecord {
+            key_id: key_id.clone(),
+            name: row.get(1),
+            secret: row.get(2),
+            key_hash: row.get(3),
+            status: row.get(4),
+            provider_type: row.get(5),
+            protocol_family: row.get(6),
+            public_visible: row.get(7),
+            quota_billable_limit: row.get(8),
+            created_at_ms: row.get(9),
+            updated_at_ms: row.get(10),
+        },
+        route: KeyRouteConfig {
+            key_id: key_id.clone(),
+            route_strategy: row.get(11),
+            fixed_account_name: row.get(12),
+            auto_account_names_json: row.get(13),
+            account_group_id: row.get(14),
+            model_name_map_json: row.get(15),
+            request_max_concurrency: row.get(16),
+            request_min_start_interval_ms: row.get(17),
+            kiro_request_validation_enabled: row.get::<_, Option<bool>>(18).unwrap_or(false),
+            kiro_cache_estimation_enabled: row.get::<_, Option<bool>>(19).unwrap_or(false),
+            kiro_zero_cache_debug_enabled: row.get::<_, Option<bool>>(20).unwrap_or(false),
+            kiro_full_request_logging_enabled: row.get::<_, Option<bool>>(21).unwrap_or(false),
+            kiro_cache_policy_override_json: row.get(22),
+            kiro_billable_model_multipliers_override_json: row.get(23),
+        },
+        rollup: KeyUsageRollup {
+            key_id,
+            input_uncached_tokens: row.get(24),
+            input_cached_tokens: row.get(25),
+            output_tokens: row.get(26),
+            billable_tokens: row.get(27),
+            credit_total,
+            credit_missing_events: row.get(29),
+            last_used_at_ms: row.get(30),
+            updated_at_ms: row.get(31),
+        },
+    })
+}
+
+fn admin_key_from_bundle(bundle: &KeyBundle) -> AdminKey {
+    let quota = bundle.key.quota_billable_limit.max(0) as u64;
+    let billable = bundle.rollup.billable_tokens.max(0) as u64;
+    AdminKey {
+        id: bundle.key.key_id.clone(),
+        name: bundle.key.name.clone(),
+        secret: bundle.key.secret.clone(),
+        key_hash: bundle.key.key_hash.clone(),
+        status: bundle.key.status.clone(),
+        provider_type: bundle.key.provider_type.clone(),
+        public_visible: bundle.key.public_visible,
+        quota_billable_limit: quota,
+        usage_input_uncached_tokens: bundle.rollup.input_uncached_tokens.max(0) as u64,
+        usage_input_cached_tokens: bundle.rollup.input_cached_tokens.max(0) as u64,
+        usage_output_tokens: bundle.rollup.output_tokens.max(0) as u64,
+        usage_credit_total: bundle.rollup.credit_total,
+        usage_credit_missing_events: bundle.rollup.credit_missing_events.max(0) as u64,
+        remaining_billable: (quota as i64).saturating_sub(billable as i64),
+        last_used_at: bundle.rollup.last_used_at_ms,
+        created_at: bundle.key.created_at_ms,
+        updated_at: bundle.key.updated_at_ms,
+        route_strategy: bundle.route.route_strategy.clone(),
+        account_group_id: bundle.route.account_group_id.clone(),
+        fixed_account_name: bundle.route.fixed_account_name.clone(),
+        auto_account_names: decode_optional_json(bundle.route.auto_account_names_json.as_deref()),
+        model_name_map: decode_optional_json(bundle.route.model_name_map_json.as_deref()),
+        request_max_concurrency: bundle
+            .route
+            .request_max_concurrency
+            .and_then(non_negative_i64_to_u64),
+        request_min_start_interval_ms: bundle
+            .route
+            .request_min_start_interval_ms
+            .and_then(non_negative_i64_to_u64),
+        kiro_request_validation_enabled: bundle.route.kiro_request_validation_enabled,
+        kiro_cache_estimation_enabled: bundle.route.kiro_cache_estimation_enabled,
+        kiro_zero_cache_debug_enabled: bundle.route.kiro_zero_cache_debug_enabled,
+        kiro_full_request_logging_enabled: bundle.route.kiro_full_request_logging_enabled,
+        kiro_cache_policy_override_json: bundle.route.kiro_cache_policy_override_json.clone(),
+        kiro_billable_model_multipliers_override_json: bundle
+            .route
+            .kiro_billable_model_multipliers_override_json
+            .clone(),
+        effective_kiro_cache_policy_json: bundle
+            .route
+            .kiro_cache_policy_override_json
+            .clone()
+            .unwrap_or_else(core_store::default_kiro_cache_policy_json),
+        uses_global_kiro_cache_policy: bundle.route.kiro_cache_policy_override_json.is_none(),
+        effective_kiro_billable_model_multipliers_json: bundle
+            .route
+            .kiro_billable_model_multipliers_override_json
+            .clone()
+            .unwrap_or_else(core_store::default_kiro_billable_model_multipliers_json),
+        uses_global_kiro_billable_model_multipliers: bundle
+            .route
+            .kiro_billable_model_multipliers_override_json
+            .is_none(),
+    }
+}
+
+fn decode_admin_account_group_row(row: PgRow) -> anyhow::Result<AdminAccountGroup> {
+    let account_names_json: String = row.get(3);
+    let account_names = serde_json::from_str::<Vec<String>>(&account_names_json)
+        .with_context(|| format!("decode account_names_json `{account_names_json}`"))?;
+    Ok(AdminAccountGroup {
+        id: row.get(0),
+        provider_type: row.get(1),
+        name: row.get(2),
+        account_names,
+        created_at: row.get(4),
+        updated_at: row.get(5),
+    })
+}
+
+fn decode_admin_proxy_config_row(row: PgRow) -> AdminProxyConfig {
+    AdminProxyConfig {
+        id: row.get(0),
+        name: row.get(1),
+        proxy_url: row.get(2),
+        proxy_username: row.get(3),
+        proxy_password: row.get(4),
+        status: row.get(5),
+        created_at: row.get(6),
+        updated_at: row.get(7),
+    }
+}
+
+fn decode_codex_account_row(row: PgRow) -> CodexAccountRecord {
+    CodexAccountRecord {
+        account_name: row.get(0),
+        account_id: row.get(1),
+        email: row.get(2),
+        status: row.get(3),
+        auth_json: row.get(4),
+        settings_json: row.get(5),
+        last_refresh_at_ms: row.get(6),
+        last_error: row.get(7),
+        created_at_ms: row.get(8),
+        updated_at_ms: row.get(9),
+    }
+}
+
+fn decode_kiro_account_row(row: PgRow) -> KiroAccountRecord {
+    KiroAccountRecord {
+        account_name: row.get(0),
+        auth_method: row.get(1),
+        account_id: row.get(2),
+        profile_arn: row.get(3),
+        user_id: row.get(4),
+        status: row.get(5),
+        auth_json: row.get(6),
+        max_concurrency: row.get(7),
+        min_start_interval_ms: row.get(8),
+        proxy_config_id: row.get(9),
+        last_refresh_at_ms: row.get(10),
+        last_error: row.get(11),
+        created_at_ms: row.get(12),
+        updated_at_ms: row.get(13),
+    }
+}
+
+fn decode_public_usage_lookup_row(row: PgRow) -> anyhow::Result<PublicUsageLookupKey> {
+    let credit_total_raw: String = row.get(10);
+    let usage_credit_total = credit_total_raw
+        .parse::<f64>()
+        .with_context(|| format!("parse usage credit_total `{credit_total_raw}`"))?;
+    Ok(PublicUsageLookupKey {
+        key_id: row.get(0),
+        key_name: row.get(1),
+        provider_type: row.get(2),
+        status: row.get(3),
+        public_visible: row.get(4),
+        quota_billable_limit: row.get::<_, i64>(5).max(0) as u64,
+        usage_input_uncached_tokens: row.get::<_, i64>(6).max(0) as u64,
+        usage_input_cached_tokens: row.get::<_, i64>(7).max(0) as u64,
+        usage_output_tokens: row.get::<_, i64>(8).max(0) as u64,
+        usage_billable_tokens: row.get::<_, i64>(9).max(0) as u64,
+        usage_credit_total,
+        usage_credit_missing_events: row.get::<_, i64>(11).max(0) as u64,
+        last_used_at_ms: row.get(12),
+    })
+}
+
+fn decode_admin_token_request_row(row: PgRow) -> AdminTokenRequest {
+    AdminTokenRequest {
+        request_id: row.get(0),
+        requester_email: row.get(1),
+        requested_quota_billable_limit: row.get::<_, i64>(2).max(0) as u64,
+        request_reason: row.get(3),
+        frontend_page_url: row.get(4),
+        status: row.get(5),
+        client_ip: row.get(6),
+        ip_region: row.get(7),
+        admin_note: row.get(8),
+        failure_reason: row.get(9),
+        issued_key_id: row.get(10),
+        issued_key_name: row.get(11),
+        created_at: row.get(12),
+        updated_at: row.get(13),
+        processed_at: row.get(14),
+    }
+}
+
+fn decode_admin_account_contribution_request_row(row: PgRow) -> AdminAccountContributionRequest {
+    AdminAccountContributionRequest {
+        request_id: row.get(0),
+        account_name: row.get(1),
+        account_id: row.get(2),
+        id_token: row.get(3),
+        access_token: row.get(4),
+        refresh_token: row.get(5),
+        requester_email: row.get(6),
+        contributor_message: row.get(7),
+        github_id: row.get(8),
+        frontend_page_url: row.get(9),
+        status: row.get(10),
+        client_ip: row.get(11),
+        ip_region: row.get(12),
+        admin_note: row.get(13),
+        failure_reason: row.get(14),
+        imported_account_name: row.get(15),
+        issued_key_id: row.get(16),
+        issued_key_name: row.get(17),
+        created_at: row.get(18),
+        updated_at: row.get(19),
+        processed_at: row.get(20),
+    }
+}
+
+fn decode_admin_sponsor_request_row(row: PgRow) -> AdminSponsorRequest {
+    AdminSponsorRequest {
+        request_id: row.get(0),
+        requester_email: row.get(1),
+        sponsor_message: row.get(2),
+        display_name: row.get(3),
+        github_id: row.get(4),
+        frontend_page_url: row.get(5),
+        status: row.get(6),
+        client_ip: row.get(7),
+        ip_region: row.get(8),
+        admin_note: row.get(9),
+        failure_reason: row.get(10),
+        payment_email_sent_at: row.get(11),
+        created_at: row.get(12),
+        updated_at: row.get(13),
+        processed_at: row.get(14),
+    }
+}
+
+fn decode_codex_import_job_summary_row(row: PgRow) -> AdminCodexImportJobSummary {
+    AdminCodexImportJobSummary {
+        job_id: row.get(0),
+        provider_type: row.get(1),
+        source_type: row.get(2),
+        validate_before_import: row.get(3),
+        status: row.get(4),
+        total_count: row.get::<_, i64>(5).max(0) as usize,
+        completed_count: row.get::<_, i64>(6).max(0) as usize,
+        succeeded_count: row.get::<_, i64>(7).max(0) as usize,
+        skipped_count: row.get::<_, i64>(8).max(0) as usize,
+        failed_count: row.get::<_, i64>(9).max(0) as usize,
+        batch_error_message: row.get(10),
+        created_at_ms: row.get(11),
+        updated_at_ms: row.get(12),
+        finished_at_ms: row.get(13),
+    }
+}
+
+fn decode_codex_import_job_item_row(row: PgRow) -> AdminCodexImportJobItem {
+    AdminCodexImportJobItem {
+        item_index: row.get::<_, i64>(0).max(0) as usize,
+        requested_name: row.get(1),
+        requested_account_id: row.get(2),
+        status: row.get(3),
+        error_message: row.get(4),
+        imported_account_name: row.get(5),
+        final_account_id: row.get(6),
+        validated_at_ms: row.get(7),
+        imported_at_ms: row.get(8),
+    }
+}
+
+fn decode_optional_json<T: serde::de::DeserializeOwned>(value: Option<&str>) -> Option<T> {
+    value.and_then(|raw| serde_json::from_str(raw).ok())
+}
+
+fn optional_json_string(value: &serde_json::Value, field: &str) -> Option<String> {
+    value
+        .get(field)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn optional_json_string_any(value: &serde_json::Value, fields: &[&str]) -> Option<String> {
+    fields
+        .iter()
+        .find_map(|field| optional_json_string(value, field))
+}
+
+fn optional_json_bool_any(value: &serde_json::Value, fields: &[&str]) -> Option<bool> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(serde_json::Value::as_bool))
+}
+
+fn optional_json_u64_any(value: &serde_json::Value, fields: &[&str]) -> Option<u64> {
+    fields.iter().find_map(|field| {
+        value
+            .get(*field)
+            .and_then(serde_json::Value::as_u64)
+            .or_else(|| {
+                value
+                    .get(*field)
+                    .and_then(serde_json::Value::as_i64)
+                    .and_then(non_negative_i64_to_u64)
+            })
+    })
+}
+
+fn optional_json_i64_any(value: &serde_json::Value, fields: &[&str]) -> Option<i64> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(serde_json::Value::as_i64))
+}
+
+fn optional_json_f64_any(value: &serde_json::Value, fields: &[&str]) -> Option<f64> {
+    fields
+        .iter()
+        .find_map(|field| value.get(*field).and_then(serde_json::Value::as_f64))
+}
+
+fn set_json_optional_string(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<String>,
+) {
+    match value {
+        Some(value) => {
+            object.insert(key.to_string(), serde_json::Value::String(value));
+        },
+        None => {
+            object.remove(key);
+        },
+    }
+}
+
+fn set_json_optional_bool(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<bool>,
+) {
+    match value {
+        Some(value) => {
+            object.insert(key.to_string(), serde_json::Value::Bool(value));
+        },
+        None => {
+            object.remove(key);
+        },
+    }
+}
+
+fn set_json_optional_u64(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<u64>,
+) {
+    match value {
+        Some(value) => {
+            object.insert(key.to_string(), serde_json::Value::Number(value.into()));
+        },
+        None => {
+            object.remove(key);
+        },
+    }
+}
+
+fn set_json_optional_f64(
+    object: &mut serde_json::Map<String, serde_json::Value>,
+    key: &str,
+    value: Option<f64>,
+) -> anyhow::Result<()> {
+    match value {
+        Some(value) => {
+            let number =
+                serde_json::Number::from_f64(value).context("serialize finite JSON number")?;
+            object.insert(key.to_string(), serde_json::Value::Number(number));
+        },
+        None => {
+            object.remove(key);
+        },
+    }
+    Ok(())
+}
+
+fn non_negative_i64_to_u64(value: i64) -> Option<u64> {
+    u64::try_from(value.max(0)).ok()
+}
+
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
+        .unwrap_or(0)
+}
+
+fn route_strategy_from_config(route: &KeyRouteConfig) -> anyhow::Result<RouteStrategy> {
+    match route.route_strategy.as_deref().unwrap_or("auto") {
+        "auto" => Ok(RouteStrategy::Auto),
+        "fixed" => Ok(RouteStrategy::Fixed),
+        other => anyhow::bail!("unsupported route strategy `{other}`"),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+struct CodexRouteQuotaScore {
+    rank: u8,
+    remaining: f64,
+    last_success_at: i64,
+}
+
+fn sort_codex_routes_by_cached_quota(
+    routes: &mut [ProviderCodexRoute],
+    status: Option<&CodexRateLimitStatus>,
+    runtime_config: &RuntimeConfigRecord,
+    route_weight_tiers: &BTreeMap<String, Option<String>>,
+) {
+    let status_by_account = status
+        .map(|status| {
+            status
+                .accounts
+                .iter()
+                .map(|account| (account.name.as_str(), account))
+                .collect::<BTreeMap<_, _>>()
+        })
+        .unwrap_or_default();
+    routes.sort_by(|left, right| {
+        let left_score = codex_route_quota_score(
+            &left.account_name,
+            &status_by_account,
+            runtime_config,
+            route_weight_tiers
+                .get(&left.account_name)
+                .and_then(|value| value.as_deref()),
+        );
+        let right_score = codex_route_quota_score(
+            &right.account_name,
+            &status_by_account,
+            runtime_config,
+            route_weight_tiers
+                .get(&right.account_name)
+                .and_then(|value| value.as_deref()),
+        );
+        right_score
+            .rank
+            .cmp(&left_score.rank)
+            .then_with(|| right_score.remaining.total_cmp(&left_score.remaining))
+            .then_with(|| right_score.last_success_at.cmp(&left_score.last_success_at))
+            .then_with(|| left.account_name.cmp(&right.account_name))
+    });
+}
+
+fn codex_route_quota_score(
+    account_name: &str,
+    status_by_account: &BTreeMap<&str, &CodexPublicAccountStatus>,
+    runtime_config: &RuntimeConfigRecord,
+    route_weight_tier: Option<&str>,
+) -> CodexRouteQuotaScore {
+    let Some(status) = status_by_account.get(account_name) else {
+        return CodexRouteQuotaScore {
+            rank: 2,
+            remaining: -1.0,
+            last_success_at: 0,
+        };
+    };
+    if status.status != core_store::KEY_STATUS_ACTIVE || status.usage_error_message.is_some() {
+        return CodexRouteQuotaScore {
+            rank: 0,
+            remaining: -1.0,
+            last_success_at: status.last_usage_success_at.unwrap_or(0),
+        };
+    }
+    let Some(remaining) = codex_remaining_bottleneck(status) else {
+        return CodexRouteQuotaScore {
+            rank: 2,
+            remaining: -1.0,
+            last_success_at: status.last_usage_success_at.unwrap_or(0),
+        };
+    };
+    CodexRouteQuotaScore {
+        rank: if remaining > 0.0 { 3 } else { 1 },
+        remaining: remaining
+            * codex_route_weight_multiplier(
+                status.plan_type.as_deref(),
+                route_weight_tier,
+                runtime_config,
+            ),
+        last_success_at: status.last_usage_success_at.unwrap_or(0),
+    }
+}
+
+fn codex_route_weight_multiplier(
+    plan_type: Option<&str>,
+    route_weight_tier: Option<&str>,
+    runtime_config: &RuntimeConfigRecord,
+) -> f64 {
+    match codex_effective_route_weight_tier(plan_type, route_weight_tier) {
+        "free" => runtime_config.codex_weight_free.max(0) as f64,
+        "plus" => runtime_config.codex_weight_plus.max(0) as f64,
+        "pro20x" => runtime_config.codex_weight_pro20x.max(0) as f64,
+        _ => runtime_config.codex_weight_pro5x.max(0) as f64,
+    }
+}
+
+fn codex_effective_route_weight_tier(
+    plan_type: Option<&str>,
+    route_weight_tier: Option<&str>,
+) -> &'static str {
+    match route_weight_tier
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(|value| value.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("free") => "free",
+        Some("plus") => "plus",
+        Some("pro5x") => "pro5x",
+        Some("pro20x") => "pro20x",
+        Some("auto") | None | Some(_) => match plan_type
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| value.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("free") => "free",
+            Some("plus") => "plus",
+            Some("pro20x") => "pro20x",
+            Some("pro") | Some("pro5x") => "pro5x",
+            _ => "free",
+        },
+    }
+}
+
+fn codex_remaining_bottleneck(status: &CodexPublicAccountStatus) -> Option<f64> {
+    [status.primary_remaining_percent, status.secondary_remaining_percent]
+        .into_iter()
+        .flatten()
+        .filter(|value| value.is_finite())
+        .map(|value| value.clamp(0.0, 100.0))
+        .reduce(f64::min)
+}
+
+fn codex_cached_error_message(
+    account_name: &str,
+    record_last_error: Option<&str>,
+    record_last_refresh_at_ms: Option<i64>,
+    auth_refresh_enabled: bool,
+    auth_json: &str,
+    status_by_account: &BTreeMap<String, CodexPublicAccountStatus>,
+) -> Option<String> {
+    let local_auth_error =
+        codex_local_auth_error_message(record_last_error, auth_refresh_enabled, auth_json);
+    match status_by_account.get(account_name) {
+        Some(status) => {
+            if status.usage_error_message.is_some() {
+                return status.usage_error_message.clone();
+            }
+            let local_refresh = record_last_refresh_at_ms.unwrap_or(0);
+            let status_checked_at = status.last_usage_checked_at.unwrap_or(0);
+            if local_refresh > status_checked_at {
+                local_auth_error
+            } else {
+                codex_disabled_expired_auth_error(auth_refresh_enabled, auth_json)
+            }
+        },
+        None => local_auth_error,
+    }
+}
+
+fn codex_local_auth_error_message(
+    record_last_error: Option<&str>,
+    auth_refresh_enabled: bool,
+    auth_json: &str,
+) -> Option<String> {
+    if auth_refresh_enabled {
+        return record_last_error.map(str::to_string);
+    }
+    if codex_access_token_is_still_usable(auth_json) {
+        return None;
+    }
+    record_last_error
+        .map(str::to_string)
+        .or_else(|| codex_disabled_expired_auth_error(auth_refresh_enabled, auth_json))
+}
+
+fn codex_disabled_expired_auth_error(
+    auth_refresh_enabled: bool,
+    auth_json: &str,
+) -> Option<String> {
+    if auth_refresh_enabled || codex_access_token_is_still_usable(auth_json) {
+        return None;
+    }
+    Some("codex auth refresh disabled and current access token expired".to_string())
+}
+
+fn codex_access_token_is_still_usable(auth_json: &str) -> bool {
+    let Some(expires_at_ms) = core_store::codex_auth_access_token_expires_at_ms(auth_json) else {
+        return true;
+    };
+    expires_at_ms > now_ms()
+}
+
+fn effective_kiro_cache_policy_json(
+    runtime_policy_json: &str,
+    override_json: Option<&str>,
+) -> anyhow::Result<String> {
+    let runtime_policy = serde_json::from_str::<KiroCachePolicy>(runtime_policy_json)
+        .context("parse runtime kiro cache policy")?;
+    let effective_policy = resolve_effective_kiro_cache_policy(&runtime_policy, override_json)
+        .context("resolve effective kiro cache policy")?;
+    serde_json::to_string(&effective_policy).context("serialize effective kiro cache policy")
+}
+
+fn provider_proxy_from_admin_proxy(proxy: AdminProxyConfig) -> ProviderProxyConfig {
+    ProviderProxyConfig {
+        proxy_url: proxy.proxy_url,
+        proxy_username: proxy.proxy_username,
+        proxy_password: proxy.proxy_password,
+    }
+}
+
+fn legacy_proxy_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
+    keys.iter()
+        .filter_map(|key| value.get(*key))
+        .find_map(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn clear_legacy_kiro_proxy_json(auth_json: &str, proxy_config_id: &str) -> anyhow::Result<String> {
+    let mut value = serde_json::from_str::<serde_json::Value>(auth_json)
+        .context("parse postgres kiro auth json for legacy proxy cleanup")?;
+    if let Some(object) = value.as_object_mut() {
+        for key in [
+            "proxyUrl",
+            "proxy_url",
+            "proxyUsername",
+            "proxy_username",
+            "proxyPassword",
+            "proxy_password",
+        ] {
+            object.remove(key);
+        }
+        object.insert("proxyMode".to_string(), serde_json::Value::String("fixed".to_string()));
+        object.insert(
+            "proxyConfigId".to_string(),
+            serde_json::Value::String(proxy_config_id.to_string()),
+        );
+    }
+    serde_json::to_string(&value).context("serialize postgres kiro auth json after proxy cleanup")
+}
+
+fn resolve_provider_proxy_config_from_context(
+    proxy_mode: &str,
+    proxy_config_id: Option<&str>,
+    context: &ProviderProxyResolutionContext,
+) -> anyhow::Result<Option<ProviderProxyConfig>> {
+    match proxy_mode {
+        "none" | "direct" => Ok(None),
+        "fixed" => {
+            let Some(proxy_id) = proxy_config_id else {
+                anyhow::bail!("fixed proxy mode requires proxy_config_id");
+            };
+            let Some(proxy) = context.proxy_configs_by_id.get(proxy_id).cloned() else {
+                anyhow::bail!("fixed proxy config `{proxy_id}` is missing");
+            };
+            if proxy.status != core_store::KEY_STATUS_ACTIVE {
+                anyhow::bail!("fixed proxy config `{}` is disabled", proxy.name);
+            }
+            Ok(Some(provider_proxy_from_admin_proxy(proxy)))
+        },
+        _ => {
+            if let Some(message) = context.binding.error_message.clone() {
+                anyhow::bail!("provider proxy binding is invalid: {message}");
+            }
+            match context.binding.effective_proxy_url.clone() {
+                Some(proxy_url) => Ok(Some(ProviderProxyConfig {
+                    proxy_url,
+                    proxy_username: context.binding.effective_proxy_username.clone(),
+                    proxy_password: context.binding.effective_proxy_password.clone(),
+                })),
+                None => Ok(None),
+            }
+        },
+    }
+}
+
+fn decode_codex_account_settings(value: &str) -> anyhow::Result<CodexAccountSettings> {
+    serde_json::from_str(value).context("decode codex account settings")
+}
+
+
+#[async_trait]
+impl AdminConfigStore for PostgresControlRepository {
+    async fn get_admin_runtime_config(&self) -> anyhow::Result<AdminRuntimeConfig> {
+        let record = self.load_runtime_config_record().await?.unwrap_or_default();
+        Ok(record.to_admin_runtime_config())
+    }
+
+    async fn update_admin_runtime_config(
+        &self,
+        config: AdminRuntimeConfig,
+    ) -> anyhow::Result<AdminRuntimeConfig> {
+        let mut record = self.load_runtime_config_record().await?.unwrap_or_default();
+        record.apply_admin_runtime_config(&config);
+        self.upsert_runtime_config_record(&record).await?;
+        Ok(record.to_admin_runtime_config())
+    }
+}
+
+#[async_trait]
+impl AdminKeyStore for PostgresControlRepository {
+    async fn list_admin_keys(&self) -> anyhow::Result<Vec<AdminKey>> {
+        Ok(self
+            .list_key_bundles()
+            .await?
+            .iter()
+            .map(admin_key_from_bundle)
+            .collect())
+    }
+
+    async fn create_admin_key(&self, key: NewAdminKey) -> anyhow::Result<AdminKey> {
+        let key_record = KeyRecord {
+            key_id: key.id.clone(),
+            name: key.name.clone(),
+            secret: key.secret.clone(),
+            key_hash: key.key_hash.clone(),
+            status: core_store::KEY_STATUS_ACTIVE.to_string(),
+            provider_type: key.provider_type.clone(),
+            protocol_family: key.protocol_family.clone(),
+            public_visible: key.public_visible,
+            quota_billable_limit: key.quota_billable_limit as i64,
+            created_at_ms: key.created_at_ms,
+            updated_at_ms: key.created_at_ms,
+        };
+        let route = KeyRouteConfig {
+            key_id: key.id.clone(),
+            route_strategy: None,
+            fixed_account_name: None,
+            auto_account_names_json: None,
+            account_group_id: None,
+            model_name_map_json: None,
+            request_max_concurrency: key.request_max_concurrency.map(|value| value as i64),
+            request_min_start_interval_ms: key
+                .request_min_start_interval_ms
+                .map(|value| value as i64),
+            kiro_request_validation_enabled: true,
+            kiro_cache_estimation_enabled: true,
+            kiro_zero_cache_debug_enabled: false,
+            kiro_full_request_logging_enabled: false,
+            kiro_cache_policy_override_json: None,
+            kiro_billable_model_multipliers_override_json: None,
+        };
+        let rollup = KeyUsageRollup {
+            key_id: key.id.clone(),
+            input_uncached_tokens: 0,
+            input_cached_tokens: 0,
+            output_tokens: 0,
+            billable_tokens: 0,
+            credit_total: 0.0,
+            credit_missing_events: 0,
+            last_used_at_ms: None,
+            updated_at_ms: key.created_at_ms,
+        };
+        Self::upsert_key_bundle_client(&self.client, &key_record, &route, &rollup).await?;
+        self.load_key_bundle_by_id(&key.id)
+            .await?
+            .map(|bundle| admin_key_from_bundle(&bundle))
+            .context("created postgres admin key disappeared")
+    }
+
+    async fn patch_admin_key(
+        &self,
+        key_id: &str,
+        patch: AdminKeyPatch,
+    ) -> anyhow::Result<Option<AdminKey>> {
+        let Some(mut bundle) = self.load_key_bundle_by_id(key_id).await? else {
+            return Ok(None);
+        };
+        if let Some(name) = patch.name.as_ref() {
+            bundle.key.name = name.clone();
+        }
+        if let Some(status) = patch.status.as_ref() {
+            bundle.key.status = status.clone();
+        }
+        if let Some(public_visible) = patch.public_visible {
+            bundle.key.public_visible = public_visible;
+        }
+        if let Some(limit) = patch.quota_billable_limit {
+            bundle.key.quota_billable_limit = limit as i64;
+        }
+        if let Some(value) = patch.route_strategy.as_ref() {
+            bundle.route.route_strategy = value.clone();
+        }
+        if let Some(value) = patch.account_group_id.as_ref() {
+            bundle.route.account_group_id = value.clone();
+        }
+        if let Some(value) = patch.fixed_account_name.as_ref() {
+            bundle.route.fixed_account_name = value.clone();
+        }
+        if let Some(value) = patch.auto_account_names.as_ref() {
+            bundle.route.auto_account_names_json = value
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .context("serialize postgres auto account names")?;
+        }
+        if let Some(value) = patch.model_name_map.as_ref() {
+            bundle.route.model_name_map_json = value
+                .as_ref()
+                .map(serde_json::to_string)
+                .transpose()
+                .context("serialize postgres model name map")?;
+        }
+        if let Some(value) = patch.request_max_concurrency {
+            bundle.route.request_max_concurrency = value.map(|value| value as i64);
+        }
+        if let Some(value) = patch.request_min_start_interval_ms {
+            bundle.route.request_min_start_interval_ms = value.map(|value| value as i64);
+        }
+        if let Some(value) = patch.kiro_request_validation_enabled {
+            bundle.route.kiro_request_validation_enabled = value;
+        }
+        if let Some(value) = patch.kiro_cache_estimation_enabled {
+            bundle.route.kiro_cache_estimation_enabled = value;
+        }
+        if let Some(value) = patch.kiro_zero_cache_debug_enabled {
+            bundle.route.kiro_zero_cache_debug_enabled = value;
+        }
+        if let Some(value) = patch.kiro_full_request_logging_enabled {
+            bundle.route.kiro_full_request_logging_enabled = value;
+        }
+        if let Some(value) = patch.kiro_cache_policy_override_json.as_ref() {
+            bundle.route.kiro_cache_policy_override_json = value.clone();
+        }
+        if let Some(value) = patch.kiro_billable_model_multipliers_override_json.as_ref() {
+            bundle.route.kiro_billable_model_multipliers_override_json = value.clone();
+        }
+        bundle.key.updated_at_ms = patch.updated_at_ms;
+        bundle.rollup.updated_at_ms = bundle.rollup.updated_at_ms.max(patch.updated_at_ms);
+        Self::upsert_key_bundle_client(&self.client, &bundle.key, &bundle.route, &bundle.rollup)
+            .await?;
+        Ok(Some(admin_key_from_bundle(&bundle)))
+    }
+
+    async fn delete_admin_key(&self, key_id: &str) -> anyhow::Result<Option<AdminKey>> {
+        let Some(bundle) = self.load_key_bundle_by_id(key_id).await? else {
+            return Ok(None);
+        };
+        self.ensure_connection_alive()?;
+        self.client
+            .execute("DELETE FROM llm_keys WHERE key_id = $1", &[&key_id])
+            .await
+            .context("delete postgres admin key")?;
+        Ok(Some(admin_key_from_bundle(&bundle)))
+    }
+}
+
+#[async_trait]
+impl AdminAccountGroupStore for PostgresControlRepository {
+    async fn list_admin_account_groups(
+        &self,
+        provider_type: &str,
+    ) -> anyhow::Result<Vec<AdminAccountGroup>> {
+        self.list_admin_account_groups_rows(provider_type).await
+    }
+
+    async fn create_admin_account_group(
+        &self,
+        group: NewAdminAccountGroup,
+    ) -> anyhow::Result<AdminAccountGroup> {
+        let account_names_json =
+            serde_json::to_string(&group.account_names).context("serialize account group names")?;
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "INSERT INTO llm_account_groups (
+                    group_id, provider_type, name, account_names_json, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4::jsonb, $5, $6)",
+                &[
+                    &group.id,
+                    &group.provider_type,
+                    &group.name,
+                    &account_names_json,
+                    &group.created_at_ms,
+                    &group.created_at_ms,
+                ],
+            )
+            .await
+            .context("create postgres account group")?;
+        self.get_admin_account_group_row(&group.id)
+            .await?
+            .context("created postgres account group disappeared")
+    }
+
+    async fn patch_admin_account_group(
+        &self,
+        group_id: &str,
+        patch: AdminAccountGroupPatch,
+    ) -> anyhow::Result<Option<AdminAccountGroup>> {
+        let Some(mut group) = self.get_admin_account_group_row(group_id).await? else {
+            return Ok(None);
+        };
+        if let Some(name) = patch.name.as_ref() {
+            group.name = name.clone();
+        }
+        if let Some(account_names) = patch.account_names.as_ref() {
+            group.account_names = account_names.clone();
+        }
+        group.updated_at = patch.updated_at_ms;
+        let account_names_json =
+            serde_json::to_string(&group.account_names).context("serialize account group names")?;
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "UPDATE llm_account_groups
+                 SET name = $2, account_names_json = $3::jsonb, updated_at_ms = $4
+                 WHERE group_id = $1",
+                &[&group_id, &group.name, &account_names_json, &group.updated_at],
+            )
+            .await
+            .context("patch postgres account group")?;
+        Ok(Some(group))
+    }
+
+    async fn delete_admin_account_group(
+        &self,
+        group_id: &str,
+    ) -> anyhow::Result<Option<AdminAccountGroup>> {
+        let Some(group) = self.get_admin_account_group_row(group_id).await? else {
+            return Ok(None);
+        };
+        self.ensure_connection_alive()?;
+        self.client
+            .execute("DELETE FROM llm_account_groups WHERE group_id = $1", &[&group_id])
+            .await
+            .context("delete postgres account group")?;
+        Ok(Some(group))
+    }
+}
+
+#[async_trait]
+impl AdminProxyStore for PostgresControlRepository {
+    async fn list_admin_proxy_configs(&self) -> anyhow::Result<Vec<AdminProxyConfig>> {
+        self.list_admin_proxy_configs_rows().await
+    }
+
+    async fn get_admin_proxy_config(
+        &self,
+        proxy_id: &str,
+    ) -> anyhow::Result<Option<AdminProxyConfig>> {
+        self.get_admin_proxy_config_row(proxy_id).await
+    }
+
+    async fn create_admin_proxy_config(
+        &self,
+        proxy: NewAdminProxyConfig,
+    ) -> anyhow::Result<AdminProxyConfig> {
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "INSERT INTO llm_proxy_configs (
+                    proxy_config_id, name, proxy_url, proxy_username, proxy_password,
+                    status, created_at_ms, updated_at_ms
+                ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)",
+                &[
+                    &proxy.id,
+                    &proxy.name,
+                    &proxy.proxy_url,
+                    &proxy.proxy_username,
+                    &proxy.proxy_password,
+                    &core_store::KEY_STATUS_ACTIVE,
+                    &proxy.created_at_ms,
+                    &proxy.created_at_ms,
+                ],
+            )
+            .await
+            .context("create postgres proxy config")?;
+        self.get_admin_proxy_config_row(&proxy.id)
+            .await?
+            .context("created postgres proxy config disappeared")
+    }
+
+    async fn patch_admin_proxy_config(
+        &self,
+        proxy_id: &str,
+        patch: AdminProxyConfigPatch,
+    ) -> anyhow::Result<Option<AdminProxyConfig>> {
+        let Some(mut proxy) = self.get_admin_proxy_config_row(proxy_id).await? else {
+            return Ok(None);
+        };
+        if let Some(name) = patch.name.as_ref() {
+            proxy.name = name.clone();
+        }
+        if let Some(proxy_url) = patch.proxy_url.as_ref() {
+            proxy.proxy_url = proxy_url.clone();
+        }
+        if let Some(proxy_username) = patch.proxy_username.as_ref() {
+            proxy.proxy_username = proxy_username.clone();
+        }
+        if let Some(proxy_password) = patch.proxy_password.as_ref() {
+            proxy.proxy_password = proxy_password.clone();
+        }
+        if let Some(status) = patch.status.as_ref() {
+            proxy.status = status.clone();
+        }
+        proxy.updated_at = patch.updated_at_ms;
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "UPDATE llm_proxy_configs
+                 SET name = $2, proxy_url = $3, proxy_username = $4,
+                     proxy_password = $5, status = $6, updated_at_ms = $7
+                 WHERE proxy_config_id = $1",
+                &[
+                    &proxy_id,
+                    &proxy.name,
+                    &proxy.proxy_url,
+                    &proxy.proxy_username,
+                    &proxy.proxy_password,
+                    &proxy.status,
+                    &proxy.updated_at,
+                ],
+            )
+            .await
+            .context("patch postgres proxy config")?;
+        Ok(Some(proxy))
+    }
+
+    async fn delete_admin_proxy_config(
+        &self,
+        proxy_id: &str,
+    ) -> anyhow::Result<Option<AdminProxyConfig>> {
+        let Some(proxy) = self.get_admin_proxy_config_row(proxy_id).await? else {
+            return Ok(None);
+        };
+        self.ensure_connection_alive()?;
+        self.client
+            .execute("DELETE FROM llm_proxy_configs WHERE proxy_config_id = $1", &[&proxy_id])
+            .await
+            .context("delete postgres proxy config")?;
+        Ok(Some(proxy))
+    }
+
+    async fn list_admin_proxy_bindings(&self) -> anyhow::Result<Vec<AdminProxyBinding>> {
+        let mut bindings = Vec::new();
+        for provider in [core_store::PROVIDER_CODEX, core_store::PROVIDER_KIRO] {
+            bindings.push(self.load_admin_proxy_binding_row(provider).await?);
+        }
+        Ok(bindings)
+    }
+
+    async fn update_admin_proxy_binding(
+        &self,
+        provider_type: &str,
+        proxy_config_id: Option<String>,
+    ) -> anyhow::Result<AdminProxyBinding> {
+        self.ensure_connection_alive()?;
+        match proxy_config_id {
+            Some(proxy_config_id) => {
+                self.client
+                    .execute(
+                        "INSERT INTO llm_proxy_bindings (
+                            provider_type, proxy_config_id, updated_at_ms
+                        ) VALUES ($1, $2, $3)
+                        ON CONFLICT(provider_type) DO UPDATE SET
+                            proxy_config_id = EXCLUDED.proxy_config_id,
+                            updated_at_ms = EXCLUDED.updated_at_ms",
+                        &[&provider_type, &proxy_config_id, &now_ms()],
+                    )
+                    .await
+                    .context("upsert postgres proxy binding")?;
+            },
+            None => {
+                self.client
+                    .execute("DELETE FROM llm_proxy_bindings WHERE provider_type = $1", &[
+                        &provider_type,
+                    ])
+                    .await
+                    .context("delete postgres proxy binding")?;
+            },
+        }
+        self.load_admin_proxy_binding_row(provider_type).await
+    }
+
+    async fn import_legacy_kiro_proxy_configs(
+        &self,
+    ) -> anyhow::Result<AdminLegacyKiroProxyMigration> {
+        let mut tuples_to_accounts =
+            BTreeMap::<(String, Option<String>, Option<String>), Vec<KiroAccountRecord>>::new();
+        for account in self.list_kiro_accounts_rows().await? {
+            let auth_json = serde_json::from_str::<serde_json::Value>(&account.auth_json)
+                .context("parse postgres kiro auth json for legacy proxy migration")?;
+            let Some(proxy_url) = legacy_proxy_json_string(&auth_json, &["proxyUrl", "proxy_url"])
+            else {
+                continue;
+            };
+            let proxy_username =
+                legacy_proxy_json_string(&auth_json, &["proxyUsername", "proxy_username"]);
+            let proxy_password =
+                legacy_proxy_json_string(&auth_json, &["proxyPassword", "proxy_password"]);
+            tuples_to_accounts
+                .entry((proxy_url, proxy_username, proxy_password))
+                .or_default()
+                .push(account);
+        }
+
+        if tuples_to_accounts.is_empty() {
+            return Ok(AdminLegacyKiroProxyMigration {
+                created_configs: Vec::new(),
+                reused_configs: Vec::new(),
+                migrated_account_names: Vec::new(),
+            });
+        }
+
+        let mut existing_by_tuple =
+            BTreeMap::<(String, Option<String>, Option<String>), AdminProxyConfig>::new();
+        for proxy in self.list_admin_proxy_configs().await? {
+            existing_by_tuple.insert(
+                (
+                    proxy.proxy_url.clone(),
+                    proxy.proxy_username.clone(),
+                    proxy.proxy_password.clone(),
+                ),
+                proxy,
+            );
+        }
+
+        let mut created_configs = Vec::new();
+        let mut reused_configs = Vec::new();
+        let mut migrated_account_names = Vec::new();
+        for (index, (tuple, mut accounts)) in tuples_to_accounts.into_iter().enumerate() {
+            let proxy = if let Some(proxy) = existing_by_tuple.get(&tuple).cloned() {
+                reused_configs.push(proxy.clone());
+                proxy
+            } else {
+                let now = now_ms();
+                let base = format!("llm-proxy-legacy-{}-{}", now, index + 1);
+                let mut suffix = 0usize;
+                let proxy_id = loop {
+                    let candidate =
+                        if suffix == 0 { base.clone() } else { format!("{base}-{suffix}") };
+                    if !existing_by_tuple
+                        .values()
+                        .any(|proxy| proxy.id == candidate)
+                    {
+                        break candidate;
+                    }
+                    suffix += 1;
+                    if suffix >= 1_000 {
+                        anyhow::bail!("failed to allocate postgres legacy proxy config id");
+                    }
+                };
+                let proxy = NewAdminProxyConfig {
+                    id: proxy_id,
+                    name: format!("legacy-kiro-{}", index + 1),
+                    proxy_url: tuple.0.clone(),
+                    proxy_username: tuple.1.clone(),
+                    proxy_password: tuple.2.clone(),
+                    created_at_ms: now,
+                };
+                let created = self.create_admin_proxy_config(proxy).await?;
+                existing_by_tuple.insert(tuple.clone(), created.clone());
+                created_configs.push(created.clone());
+                created
+            };
+
+            accounts.sort_by_cached_key(|account| account.account_name.to_ascii_lowercase());
+            for mut account in accounts {
+                account.proxy_config_id = Some(proxy.id.clone());
+                account.updated_at_ms = now_ms();
+                account.auth_json = clear_legacy_kiro_proxy_json(&account.auth_json, &proxy.id)?;
+                self.upsert_kiro_account(&account).await?;
+                migrated_account_names.push(account.account_name);
+            }
+        }
+        migrated_account_names.sort();
+        migrated_account_names.dedup();
+        Ok(AdminLegacyKiroProxyMigration {
+            created_configs,
+            reused_configs,
+            migrated_account_names,
+        })
+    }
+}
+
+#[async_trait]
+impl AdminCodexAccountStore for PostgresControlRepository {
+    async fn list_admin_codex_accounts(&self) -> anyhow::Result<Vec<AdminCodexAccount>> {
+        let records = self.list_codex_accounts_rows().await?;
+        let context = self.load_codex_admin_account_view_context().await?;
+        records
+            .iter()
+            .map(|record| self.admin_codex_account_from_record_with_context(record, &context))
+            .collect()
+    }
+
+    async fn get_admin_codex_account(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<AdminCodexAccount>> {
+        match self.get_codex_account_row(name).await? {
+            Some(record) => self
+                .admin_codex_account_from_record(&record)
+                .await
+                .map(Some),
+            None => Ok(None),
+        }
+    }
+
+    async fn find_admin_codex_account_name_by_account_id(
+        &self,
+        account_id: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT account_name
+                 FROM llm_codex_accounts
+                 WHERE account_id = $1
+                 ORDER BY account_name
+                 LIMIT 1",
+                &[&account_id],
+            )
+            .await
+            .context("load codex account name by account id")?;
+        Ok(row.map(|row| row.get(0)))
+    }
+
+    async fn create_admin_codex_account(
+        &self,
+        account: NewAdminCodexAccount,
+    ) -> anyhow::Result<AdminCodexAccount> {
+        let settings = CodexAccountSettings {
+            map_gpt53_codex_to_spark: account.map_gpt53_codex_to_spark,
+            auth_refresh_enabled: account.auto_refresh_enabled,
+            route_weight_tier: account.route_weight_tier.clone(),
+            ..CodexAccountSettings::default()
+        };
+        let record = CodexAccountRecord {
+            account_name: account.name.clone(),
+            account_id: account.account_id.clone(),
+            email: None,
+            status: core_store::KEY_STATUS_ACTIVE.to_string(),
+            auth_json: account.auth_json.clone(),
+            settings_json: serde_json::to_string(&settings)
+                .context("serialize postgres codex settings")?,
+            last_refresh_at_ms: Some(account.created_at_ms),
+            last_error: None,
+            created_at_ms: account.created_at_ms,
+            updated_at_ms: account.created_at_ms,
+        };
+        self.upsert_codex_account(&record).await?;
+        self.get_admin_codex_account(&account.name)
+            .await?
+            .context("created postgres codex account disappeared")
+    }
+
+    async fn patch_admin_codex_account(
+        &self,
+        name: &str,
+        patch: AdminCodexAccountPatch,
+    ) -> anyhow::Result<Option<AdminCodexAccount>> {
+        let Some(mut record) = self.get_codex_account_row(name).await? else {
+            return Ok(None);
+        };
+        if let Some(value) = patch.status.as_ref() {
+            record.status = value.clone();
+        }
+        let mut settings = decode_codex_account_settings(&record.settings_json)?;
+        if let Some(value) = patch.map_gpt53_codex_to_spark {
+            settings.map_gpt53_codex_to_spark = value;
+        }
+        if let Some(value) = patch.auto_refresh_enabled {
+            settings.auth_refresh_enabled = value;
+        }
+        if let Some(value) = patch.route_weight_tier.as_ref() {
+            settings.route_weight_tier = Some(value.clone());
+        }
+        if let Some(value) = patch.proxy_mode.as_ref() {
+            settings.proxy_mode = value.clone();
+        }
+        if let Some(value) = patch.proxy_config_id.as_ref() {
+            settings.proxy_config_id = value.clone();
+        }
+        if let Some(value) = patch.request_max_concurrency {
+            settings.request_max_concurrency = value;
+        }
+        if let Some(value) = patch.request_min_start_interval_ms {
+            settings.request_min_start_interval_ms = value;
+        }
+        record.settings_json =
+            serde_json::to_string(&settings).context("serialize postgres codex settings")?;
+        record.updated_at_ms = patch.updated_at_ms;
+        self.upsert_codex_account(&record).await?;
+        Ok(Some(self.admin_codex_account_from_record(&record).await?))
+    }
+
+    async fn delete_admin_codex_account(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<AdminCodexAccount>> {
+        let Some(record) = self.get_codex_account_row(name).await? else {
+            return Ok(None);
+        };
+        let view = self.admin_codex_account_from_record(&record).await?;
+        self.ensure_connection_alive()?;
+        self.client
+            .execute("DELETE FROM llm_codex_accounts WHERE account_name = $1", &[&name])
+            .await
+            .context("delete postgres codex account")?;
+        Ok(Some(view))
+    }
+
+    async fn refresh_admin_codex_account(
+        &self,
+        name: &str,
+        refreshed_at_ms: i64,
+    ) -> anyhow::Result<Option<AdminCodexAccount>> {
+        let Some(mut record) = self.get_codex_account_row(name).await? else {
+            return Ok(None);
+        };
+        record.last_refresh_at_ms = Some(refreshed_at_ms);
+        record.last_error = None;
+        record.updated_at_ms = refreshed_at_ms;
+        self.upsert_codex_account(&record).await?;
+        Ok(Some(self.admin_codex_account_from_record(&record).await?))
+    }
+
+    async fn resolve_admin_codex_account_route(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<ProviderCodexRoute>> {
+        let Some(record) = self.get_codex_account_row(name).await? else {
+            return Ok(None);
+        };
+        if record.status != core_store::KEY_STATUS_ACTIVE {
+            return Ok(None);
+        }
+        let settings = decode_codex_account_settings(&record.settings_json)?;
+        let proxy_context = self
+            .load_provider_proxy_resolution_context(core_store::PROVIDER_CODEX)
+            .await?;
+        let proxy = resolve_provider_proxy_config_from_context(
+            &settings.proxy_mode,
+            settings.proxy_config_id.as_deref(),
+            &proxy_context,
+        )?;
+        let status_by_account = self
+            .load_codex_rate_limit_status_row()
+            .await?
+            .map(|status| {
+                status
+                    .accounts
+                    .into_iter()
+                    .map(|account| (account.name.clone(), account))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let cached_error_message = codex_cached_error_message(
+            &record.account_name,
+            record.last_error.as_deref(),
+            record.last_refresh_at_ms,
+            settings.auth_refresh_enabled,
+            &record.auth_json,
+            &status_by_account,
+        );
+        Ok(Some(ProviderCodexRoute {
+            account_name: record.account_name.clone(),
+            account_group_id_at_event: None,
+            route_strategy_at_event: RouteStrategy::Auto,
+            auth_json: record.auth_json,
+            map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
+            auth_refresh_enabled: settings.auth_refresh_enabled,
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+            account_request_max_concurrency: settings.request_max_concurrency,
+            account_request_min_start_interval_ms: settings.request_min_start_interval_ms,
+            cached_error_message,
+            proxy,
+        }))
+    }
+
+    async fn create_admin_codex_import_job(
+        &self,
+        job: NewAdminCodexImportJob,
+    ) -> anyhow::Result<AdminCodexImportJobDetail> {
+        let client = self.connect_fresh_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .context("begin postgres codex import job transaction")?;
+        tx.execute(
+            "INSERT INTO llm_account_import_jobs (
+                job_id, provider_type, source_type, validate_before_import, status,
+                total_count, completed_count, succeeded_count, skipped_count, failed_count,
+                batch_error_message, created_at_ms, updated_at_ms, finished_at_ms
+            ) VALUES (
+                $1, $2, $3, $4, 'pending',
+                $5, 0, 0, 0, 0,
+                NULL, $6, $6, NULL
+            )",
+            &[
+                &job.job_id,
+                &job.provider_type,
+                &job.source_type,
+                &job.validate_before_import,
+                &(job.items.len() as i64),
+                &job.created_at_ms,
+            ],
+        )
+        .await
+        .context("insert postgres codex import job")?;
+        for (item_index, item) in job.items.iter().enumerate() {
+            tx.execute(
+                "INSERT INTO llm_account_import_job_items (
+                    job_id, item_index, requested_name, requested_account_id, raw_auth_json,
+                    status, error_message, imported_account_name, final_account_id,
+                    validated_at_ms, imported_at_ms, created_at_ms, updated_at_ms
+                ) VALUES (
+                    $1, $2, $3, $4, $5::jsonb,
+                    'pending', NULL, NULL, NULL,
+                    NULL, NULL, $6, $6
+                )",
+                &[
+                    &job.job_id,
+                    &(item_index as i64),
+                    &item.requested_name,
+                    &item.requested_account_id,
+                    &item.raw_auth_json,
+                    &job.created_at_ms,
+                ],
+            )
+            .await
+            .with_context(|| format!("insert postgres codex import job item {item_index}"))?;
+        }
+        tx.commit()
+            .await
+            .context("commit postgres codex import job transaction")?;
+        self.get_admin_codex_import_job(&job.job_id)
+            .await?
+            .context("created postgres codex import job disappeared")
+    }
+
+    async fn list_admin_codex_import_jobs(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<AdminCodexImportJobSummary>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    job_id, provider_type, source_type, validate_before_import, status,
+                    total_count, completed_count, succeeded_count, skipped_count, failed_count,
+                    batch_error_message, created_at_ms, updated_at_ms, finished_at_ms
+                 FROM llm_account_import_jobs
+                 ORDER BY created_at_ms DESC, job_id DESC
+                 LIMIT $1",
+                &[&(limit as i64)],
+            )
+            .await
+            .context("list postgres codex import jobs")?;
+        Ok(rows
+            .into_iter()
+            .map(decode_codex_import_job_summary_row)
+            .collect())
+    }
+
+    async fn get_admin_codex_import_job(
+        &self,
+        job_id: &str,
+    ) -> anyhow::Result<Option<AdminCodexImportJobDetail>> {
+        let Some(summary) = self.load_codex_import_job_summary_row(job_id).await? else {
+            return Ok(None);
+        };
+        let items = self.load_codex_import_job_items_rows(job_id).await?;
+        Ok(Some(AdminCodexImportJobDetail {
+            summary,
+            items,
+        }))
+    }
+
+    async fn mark_admin_codex_import_job_running(
+        &self,
+        job_id: &str,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        self.ensure_connection_alive()?;
+        let changed = self
+            .client
+            .execute(
+                "UPDATE llm_account_import_jobs
+                 SET status = 'running', updated_at_ms = $2
+                 WHERE job_id = $1",
+                &[&job_id, &updated_at_ms],
+            )
+            .await
+            .context("mark postgres codex import job running")?;
+        if changed == 0 {
+            anyhow::bail!("codex import job `{job_id}` not found");
+        }
+        Ok(())
+    }
+
+    async fn mark_admin_codex_import_job_item_running(
+        &self,
+        job_id: &str,
+        item_index: usize,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        self.ensure_connection_alive()?;
+        let changed = self
+            .client
+            .execute(
+                "UPDATE llm_account_import_job_items
+                 SET status = 'running', updated_at_ms = $3
+                 WHERE job_id = $1 AND item_index = $2",
+                &[&job_id, &(item_index as i64), &updated_at_ms],
+            )
+            .await
+            .context("mark postgres codex import job item running")?;
+        if changed == 0 {
+            anyhow::bail!("codex import job item `{job_id}`:{item_index} not found");
+        }
+        Ok(())
+    }
+
+    async fn complete_admin_codex_import_job_item(
+        &self,
+        job_id: &str,
+        result: AdminCodexImportJobItemResult,
+    ) -> anyhow::Result<Option<AdminCodexImportJobSummary>> {
+        if self
+            .load_codex_import_job_summary_row(job_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let client = self.connect_fresh_client().await?;
+        let tx = client
+            .transaction()
+            .await
+            .context("begin postgres codex import job item completion transaction")?;
+        let item_rows = tx
+            .execute(
+                "UPDATE llm_account_import_job_items
+                 SET
+                    raw_auth_json = NULL,
+                    status = $3,
+                    error_message = $4,
+                    imported_account_name = $5,
+                    final_account_id = $6,
+                    validated_at_ms = $7,
+                    imported_at_ms = $8,
+                    updated_at_ms = $9
+                 WHERE job_id = $1 AND item_index = $2",
+                &[
+                    &job_id,
+                    &(result.item_index as i64),
+                    &result.status,
+                    &result.error_message,
+                    &result.imported_account_name,
+                    &result.final_account_id,
+                    &result.validated_at_ms,
+                    &result.imported_at_ms,
+                    &result.updated_at_ms,
+                ],
+            )
+            .await
+            .context("update postgres codex import job item terminal state")?;
+        if item_rows == 0 {
+            anyhow::bail!("codex import job item `{job_id}`:{} not found", result.item_index);
+        }
+        let job_rows = tx
+            .execute(
+                "UPDATE llm_account_import_jobs
+                 SET
+                    completed_count = completed_count + $2,
+                    succeeded_count = succeeded_count + $3,
+                    skipped_count = skipped_count + $4,
+                    failed_count = failed_count + $5,
+                    status = CASE
+                        WHEN completed_count + $2 >= total_count THEN 'completed'
+                        ELSE status
+                    END,
+                    updated_at_ms = $6,
+                    finished_at_ms = CASE
+                        WHEN completed_count + $2 >= total_count THEN $6
+                        ELSE finished_at_ms
+                    END
+                 WHERE job_id = $1",
+                &[
+                    &job_id,
+                    &(result.completed_delta as i64),
+                    &(result.succeeded_delta as i64),
+                    &(result.skipped_delta as i64),
+                    &(result.failed_delta as i64),
+                    &result.updated_at_ms,
+                ],
+            )
+            .await
+            .context("roll up postgres codex import job counters")?;
+        if job_rows == 0 {
+            anyhow::bail!("codex import job `{job_id}` not found");
+        }
+        tx.commit()
+            .await
+            .context("commit postgres codex import job item completion transaction")?;
+        self.load_codex_import_job_summary_row(job_id).await
+    }
+
+    async fn fail_admin_codex_import_job(
+        &self,
+        job_id: &str,
+        error_message: &str,
+        finished_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        self.ensure_connection_alive()?;
+        let changed = self
+            .client
+            .execute(
+                "UPDATE llm_account_import_jobs
+                 SET
+                    status = 'failed',
+                    batch_error_message = $2,
+                    updated_at_ms = $3,
+                    finished_at_ms = $3
+                 WHERE job_id = $1",
+                &[&job_id, &error_message, &finished_at_ms],
+            )
+            .await
+            .context("mark postgres codex import job failed")?;
+        if changed == 0 {
+            anyhow::bail!("codex import job `{job_id}` not found");
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl AdminKiroAccountStore for PostgresControlRepository {
+    async fn list_admin_kiro_accounts(&self) -> anyhow::Result<Vec<AdminKiroAccount>> {
+        let records = self.list_kiro_accounts_rows().await?;
+        let context = self.load_kiro_admin_account_view_context().await?;
+        records
+            .iter()
+            .map(|record| self.admin_kiro_account_from_record_with_context(record, &context))
+            .collect()
+    }
+
+    async fn create_admin_kiro_account(
+        &self,
+        account: NewAdminKiroAccount,
+    ) -> anyhow::Result<AdminKiroAccount> {
+        let record = KiroAccountRecord {
+            account_name: account.name.clone(),
+            auth_method: account.auth_method.clone(),
+            account_id: account.account_id.clone(),
+            profile_arn: account.profile_arn.clone(),
+            user_id: account.user_id.clone(),
+            status: account.status.clone(),
+            auth_json: account.auth_json.clone(),
+            max_concurrency: account.max_concurrency.map(|value| value as i64),
+            min_start_interval_ms: account.min_start_interval_ms.map(|value| value as i64),
+            proxy_config_id: account.proxy_config_id.clone(),
+            last_refresh_at_ms: Some(account.created_at_ms),
+            last_error: None,
+            created_at_ms: account.created_at_ms,
+            updated_at_ms: account.created_at_ms,
+        };
+        self.upsert_kiro_account(&record).await?;
+        let Some(record) = self.get_kiro_account_row(&account.name).await? else {
+            anyhow::bail!("created postgres kiro account disappeared");
+        };
+        self.admin_kiro_account_from_record(&record).await
+    }
+
+    async fn patch_admin_kiro_account(
+        &self,
+        name: &str,
+        patch: AdminKiroAccountPatch,
+    ) -> anyhow::Result<Option<AdminKiroAccount>> {
+        let Some(mut record) = self.get_kiro_account_row(name).await? else {
+            return Ok(None);
+        };
+        let mut auth_value = serde_json::from_str::<serde_json::Value>(&record.auth_json)
+            .context("parse postgres kiro auth json for patch")?;
+        let object = auth_value
+            .as_object_mut()
+            .context("kiro auth json must be an object")?;
+        if let Some(status) = patch.status.as_ref() {
+            record.status = status.clone();
+            set_json_optional_bool(
+                object,
+                "disabled",
+                Some(status == core_store::KEY_STATUS_DISABLED),
+            );
+            object.remove("disabledReason");
+            object.remove("disabled_reason");
+        }
+        if let Some(value) = patch.max_concurrency {
+            record.max_concurrency = Some(value as i64);
+            set_json_optional_u64(object, "kiroChannelMaxConcurrency", Some(value));
+        }
+        if let Some(value) = patch.min_start_interval_ms {
+            record.min_start_interval_ms = Some(value as i64);
+            set_json_optional_u64(object, "kiroChannelMinStartIntervalMs", Some(value));
+        }
+        if let Some(value) = patch.minimum_remaining_credits_before_block {
+            set_json_optional_f64(
+                object,
+                "minimumRemainingCreditsBeforeBlock",
+                Some(value.max(0.0)),
+            )?;
+        }
+        if let Some(proxy_mode) = patch.proxy_mode.as_ref() {
+            set_json_optional_string(object, "proxyMode", Some(proxy_mode.clone()));
+        }
+        if let Some(proxy_config_id) = patch.proxy_config_id.as_ref() {
+            record.proxy_config_id = proxy_config_id.clone();
+            set_json_optional_string(object, "proxyConfigId", proxy_config_id.clone());
+        }
+        record.auth_json =
+            serde_json::to_string(&auth_value).context("serialize postgres kiro auth json")?;
+        record.updated_at_ms = patch.updated_at_ms;
+        self.upsert_kiro_account(&record).await?;
+        Ok(Some(self.admin_kiro_account_from_record(&record).await?))
+    }
+
+    async fn delete_admin_kiro_account(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<AdminKiroAccount>> {
+        let Some(record) = self.get_kiro_account_row(name).await? else {
+            return Ok(None);
+        };
+        let view = self.admin_kiro_account_from_record(&record).await?;
+        self.ensure_connection_alive()?;
+        self.client
+            .execute("DELETE FROM llm_kiro_accounts WHERE account_name = $1", &[&name])
+            .await
+            .context("delete postgres kiro account")?;
+        Ok(Some(view))
+    }
+
+    async fn get_admin_kiro_balance(
+        &self,
+        name: &str,
+    ) -> anyhow::Result<Option<AdminKiroBalanceView>> {
+        let Some((balance, _cache)) = self.get_kiro_cached_status_parts_row(name).await? else {
+            return Ok(None);
+        };
+        Ok(balance)
+    }
+
+    async fn resolve_admin_kiro_account_route(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<Option<ProviderKiroRoute>> {
+        let Some(record) = self.get_kiro_account_row(account_name).await? else {
+            return Ok(None);
+        };
+        if record.status != core_store::KEY_STATUS_ACTIVE {
+            return Ok(None);
+        }
+        let runtime_config = self.load_runtime_config_record().await?.unwrap_or_default();
+        let auth_json = serde_json::from_str::<serde_json::Value>(&record.auth_json)
+            .context("parse kiro account auth json")?;
+        let profile_arn = record
+            .profile_arn
+            .clone()
+            .or_else(|| optional_json_string(&auth_json, "profileArn"))
+            .or_else(|| optional_json_string(&auth_json, "profile_arn"));
+        let api_region = optional_json_string(&auth_json, "apiRegion")
+            .or_else(|| optional_json_string(&auth_json, "api_region"))
+            .or_else(|| optional_json_string(&auth_json, "region"))
+            .unwrap_or_else(|| "us-east-1".to_string());
+        let minimum_remaining_credits_before_block = optional_json_f64_any(&auth_json, &[
+            "minimumRemainingCreditsBeforeBlock",
+            "minimum_remaining_credits_before_block",
+        ])
+        .filter(|value| value.is_finite())
+        .unwrap_or(0.0)
+        .max(0.0);
+        let cached_status = self
+            .get_kiro_cached_status_parts_row(&record.account_name)
+            .await?;
+        let cached_balance = cached_status
+            .as_ref()
+            .and_then(|(balance, _)| balance.as_ref());
+        let cached_balance_view = cached_balance.cloned();
+        let cached_cache_view = cached_status.as_ref().map(|(_, cache)| cache.clone());
+        let cached_status_label = cached_status
+            .as_ref()
+            .map(|(_, cache)| cache.status.clone());
+        let cached_remaining_credits = cached_balance.map(|balance| balance.remaining);
+        let routing_identity = cached_balance
+            .and_then(|balance| balance.user_id.clone())
+            .or_else(|| record.user_id.clone())
+            .unwrap_or_else(|| record.account_name.clone());
+        let proxy_mode = optional_json_string_any(&auth_json, &["proxyMode", "proxy_mode"])
+            .unwrap_or_else(|| {
+                if record.proxy_config_id.is_some() {
+                    "fixed".to_string()
+                } else {
+                    "inherit".to_string()
+                }
+            });
+        let proxy_config_id = record.proxy_config_id.clone().or_else(|| {
+            optional_json_string_any(&auth_json, &["proxyConfigId", "proxy_config_id"])
+        });
+        let proxy_context = self
+            .load_provider_proxy_resolution_context(core_store::PROVIDER_KIRO)
+            .await?;
+        let proxy = resolve_provider_proxy_config_from_context(
+            &proxy_mode,
+            proxy_config_id.as_deref(),
+            &proxy_context,
+        )?;
+        Ok(Some(ProviderKiroRoute {
+            account_name: record.account_name,
+            account_group_id_at_event: None,
+            route_strategy_at_event: RouteStrategy::Auto,
+            auth_json: record.auth_json,
+            profile_arn,
+            api_region,
+            request_validation_enabled: true,
+            cache_estimation_enabled: true,
+            zero_cache_debug_enabled: false,
+            full_request_logging_enabled: false,
+            model_name_map_json: "{}".to_string(),
+            cache_kmodels_json: runtime_config.kiro_cache_kmodels_json,
+            cache_policy_json: runtime_config.kiro_cache_policy_json,
+            prefix_cache_mode: runtime_config.kiro_prefix_cache_mode,
+            prefix_cache_max_tokens: runtime_config.kiro_prefix_cache_max_tokens.max(0) as u64,
+            prefix_cache_entry_ttl_seconds: runtime_config
+                .kiro_prefix_cache_entry_ttl_seconds
+                .max(0) as u64,
+            conversation_anchor_max_entries: runtime_config
+                .kiro_conversation_anchor_max_entries
+                .max(0) as u64,
+            conversation_anchor_ttl_seconds: runtime_config
+                .kiro_conversation_anchor_ttl_seconds
+                .max(0) as u64,
+            billable_model_multipliers_json: runtime_config.kiro_billable_model_multipliers_json,
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+            account_request_max_concurrency: record
+                .max_concurrency
+                .and_then(non_negative_i64_to_u64),
+            account_request_min_start_interval_ms: record
+                .min_start_interval_ms
+                .and_then(non_negative_i64_to_u64),
+            proxy,
+            routing_identity,
+            cached_status: cached_status_label,
+            cached_remaining_credits,
+            cached_balance: cached_balance_view,
+            cached_cache: cached_cache_view,
+            status_refresh_interval_seconds: runtime_config
+                .kiro_status_refresh_max_interval_seconds
+                .max(0) as u64,
+            minimum_remaining_credits_before_block,
+        }))
+    }
+
+    async fn save_admin_kiro_status_cache(
+        &self,
+        update: AdminKiroStatusCacheUpdate,
+    ) -> anyhow::Result<()> {
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "INSERT INTO llm_kiro_status_cache (
+                    account_name, status, balance_json, cache_json, refreshed_at_ms,
+                    expires_at_ms, last_error
+                ) VALUES ($1, $2, $3::jsonb, $4::jsonb, $5, $6, $7)
+                ON CONFLICT(account_name) DO UPDATE SET
+                    status = EXCLUDED.status,
+                    balance_json = EXCLUDED.balance_json,
+                    cache_json = EXCLUDED.cache_json,
+                    refreshed_at_ms = EXCLUDED.refreshed_at_ms,
+                    expires_at_ms = EXCLUDED.expires_at_ms,
+                    last_error = EXCLUDED.last_error",
+                &[
+                    &update.account_name,
+                    &update.cache.status,
+                    &serde_json::to_string(&update.balance)
+                        .context("encode postgres kiro balance cache")?,
+                    &serde_json::to_string(&update.cache)
+                        .context("encode postgres kiro cache view")?,
+                    &update.refreshed_at_ms,
+                    &update.expires_at_ms,
+                    &update.last_error,
+                ],
+            )
+            .await
+            .context("upsert postgres kiro status cache")?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl ProviderRouteStore for PostgresControlRepository {
+    async fn resolve_codex_route(
+        &self,
+        key: &AuthenticatedKey,
+    ) -> anyhow::Result<Option<ProviderCodexRoute>> {
+        Ok(self
+            .resolve_codex_route_candidates(key)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    async fn resolve_codex_route_candidates(
+        &self,
+        key: &AuthenticatedKey,
+    ) -> anyhow::Result<Vec<ProviderCodexRoute>> {
+        let Some(bundle) = self.load_key_bundle_by_id(&key.key_id).await? else {
+            return Ok(Vec::new());
+        };
+        if bundle.key.provider_type != core_store::PROVIDER_CODEX {
+            return Ok(Vec::new());
+        }
+
+        let runtime_config = self.load_runtime_config_record().await?.unwrap_or_default();
+        let records = self.list_codex_accounts_rows().await?;
+        let account_names = self
+            .resolve_route_account_names(
+                core_store::PROVIDER_CODEX,
+                &bundle.route,
+                records
+                    .iter()
+                    .filter(|record| record.status == core_store::KEY_STATUS_ACTIVE)
+                    .map(|record| record.account_name.clone())
+                    .collect(),
+            )
+            .await?;
+        let route_strategy_at_event = route_strategy_from_config(&bundle.route)?;
+        let account_group_id_at_event = bundle.route.account_group_id.clone();
+        let records_by_name = records
+            .into_iter()
+            .map(|record| (record.account_name.clone(), record))
+            .collect::<BTreeMap<_, _>>();
+        let status_by_account = self
+            .load_codex_rate_limit_status_row()
+            .await?
+            .map(|status| {
+                status
+                    .accounts
+                    .into_iter()
+                    .map(|account| (account.name.clone(), account))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let proxy_context = self
+            .load_provider_proxy_resolution_context(core_store::PROVIDER_CODEX)
+            .await?;
+        let route_weight_tiers = records_by_name
+            .iter()
+            .map(|(name, record)| {
+                let settings = decode_codex_account_settings(&record.settings_json)?;
+                Ok((name.clone(), settings.route_weight_tier))
+            })
+            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+        let mut routes = Vec::new();
+        for account_name in account_names {
+            let Some(record) = records_by_name.get(&account_name).cloned() else {
+                continue;
+            };
+            if record.status != core_store::KEY_STATUS_ACTIVE {
+                continue;
+            }
+            let settings = decode_codex_account_settings(&record.settings_json)?;
+            let proxy = resolve_provider_proxy_config_from_context(
+                &settings.proxy_mode,
+                settings.proxy_config_id.as_deref(),
+                &proxy_context,
+            )?;
+            let cached_error_message = codex_cached_error_message(
+                &account_name,
+                record.last_error.as_deref(),
+                record.last_refresh_at_ms,
+                settings.auth_refresh_enabled,
+                &record.auth_json,
+                &status_by_account,
+            );
+            routes.push(ProviderCodexRoute {
+                account_name: record.account_name,
+                account_group_id_at_event: account_group_id_at_event.clone(),
+                route_strategy_at_event,
+                auth_json: record.auth_json,
+                map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
+                auth_refresh_enabled: settings.auth_refresh_enabled,
+                request_max_concurrency: bundle
+                    .route
+                    .request_max_concurrency
+                    .and_then(non_negative_i64_to_u64),
+                request_min_start_interval_ms: bundle
+                    .route
+                    .request_min_start_interval_ms
+                    .and_then(non_negative_i64_to_u64),
+                account_request_max_concurrency: settings.request_max_concurrency,
+                account_request_min_start_interval_ms: settings.request_min_start_interval_ms,
+                cached_error_message,
+                proxy,
+            });
+        }
+        let codex_status = self.load_codex_rate_limit_status_row().await?;
+        sort_codex_routes_by_cached_quota(
+            &mut routes,
+            codex_status.as_ref(),
+            &runtime_config,
+            &route_weight_tiers,
+        );
+        Ok(routes)
+    }
+
+    async fn resolve_codex_account_route(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<Option<ProviderCodexRoute>> {
+        self.resolve_admin_codex_account_route(account_name).await
+    }
+
+    async fn resolve_kiro_route(
+        &self,
+        key: &AuthenticatedKey,
+    ) -> anyhow::Result<Option<ProviderKiroRoute>> {
+        Ok(self
+            .resolve_kiro_route_candidates(key)
+            .await?
+            .into_iter()
+            .next())
+    }
+
+    async fn resolve_kiro_route_candidates(
+        &self,
+        key: &AuthenticatedKey,
+    ) -> anyhow::Result<Vec<ProviderKiroRoute>> {
+        let Some(bundle) = self.load_key_bundle_by_id(&key.key_id).await? else {
+            return Ok(Vec::new());
+        };
+        if bundle.key.provider_type != core_store::PROVIDER_KIRO {
+            return Ok(Vec::new());
+        }
+
+        let runtime_config = self.load_runtime_config_record().await?.unwrap_or_default();
+        let records = self.list_kiro_accounts_rows().await?;
+        let account_names = self
+            .resolve_route_account_names(
+                core_store::PROVIDER_KIRO,
+                &bundle.route,
+                records
+                    .iter()
+                    .filter(|record| record.status == core_store::KEY_STATUS_ACTIVE)
+                    .map(|record| record.account_name.clone())
+                    .collect(),
+            )
+            .await?;
+        let route_strategy_at_event = route_strategy_from_config(&bundle.route)?;
+        let account_group_id_at_event = bundle.route.account_group_id.clone();
+        let cache_policy_json = effective_kiro_cache_policy_json(
+            &runtime_config.kiro_cache_policy_json,
+            bundle.route.kiro_cache_policy_override_json.as_deref(),
+        )?;
+        let records_by_name = records
+            .into_iter()
+            .map(|record| (record.account_name.clone(), record))
+            .collect::<BTreeMap<_, _>>();
+        let status_by_account = self.list_kiro_cached_status_parts_rows().await?;
+        let proxy_context = self
+            .load_provider_proxy_resolution_context(core_store::PROVIDER_KIRO)
+            .await?;
+        let mut routes = Vec::new();
+        for account_name in account_names {
+            let Some(record) = records_by_name.get(&account_name).cloned() else {
+                continue;
+            };
+            if record.status != core_store::KEY_STATUS_ACTIVE {
+                continue;
+            }
+            let auth_json = serde_json::from_str::<serde_json::Value>(&record.auth_json)
+                .context("parse kiro account auth json")?;
+            if optional_json_bool_any(&auth_json, &["disabled"]).unwrap_or(false) {
+                continue;
+            }
+            let minimum_remaining_credits_before_block = optional_json_f64_any(&auth_json, &[
+                "minimumRemainingCreditsBeforeBlock",
+                "minimum_remaining_credits_before_block",
+            ])
+            .unwrap_or(0.0)
+            .max(0.0);
+            let cached_status = status_by_account.get(&record.account_name).cloned();
+            if let Some((balance, cache)) = &cached_status {
+                if matches!(cache.status.as_str(), "disabled" | "quota_exhausted") {
+                    continue;
+                }
+                if balance.as_ref().is_some_and(|balance| {
+                    balance.remaining <= 0.0
+                        || balance.remaining <= minimum_remaining_credits_before_block
+                }) {
+                    continue;
+                }
+            }
+            let cached_balance = cached_status
+                .as_ref()
+                .and_then(|(balance, _)| balance.as_ref());
+            let cached_balance_view = cached_balance.cloned();
+            let cached_cache_view = cached_status.as_ref().map(|(_, cache)| cache.clone());
+            let cached_status_label = cached_status
+                .as_ref()
+                .map(|(_, cache)| cache.status.clone());
+            let cached_remaining_credits = cached_balance.map(|balance| balance.remaining);
+            let routing_identity = cached_balance
+                .and_then(|balance| balance.user_id.clone())
+                .or_else(|| record.user_id.clone())
+                .unwrap_or_else(|| record.account_name.clone());
+            let profile_arn = record
+                .profile_arn
+                .clone()
+                .or_else(|| optional_json_string(&auth_json, "profileArn"))
+                .or_else(|| optional_json_string(&auth_json, "profile_arn"));
+            let api_region = optional_json_string(&auth_json, "apiRegion")
+                .or_else(|| optional_json_string(&auth_json, "api_region"))
+                .or_else(|| optional_json_string(&auth_json, "region"))
+                .unwrap_or_else(|| "us-east-1".to_string());
+            let billable_model_multipliers_json = bundle
+                .route
+                .kiro_billable_model_multipliers_override_json
+                .clone()
+                .unwrap_or_else(|| runtime_config.kiro_billable_model_multipliers_json.clone());
+            let proxy_mode = optional_json_string_any(&auth_json, &["proxyMode", "proxy_mode"])
+                .unwrap_or_else(|| {
+                    if record.proxy_config_id.is_some() {
+                        "fixed".to_string()
+                    } else {
+                        "inherit".to_string()
+                    }
+                });
+            let proxy_config_id = record.proxy_config_id.clone().or_else(|| {
+                optional_json_string_any(&auth_json, &["proxyConfigId", "proxy_config_id"])
+            });
+            let proxy = resolve_provider_proxy_config_from_context(
+                &proxy_mode,
+                proxy_config_id.as_deref(),
+                &proxy_context,
+            )?;
+            routes.push(ProviderKiroRoute {
+                account_name: record.account_name,
+                account_group_id_at_event: account_group_id_at_event.clone(),
+                route_strategy_at_event,
+                auth_json: record.auth_json,
+                profile_arn,
+                api_region,
+                request_validation_enabled: bundle.route.kiro_request_validation_enabled,
+                cache_estimation_enabled: bundle.route.kiro_cache_estimation_enabled,
+                zero_cache_debug_enabled: bundle.route.kiro_zero_cache_debug_enabled,
+                full_request_logging_enabled: bundle.route.kiro_full_request_logging_enabled,
+                model_name_map_json: bundle
+                    .route
+                    .model_name_map_json
+                    .clone()
+                    .unwrap_or_else(|| "{}".to_string()),
+                cache_kmodels_json: runtime_config.kiro_cache_kmodels_json.clone(),
+                cache_policy_json: cache_policy_json.clone(),
+                prefix_cache_mode: runtime_config.kiro_prefix_cache_mode.clone(),
+                prefix_cache_max_tokens: runtime_config.kiro_prefix_cache_max_tokens.max(0) as u64,
+                prefix_cache_entry_ttl_seconds: runtime_config
+                    .kiro_prefix_cache_entry_ttl_seconds
+                    .max(0) as u64,
+                conversation_anchor_max_entries: runtime_config
+                    .kiro_conversation_anchor_max_entries
+                    .max(0) as u64,
+                conversation_anchor_ttl_seconds: runtime_config
+                    .kiro_conversation_anchor_ttl_seconds
+                    .max(0) as u64,
+                billable_model_multipliers_json,
+                request_max_concurrency: bundle
+                    .route
+                    .request_max_concurrency
+                    .and_then(non_negative_i64_to_u64),
+                request_min_start_interval_ms: bundle
+                    .route
+                    .request_min_start_interval_ms
+                    .and_then(non_negative_i64_to_u64),
+                account_request_max_concurrency: record
+                    .max_concurrency
+                    .and_then(non_negative_i64_to_u64),
+                account_request_min_start_interval_ms: record
+                    .min_start_interval_ms
+                    .and_then(non_negative_i64_to_u64),
+                proxy,
+                routing_identity,
+                cached_status: cached_status_label,
+                cached_remaining_credits,
+                cached_balance: cached_balance_view,
+                cached_cache: cached_cache_view,
+                status_refresh_interval_seconds: runtime_config
+                    .kiro_status_refresh_max_interval_seconds
+                    .max(0) as u64,
+                minimum_remaining_credits_before_block,
+            });
+        }
+        Ok(routes)
+    }
+
+    async fn save_kiro_auth_update(&self, _update: ProviderKiroAuthUpdate) -> anyhow::Result<()> {
+        let Some(mut record) = self.get_kiro_account_row(&_update.account_name).await? else {
+            anyhow::bail!("kiro account `{}` is not configured", _update.account_name);
+        };
+        record.auth_json = _update.auth_json.clone();
+        record.auth_method = _update.auth_method.clone();
+        record.account_id = _update.account_id.clone();
+        record.profile_arn = _update.profile_arn.clone();
+        record.user_id = _update.user_id.clone();
+        record.status = _update.status.clone();
+        record.last_refresh_at_ms = Some(_update.refreshed_at_ms);
+        record.last_error = _update.last_error.clone();
+        record.updated_at_ms = _update.refreshed_at_ms;
+        self.upsert_kiro_account(&record).await
+    }
+
+    async fn save_codex_auth_update(&self, update: ProviderCodexAuthUpdate) -> anyhow::Result<()> {
+        let Some(mut record) = self.get_codex_account_row(&update.account_name).await? else {
+            anyhow::bail!("codex account `{}` is not configured", update.account_name);
+        };
+        record.auth_json = update.auth_json.clone();
+        if update.account_id.is_some() {
+            record.account_id = update.account_id.clone();
+        }
+        record.status = update.status.clone();
+        record.last_refresh_at_ms = Some(update.refreshed_at_ms);
+        record.last_error = update.last_error.clone();
+        record.updated_at_ms = update.refreshed_at_ms;
+        self.upsert_codex_account(&record).await
+    }
+
+    async fn set_codex_account_auto_refresh_enabled(
+        &self,
+        account_name: &str,
+        enabled: bool,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let Some(mut record) = self.get_codex_account_row(account_name).await? else {
+            anyhow::bail!("codex account `{account_name}` is not configured");
+        };
+        let mut settings = decode_codex_account_settings(&record.settings_json)?;
+        if settings.auth_refresh_enabled == enabled {
+            return Ok(());
+        }
+        settings.auth_refresh_enabled = enabled;
+        record.settings_json =
+            serde_json::to_string(&settings).context("serialize postgres codex settings")?;
+        record.updated_at_ms = updated_at_ms;
+        self.upsert_codex_account(&record).await
+    }
+
+    async fn mark_kiro_account_quota_exhausted(
+        &self,
+        account_name: &str,
+        error_message: &str,
+        checked_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        let refresh_interval_seconds = self
+            .load_runtime_config_record()
+            .await?
+            .unwrap_or_default()
+            .kiro_status_refresh_max_interval_seconds
+            .max(0) as u64;
+        self.save_admin_kiro_status_cache(AdminKiroStatusCacheUpdate {
+            account_name: account_name.to_string(),
+            balance: None,
+            cache: AdminKiroCacheView {
+                status: "quota_exhausted".to_string(),
+                refresh_interval_seconds,
+                last_checked_at: Some(checked_at_ms),
+                last_success_at: Some(checked_at_ms),
+                error_message: Some(error_message.to_string()),
+            },
+            refreshed_at_ms: checked_at_ms,
+            expires_at_ms: checked_at_ms
+                .saturating_add((refresh_interval_seconds as i64).saturating_mul(1000)),
+            last_error: Some(error_message.to_string()),
+        })
+        .await
+    }
+
+    async fn save_kiro_status_cache_update(
+        &self,
+        update: AdminKiroStatusCacheUpdate,
+    ) -> anyhow::Result<()> {
+        self.save_admin_kiro_status_cache(update).await
+    }
+}
+
+#[async_trait]
+impl ControlStore for PostgresControlRepository {
+    async fn authenticate_bearer_secret(
+        &self,
+        secret: &str,
+    ) -> anyhow::Result<Option<AuthenticatedKey>> {
+        Ok(self
+            .load_key_bundle_by_hash(&hash_bearer_secret(secret))
+            .await?
+            .map(|bundle| AuthenticatedKey {
+                key_id: bundle.key.key_id,
+                key_name: bundle.key.name,
+                provider_type: bundle.key.provider_type,
+                protocol_family: bundle.key.protocol_family,
+                status: bundle.key.status,
+                quota_billable_limit: bundle.key.quota_billable_limit,
+                billable_tokens_used: bundle.rollup.billable_tokens,
+            }))
+    }
+
+    async fn apply_usage_rollup(&self, event: &UsageEvent) -> anyhow::Result<()> {
+        self.ensure_connection_alive()?;
+        let credit_delta = event
+            .credit_usage
+            .as_deref()
+            .and_then(|raw| raw.parse::<f64>().ok())
+            .unwrap_or(0.0);
+        let last_used_at_ms = event.created_at_ms;
+        let changed = self
+            .client
+            .execute(
+                "UPDATE llm_key_usage_rollups
+                 SET input_uncached_tokens = input_uncached_tokens + $2,
+                     input_cached_tokens = input_cached_tokens + $3,
+                     output_tokens = output_tokens + $4,
+                     billable_tokens = billable_tokens + $5,
+                     credit_total = ((credit_total)::numeric + ($6::double \
+                 precision)::numeric)::text,
+                     credit_missing_events = credit_missing_events + $7,
+                     last_used_at_ms = CASE
+                         WHEN last_used_at_ms IS NULL THEN $8
+                         ELSE GREATEST(last_used_at_ms, $8)
+                     END,
+                     updated_at_ms = GREATEST(updated_at_ms, $8)
+                 WHERE key_id = $1",
+                &[
+                    &event.key_id,
+                    &event.input_uncached_tokens.max(0),
+                    &event.input_cached_tokens.max(0),
+                    &event.output_tokens.max(0),
+                    &event.billable_tokens.max(0),
+                    &credit_delta,
+                    &(event.credit_usage_missing as i64),
+                    &last_used_at_ms,
+                ],
+            )
+            .await
+            .with_context(|| {
+                format!("increment postgres usage rollup for key `{}`", event.key_id)
+            })?;
+        if changed == 0 {
+            anyhow::bail!("usage rollup not found for key `{}`", event.key_id);
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl UsageEventSink for PostgresControlRepository {
+    async fn append_usage_events(&self, events: &[UsageEvent]) -> anyhow::Result<()> {
+        self.append_usage_events_owned(events.to_vec()).await
+    }
+
+    async fn append_usage_events_owned(&self, events: Vec<UsageEvent>) -> anyhow::Result<()> {
+        for event in &events {
+            self.apply_usage_rollup(event).await?;
+        }
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PublicSubmissionStore for PostgresControlRepository {
+    async fn create_public_token_request(
+        &self,
+        request: NewPublicTokenRequest,
+    ) -> anyhow::Result<()> {
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "INSERT INTO llm_token_requests (
+                    request_id, requester_email, requested_quota_billable_limit, request_reason,
+                    frontend_page_url, status, fingerprint, client_ip, ip_region, admin_note,
+                    failure_reason, issued_key_id, issued_key_name, created_at_ms,
+                    updated_at_ms, processed_at_ms
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, NULL, NULL, NULL, NULL, $10, $10, NULL
+                )",
+                &[
+                    &request.request_id,
+                    &request.requester_email,
+                    &(request.requested_quota_billable_limit as i64),
+                    &request.request_reason,
+                    &request.frontend_page_url,
+                    &PUBLIC_TOKEN_REQUEST_STATUS_PENDING,
+                    &request.fingerprint,
+                    &request.client_ip,
+                    &request.ip_region,
+                    &request.created_at_ms,
+                ],
+            )
+            .await
+            .context("create postgres public token request")?;
+        Ok(())
+    }
+
+    async fn create_public_account_contribution_request(
+        &self,
+        request: NewPublicAccountContributionRequest,
+    ) -> anyhow::Result<()> {
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "INSERT INTO llm_account_contribution_requests (
+                    request_id, account_name, account_id, id_token, access_token, refresh_token,
+                    requester_email, contributor_message, github_id, frontend_page_url,
+                    show_on_public_wall, status, fingerprint, client_ip, ip_region,
+                    admin_note, failure_reason, imported_account_name, issued_key_id,
+                    issued_key_name, created_at_ms, updated_at_ms, processed_at_ms
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
+                    $15, NULL, NULL, NULL, NULL, NULL, $16, $16, NULL
+                )",
+                &[
+                    &request.request_id,
+                    &request.account_name,
+                    &request.account_id,
+                    &request.id_token,
+                    &request.access_token,
+                    &request.refresh_token,
+                    &request.requester_email,
+                    &request.contributor_message,
+                    &request.github_id,
+                    &request.frontend_page_url,
+                    &request.show_on_public_wall,
+                    &PUBLIC_TOKEN_REQUEST_STATUS_PENDING,
+                    &request.fingerprint,
+                    &request.client_ip,
+                    &request.ip_region,
+                    &request.created_at_ms,
+                ],
+            )
+            .await
+            .context("create postgres public account contribution request")?;
+        Ok(())
+    }
+
+    async fn public_account_contribution_name_exists(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<bool> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_one(
+                "SELECT EXISTS(
+                    SELECT 1 FROM llm_codex_accounts WHERE account_name = $1
+                    UNION ALL
+                    SELECT 1 FROM llm_account_contribution_requests
+                     WHERE account_name = $1
+                       AND status IN ($2, $3, 'issued')
+                )",
+                &[
+                    &account_name,
+                    &PUBLIC_TOKEN_REQUEST_STATUS_PENDING,
+                    &PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED,
+                ],
+            )
+            .await
+            .context("check postgres public account contribution name")?;
+        Ok(row.get(0))
+    }
+
+    async fn create_public_sponsor_request(
+        &self,
+        request: NewPublicSponsorRequest,
+    ) -> anyhow::Result<()> {
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "INSERT INTO llm_sponsor_requests (
+                    request_id, requester_email, sponsor_message, display_name, github_id,
+                    frontend_page_url, status, fingerprint, client_ip, ip_region, admin_note,
+                    failure_reason, payment_email_sent_at_ms, created_at_ms, updated_at_ms,
+                    processed_at_ms
+                ) VALUES (
+                    $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, NULL, NULL, NULL, $11, $11, NULL
+                )",
+                &[
+                    &request.request_id,
+                    &request.requester_email,
+                    &request.sponsor_message,
+                    &request.display_name,
+                    &request.github_id,
+                    &request.frontend_page_url,
+                    &PUBLIC_SPONSOR_REQUEST_STATUS_SUBMITTED,
+                    &request.fingerprint,
+                    &request.client_ip,
+                    &request.ip_region,
+                    &request.created_at_ms,
+                ],
+            )
+            .await
+            .context("create postgres public sponsor request")?;
+        Ok(())
+    }
+
+    async fn record_public_sponsor_payment_email_result(
+        &self,
+        request_id: &str,
+        sent_at_ms: Option<i64>,
+        failure_reason: Option<String>,
+    ) -> anyhow::Result<()> {
+        self.ensure_connection_alive()?;
+        let status = if sent_at_ms.is_some() {
+            PUBLIC_SPONSOR_REQUEST_STATUS_PAYMENT_EMAIL_SENT
+        } else {
+            PUBLIC_SPONSOR_REQUEST_STATUS_SUBMITTED
+        };
+        let updated_at_ms = sent_at_ms.unwrap_or_else(now_ms);
+        self.client
+            .execute(
+                "UPDATE llm_sponsor_requests
+                 SET status = $2,
+                     failure_reason = $3,
+                     payment_email_sent_at_ms = $4,
+                     updated_at_ms = $5
+                 WHERE request_id = $1",
+                &[&request_id, &status, &failure_reason, &sent_at_ms, &updated_at_ms],
+            )
+            .await
+            .context("record postgres sponsor payment email result")?;
+        Ok(())
+    }
+}
+
+#[async_trait]
+impl PublicAccessStore for PostgresControlRepository {
+    async fn auth_cache_ttl_seconds(&self) -> anyhow::Result<u64> {
+        Ok(self
+            .load_runtime_config_record()
+            .await?
+            .map_or(DEFAULT_AUTH_CACHE_TTL_SECONDS, |record| {
+                record.auth_cache_ttl_seconds.max(0) as u64
+            }))
+    }
+
+    async fn list_public_access_keys(&self) -> anyhow::Result<Vec<PublicAccessKey>> {
+        self.list_public_access_keys_rows().await
+    }
+}
+
+#[async_trait]
+impl PublicCommunityStore for PostgresControlRepository {
+    async fn list_public_account_contributions(
+        &self,
+        limit: usize,
+    ) -> anyhow::Result<Vec<PublicAccountContribution>> {
+        self.list_public_account_contributions_rows(limit).await
+    }
+
+    async fn list_public_sponsors(&self, limit: usize) -> anyhow::Result<Vec<PublicSponsor>> {
+        self.list_public_sponsors_rows(limit).await
+    }
+}
+
+#[async_trait]
+impl PublicUsageStore for PostgresControlRepository {
+    async fn get_public_usage_key_by_secret(
+        &self,
+        secret: &str,
+    ) -> anyhow::Result<Option<PublicUsageLookupKey>> {
+        self.load_public_usage_key_by_hash(&hash_bearer_secret(secret))
+            .await
+    }
+}
+
+#[async_trait]
+impl AdminReviewQueueStore for PostgresControlRepository {
+    async fn get_admin_token_request(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<Option<AdminTokenRequest>> {
+        self.get_admin_token_request_row(request_id).await
+    }
+
+    async fn list_admin_token_requests(
+        &self,
+        query: AdminReviewQueueQuery,
+    ) -> anyhow::Result<AdminTokenRequestsPage> {
+        let total = self
+            .count_rows(
+                "SELECT COUNT(*) FROM llm_token_requests",
+                "SELECT COUNT(*) FROM llm_token_requests WHERE status = $1",
+                query.status.as_deref(),
+            )
+            .await?;
+        if total == 0 || query.offset >= total {
+            return Ok(AdminTokenRequestsPage {
+                total,
+                offset: query.offset,
+                limit: query.limit,
+                has_more: false,
+                requests: Vec::new(),
+            });
+        }
+        let rows = if let Some(status) = query.status.as_deref() {
+            self.client
+                .query(
+                    "SELECT
+                        request_id, requester_email, requested_quota_billable_limit,
+                        request_reason, frontend_page_url, status, client_ip, ip_region,
+                        admin_note, failure_reason, issued_key_id, issued_key_name,
+                        created_at_ms, updated_at_ms, processed_at_ms
+                     FROM llm_token_requests
+                     WHERE status = $1
+                     ORDER BY created_at_ms DESC, request_id DESC
+                     LIMIT $2 OFFSET $3",
+                    &[&status, &(query.limit as i64), &(query.offset as i64)],
+                )
+                .await
+                .context("list admin token requests by status")?
+        } else {
+            self.client
+                .query(
+                    "SELECT
+                        request_id, requester_email, requested_quota_billable_limit,
+                        request_reason, frontend_page_url, status, client_ip, ip_region,
+                        admin_note, failure_reason, issued_key_id, issued_key_name,
+                        created_at_ms, updated_at_ms, processed_at_ms
+                     FROM llm_token_requests
+                     ORDER BY created_at_ms DESC, request_id DESC
+                     LIMIT $1 OFFSET $2",
+                    &[&(query.limit as i64), &(query.offset as i64)],
+                )
+                .await
+                .context("list admin token requests")?
+        };
+        let requests = rows
+            .into_iter()
+            .map(decode_admin_token_request_row)
+            .collect::<Vec<_>>();
+        Ok(AdminTokenRequestsPage {
+            total,
+            offset: query.offset,
+            limit: query.limit,
+            has_more: query.offset.saturating_add(requests.len()) < total,
+            requests,
+        })
+    }
+
+    async fn get_admin_account_contribution_request(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>> {
+        self.get_admin_account_contribution_request_row(request_id)
+            .await
+    }
+
+    async fn list_admin_account_contribution_requests(
+        &self,
+        query: AdminReviewQueueQuery,
+    ) -> anyhow::Result<AdminAccountContributionRequestsPage> {
+        let total = self
+            .count_rows(
+                "SELECT COUNT(*) FROM llm_account_contribution_requests",
+                "SELECT COUNT(*) FROM llm_account_contribution_requests WHERE status = $1",
+                query.status.as_deref(),
+            )
+            .await?;
+        if total == 0 || query.offset >= total {
+            return Ok(AdminAccountContributionRequestsPage {
+                total,
+                offset: query.offset,
+                limit: query.limit,
+                has_more: false,
+                requests: Vec::new(),
+            });
+        }
+        let rows = if let Some(status) = query.status.as_deref() {
+            self.client
+                .query(
+                    "SELECT
+                        request_id, account_name, account_id, id_token, access_token,
+                        refresh_token, requester_email, contributor_message, github_id,
+                        frontend_page_url, status, client_ip, ip_region, admin_note,
+                        failure_reason, imported_account_name, issued_key_id, issued_key_name,
+                        created_at_ms, updated_at_ms, processed_at_ms
+                     FROM llm_account_contribution_requests
+                     WHERE status = $1
+                     ORDER BY created_at_ms DESC, request_id DESC
+                     LIMIT $2 OFFSET $3",
+                    &[&status, &(query.limit as i64), &(query.offset as i64)],
+                )
+                .await
+                .context("list admin account contribution requests by status")?
+        } else {
+            self.client
+                .query(
+                    "SELECT
+                        request_id, account_name, account_id, id_token, access_token,
+                        refresh_token, requester_email, contributor_message, github_id,
+                        frontend_page_url, status, client_ip, ip_region, admin_note,
+                        failure_reason, imported_account_name, issued_key_id, issued_key_name,
+                        created_at_ms, updated_at_ms, processed_at_ms
+                     FROM llm_account_contribution_requests
+                     ORDER BY created_at_ms DESC, request_id DESC
+                     LIMIT $1 OFFSET $2",
+                    &[&(query.limit as i64), &(query.offset as i64)],
+                )
+                .await
+                .context("list admin account contribution requests")?
+        };
+        let requests = rows
+            .into_iter()
+            .map(decode_admin_account_contribution_request_row)
+            .collect::<Vec<_>>();
+        Ok(AdminAccountContributionRequestsPage {
+            total,
+            offset: query.offset,
+            limit: query.limit,
+            has_more: query.offset.saturating_add(requests.len()) < total,
+            requests,
+        })
+    }
+
+    async fn get_admin_sponsor_request(
+        &self,
+        request_id: &str,
+    ) -> anyhow::Result<Option<AdminSponsorRequest>> {
+        self.get_admin_sponsor_request_row(request_id).await
+    }
+
+    async fn list_admin_sponsor_requests(
+        &self,
+        query: AdminReviewQueueQuery,
+    ) -> anyhow::Result<AdminSponsorRequestsPage> {
+        let total = self
+            .count_rows(
+                "SELECT COUNT(*) FROM llm_sponsor_requests",
+                "SELECT COUNT(*) FROM llm_sponsor_requests WHERE status = $1",
+                query.status.as_deref(),
+            )
+            .await?;
+        if total == 0 || query.offset >= total {
+            return Ok(AdminSponsorRequestsPage {
+                total,
+                offset: query.offset,
+                limit: query.limit,
+                has_more: false,
+                requests: Vec::new(),
+            });
+        }
+        let rows = if let Some(status) = query.status.as_deref() {
+            self.client
+                .query(
+                    "SELECT
+                        request_id, requester_email, sponsor_message, display_name, github_id,
+                        frontend_page_url, status, client_ip, ip_region, admin_note,
+                        failure_reason, payment_email_sent_at_ms, created_at_ms, updated_at_ms,
+                        processed_at_ms
+                     FROM llm_sponsor_requests
+                     WHERE status = $1
+                     ORDER BY created_at_ms DESC, request_id DESC
+                     LIMIT $2 OFFSET $3",
+                    &[&status, &(query.limit as i64), &(query.offset as i64)],
+                )
+                .await
+                .context("list admin sponsor requests by status")?
+        } else {
+            self.client
+                .query(
+                    "SELECT
+                        request_id, requester_email, sponsor_message, display_name, github_id,
+                        frontend_page_url, status, client_ip, ip_region, admin_note,
+                        failure_reason, payment_email_sent_at_ms, created_at_ms, updated_at_ms,
+                        processed_at_ms
+                     FROM llm_sponsor_requests
+                     ORDER BY created_at_ms DESC, request_id DESC
+                     LIMIT $1 OFFSET $2",
+                    &[&(query.limit as i64), &(query.offset as i64)],
+                )
+                .await
+                .context("list admin sponsor requests")?
+        };
+        let requests = rows
+            .into_iter()
+            .map(decode_admin_sponsor_request_row)
+            .collect::<Vec<_>>();
+        Ok(AdminSponsorRequestsPage {
+            total,
+            offset: query.offset,
+            limit: query.limit,
+            has_more: query.offset.saturating_add(requests.len()) < total,
+            requests,
+        })
+    }
+
+    async fn issue_admin_token_request(
+        &self,
+        request_id: &str,
+        key: Option<NewAdminKey>,
+        action: AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminTokenRequest>> {
+        let Some(current) = self.get_admin_token_request_row(request_id).await? else {
+            return Ok(None);
+        };
+        let (issued_key_id, issued_key_name) = match (current.issued_key_id, key) {
+            (Some(id), _) => (Some(id), current.issued_key_name),
+            (None, Some(key)) => {
+                let created = self.create_admin_key(key).await?;
+                (Some(created.id), Some(created.name))
+            },
+            (None, None) => (None, None),
+        };
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "UPDATE llm_token_requests
+                 SET status = 'issued',
+                     admin_note = $2,
+                     failure_reason = NULL,
+                     issued_key_id = $3,
+                     issued_key_name = $4,
+                     updated_at_ms = $5,
+                     processed_at_ms = $5
+                 WHERE request_id = $1",
+                &[
+                    &request_id,
+                    &action.admin_note,
+                    &issued_key_id,
+                    &issued_key_name,
+                    &action.updated_at_ms,
+                ],
+            )
+            .await
+            .context("issue postgres admin token request")?;
+        self.get_admin_token_request_row(request_id).await
+    }
+
+    async fn reject_admin_token_request(
+        &self,
+        request_id: &str,
+        action: AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminTokenRequest>> {
+        let Some(current) = self.get_admin_token_request_row(request_id).await? else {
+            return Ok(None);
+        };
+        if let Some(key_id) = current.issued_key_id.as_deref() {
+            self.disable_admin_key_if_present(key_id, action.updated_at_ms)
+                .await?;
+        }
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "UPDATE llm_token_requests
+                 SET status = 'rejected',
+                     admin_note = $2,
+                     failure_reason = NULL,
+                     updated_at_ms = $3,
+                     processed_at_ms = $3
+                 WHERE request_id = $1",
+                &[&request_id, &action.admin_note, &action.updated_at_ms],
+            )
+            .await
+            .context("reject postgres admin token request")?;
+        self.get_admin_token_request_row(request_id).await
+    }
+
+    async fn issue_admin_account_contribution_request(
+        &self,
+        request_id: &str,
+        account: Option<NewAdminCodexAccount>,
+        account_group: Option<NewAdminAccountGroup>,
+        key: Option<NewAdminKey>,
+        action: AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>> {
+        let Some(current) = self
+            .get_admin_account_contribution_request_row(request_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        let imported_account_name = match (current.imported_account_name, account) {
+            (Some(name), _) => Some(name),
+            (None, Some(account)) => {
+                let created = self.create_admin_codex_account(account).await?;
+                Some(created.name)
+            },
+            (None, None) => None,
+        };
+        if let Some(group) = account_group.clone() {
+            self.create_admin_account_group(group).await?;
+        }
+        let (issued_key_id, issued_key_name) = match (current.issued_key_id, key) {
+            (Some(id), _) => (Some(id), current.issued_key_name),
+            (None, Some(key)) => {
+                let created = self.create_admin_key(key).await?;
+                if let Some(group) = account_group {
+                    self.patch_admin_key(&created.id, AdminKeyPatch {
+                        route_strategy: Some(Some("fixed".to_string())),
+                        account_group_id: Some(Some(group.id.clone())),
+                        updated_at_ms: action.updated_at_ms,
+                        ..AdminKeyPatch::default()
+                    })
+                    .await?;
+                }
+                (Some(created.id), Some(created.name))
+            },
+            (None, None) => (None, None),
+        };
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "UPDATE llm_account_contribution_requests
+                 SET status = 'issued',
+                     admin_note = $2,
+                     failure_reason = NULL,
+                     imported_account_name = $3,
+                     issued_key_id = $4,
+                     issued_key_name = $5,
+                     updated_at_ms = $6,
+                     processed_at_ms = $6
+                 WHERE request_id = $1",
+                &[
+                    &request_id,
+                    &action.admin_note,
+                    &imported_account_name,
+                    &issued_key_id,
+                    &issued_key_name,
+                    &action.updated_at_ms,
+                ],
+            )
+            .await
+            .context("issue postgres admin account contribution request")?;
+        self.get_admin_account_contribution_request_row(request_id)
+            .await
+    }
+
+    async fn validate_admin_account_contribution_request(
+        &self,
+        request_id: &str,
+        account_id: Option<String>,
+        id_token: String,
+        access_token: String,
+        refresh_token: String,
+        action: AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>> {
+        if self
+            .get_admin_account_contribution_request_row(request_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "UPDATE llm_account_contribution_requests
+                 SET status = $2,
+                     account_id = $3,
+                     id_token = $4,
+                     access_token = $5,
+                     refresh_token = $6,
+                     admin_note = $7,
+                     failure_reason = NULL,
+                     updated_at_ms = $8,
+                     processed_at_ms = NULL
+                 WHERE request_id = $1",
+                &[
+                    &request_id,
+                    &PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED,
+                    &account_id,
+                    &id_token,
+                    &access_token,
+                    &refresh_token,
+                    &action.admin_note,
+                    &action.updated_at_ms,
+                ],
+            )
+            .await
+            .context("validate postgres admin account contribution request")?;
+        self.get_admin_account_contribution_request_row(request_id)
+            .await
+    }
+
+    async fn fail_admin_account_contribution_request(
+        &self,
+        request_id: &str,
+        failure_reason: String,
+        action: AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>> {
+        if self
+            .get_admin_account_contribution_request_row(request_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "UPDATE llm_account_contribution_requests
+                 SET status = 'failed',
+                     admin_note = $2,
+                     failure_reason = $3,
+                     updated_at_ms = $4,
+                     processed_at_ms = NULL
+                 WHERE request_id = $1",
+                &[&request_id, &action.admin_note, &failure_reason, &action.updated_at_ms],
+            )
+            .await
+            .context("fail postgres admin account contribution request")?;
+        self.get_admin_account_contribution_request_row(request_id)
+            .await
+    }
+
+    async fn reject_admin_account_contribution_request(
+        &self,
+        request_id: &str,
+        action: AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminAccountContributionRequest>> {
+        let Some(current) = self
+            .get_admin_account_contribution_request_row(request_id)
+            .await?
+        else {
+            return Ok(None);
+        };
+        if let Some(key_id) = current.issued_key_id.as_deref() {
+            self.disable_admin_key_if_present(key_id, action.updated_at_ms)
+                .await?;
+        }
+        if let Some(account_name) = current.imported_account_name.as_deref() {
+            self.delete_admin_codex_account(account_name).await?;
+        }
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "UPDATE llm_account_contribution_requests
+                 SET status = 'rejected',
+                     admin_note = $2,
+                     failure_reason = NULL,
+                     updated_at_ms = $3,
+                     processed_at_ms = $3
+                 WHERE request_id = $1",
+                &[&request_id, &action.admin_note, &action.updated_at_ms],
+            )
+            .await
+            .context("reject postgres admin account contribution request")?;
+        self.get_admin_account_contribution_request_row(request_id)
+            .await
+    }
+
+    async fn approve_admin_sponsor_request(
+        &self,
+        request_id: &str,
+        action: AdminReviewQueueAction,
+    ) -> anyhow::Result<Option<AdminSponsorRequest>> {
+        if self
+            .get_admin_sponsor_request_row(request_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "UPDATE llm_sponsor_requests
+                 SET status = 'approved',
+                     admin_note = $2,
+                     failure_reason = NULL,
+                     updated_at_ms = $3,
+                     processed_at_ms = $3
+                 WHERE request_id = $1",
+                &[&request_id, &action.admin_note, &action.updated_at_ms],
+            )
+            .await
+            .context("approve postgres sponsor request")?;
+        self.get_admin_sponsor_request_row(request_id).await
+    }
+
+    async fn delete_admin_sponsor_request(&self, request_id: &str) -> anyhow::Result<bool> {
+        self.ensure_connection_alive()?;
+        let changed = self
+            .client
+            .execute("DELETE FROM llm_sponsor_requests WHERE request_id = $1", &[&request_id])
+            .await
+            .context("delete postgres sponsor request")?;
+        Ok(changed > 0)
+    }
+}
+
+#[async_trait]
+impl PublicStatusStore for PostgresControlRepository {
+    async fn codex_rate_limit_status(&self) -> anyhow::Result<CodexRateLimitStatus> {
+        if let Some(snapshot) = self.load_codex_rate_limit_status_row().await? {
+            return Ok(snapshot);
+        }
+        let refresh_interval_seconds = self
+            .load_runtime_config_record()
+            .await?
+            .map(|record| record.codex_status_refresh_max_interval_seconds.max(0) as u64)
+            .unwrap_or(DEFAULT_CODEX_STATUS_REFRESH_SECONDS);
+        Ok(CodexRateLimitStatus::loading(refresh_interval_seconds))
+    }
+
+    async fn save_codex_rate_limit_status(
+        &self,
+        snapshot: CodexRateLimitStatus,
+    ) -> anyhow::Result<()> {
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "INSERT INTO llm_codex_status_cache (id, snapshot_json, updated_at_ms)
+                 VALUES ('default', $1::jsonb, $2)
+                 ON CONFLICT(id) DO UPDATE SET
+                    snapshot_json = EXCLUDED.snapshot_json,
+                    updated_at_ms = EXCLUDED.updated_at_ms",
+                &[
+                    &serde_json::to_string(&snapshot)
+                        .context("serialize postgres codex rate-limit snapshot")?,
+                    &now_ms(),
+                ],
+            )
+            .await
+            .context("upsert postgres codex rate-limit status snapshot")?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::OnceLock;
+
+    use anyhow::Context;
+    use llm_access_core::{
+        provider::{ProtocolFamily, ProviderType, RouteStrategy},
+        store::{
+            AdminConfigStore, AdminReviewQueueStore, ControlStore,
+            NewPublicAccountContributionRequest, PublicSubmissionStore, PublicUsageStore,
+        },
+    };
+    use sha2::{Digest, Sha256};
+
+    use super::SqlxClient;
+
+    static TEST_DB_LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+
+    async fn test_db_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        TEST_DB_LOCK
+            .get_or_init(|| tokio::sync::Mutex::new(()))
+            .lock()
+            .await
+    }
+
+    async fn reset_test_db(database_url: &str) -> anyhow::Result<()> {
+        crate::initialize_postgres_target(database_url)
+            .await
+            .context("initialize postgres test database")?;
+        let client = SqlxClient::connect(database_url)
+            .await
+            .context("connect postgres test database")?;
+        client
+            .batch_execute(
+                "TRUNCATE TABLE
+                    llm_account_import_job_items,
+                    llm_account_import_jobs,
+                    llm_codex_status_cache,
+                    llm_sponsor_requests,
+                    gpt2api_account_contribution_requests,
+                    llm_account_contribution_requests,
+                    llm_token_requests,
+                    llm_kiro_status_cache,
+                    llm_kiro_accounts,
+                    llm_codex_accounts,
+                    llm_proxy_bindings,
+                    llm_proxy_configs,
+                    llm_account_groups,
+                    llm_runtime_config,
+                    llm_key_usage_rollups,
+                    llm_key_route_config,
+                    llm_keys CASCADE",
+            )
+            .await
+            .context("truncate postgres test fixtures")?;
+        client.close().await;
+        Ok(())
+    }
+
+    async fn seed_test_key_bundle(database_url: &str) -> anyhow::Result<()> {
+        let client = SqlxClient::connect(database_url)
+            .await
+            .context("connect postgres test database")?;
+        let key_hash = format!("{:x}", Sha256::digest(b"secret"));
+        client
+            .execute(
+                "INSERT INTO llm_keys (
+                    key_id, name, secret, key_hash, status, provider_type, protocol_family,
+                    public_visible, quota_billable_limit, created_at_ms, updated_at_ms
+                 ) VALUES (
+                    'key-1', 'external', 'secret', $1, 'active', 'codex', 'openai',
+                    TRUE, 1000, 1700000000000, 1700000000000
+                 )",
+                &[&key_hash],
+            )
+            .await
+            .context("insert postgres test key row")?;
+        client
+            .batch_execute(
+                "INSERT INTO llm_key_route_config (
+                    key_id, route_strategy, fixed_account_name, auto_account_names_json,
+                    account_group_id, model_name_map_json, request_max_concurrency,
+                    request_min_start_interval_ms, kiro_request_validation_enabled,
+                    kiro_cache_estimation_enabled, kiro_zero_cache_debug_enabled,
+                    kiro_full_request_logging_enabled, kiro_cache_policy_override_json,
+                    kiro_billable_model_multipliers_override_json
+                 ) VALUES (
+                    'key-1', NULL, NULL, NULL, NULL, NULL, NULL, NULL,
+                    FALSE, FALSE, FALSE, FALSE, NULL, NULL
+                 );
+                 INSERT INTO llm_key_usage_rollups (
+                    key_id, input_uncached_tokens, input_cached_tokens, output_tokens,
+                    billable_tokens, credit_total, credit_missing_events, last_used_at_ms,
+                    updated_at_ms
+                 ) VALUES (
+                    'key-1', 0, 0, 0, 0, '0', 0, NULL, 1700000000000
+                 );",
+            )
+            .await
+            .context("insert postgres test key config rows")?;
+        client.close().await;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn postgres_repository_reads_runtime_config_and_authenticates_key() {
+        let Ok(database_url) = std::env::var("TEST_POSTGRES_URL") else {
+            eprintln!("skipping postgres integration test: TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let _guard = test_db_guard().await;
+        reset_test_db(&database_url)
+            .await
+            .expect("reset postgres test database");
+        seed_test_key_bundle(&database_url)
+            .await
+            .expect("seed postgres test key bundle");
+        let repo = super::PostgresControlRepository::connect(&database_url)
+            .await
+            .expect("connect postgres repository");
+
+        let config = repo
+            .get_admin_runtime_config()
+            .await
+            .expect("runtime config");
+        assert_eq!(config.codex_client_version.as_str(), "0.124.0");
+
+        let key = repo
+            .authenticate_bearer_secret("secret")
+            .await
+            .expect("lookup result")
+            .expect("key must exist");
+        assert_eq!(key.key_name, "external");
+    }
+
+    #[tokio::test]
+    async fn postgres_repository_updates_key_usage_rollups() {
+        let Ok(database_url) = std::env::var("TEST_POSTGRES_URL") else {
+            eprintln!("skipping postgres integration test: TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let _guard = test_db_guard().await;
+        reset_test_db(&database_url)
+            .await
+            .expect("reset postgres test database");
+        seed_test_key_bundle(&database_url)
+            .await
+            .expect("seed postgres test key bundle");
+        let repo = super::PostgresControlRepository::connect(&database_url)
+            .await
+            .expect("connect postgres repository");
+
+        let event = llm_access_core::usage::UsageEvent {
+            event_id: "evt-1".to_string(),
+            created_at_ms: 1_700_000_000_001,
+            provider_type: ProviderType::Codex,
+            protocol_family: ProtocolFamily::OpenAi,
+            key_id: "key-1".to_string(),
+            key_name: "external".to_string(),
+            account_name: Some("acct-1".to_string()),
+            account_group_id_at_event: None,
+            route_strategy_at_event: Some(RouteStrategy::Auto),
+            request_method: "POST".to_string(),
+            request_url: "https://ackingliu.top/v1/chat/completions".to_string(),
+            endpoint: "/v1/chat/completions".to_string(),
+            model: Some("gpt-4.1".to_string()),
+            mapped_model: Some("gpt-4.1".to_string()),
+            status_code: 200,
+            request_body_bytes: Some(256),
+            quota_failover_count: 0,
+            routing_diagnostics_json: None,
+            input_uncached_tokens: 10,
+            input_cached_tokens: 2,
+            output_tokens: 5,
+            billable_tokens: 15,
+            credit_usage: Some("1.25".to_string()),
+            usage_missing: false,
+            credit_usage_missing: false,
+            client_ip: "127.0.0.1".to_string(),
+            ip_region: "local".to_string(),
+            request_headers_json: "{}".to_string(),
+            last_message_content: None,
+            client_request_body_json: None,
+            upstream_request_body_json: None,
+            full_request_json: None,
+            timing: llm_access_core::usage::UsageTiming {
+                latency_ms: Some(120),
+                ..Default::default()
+            },
+            stream: llm_access_core::usage::UsageStreamDetails::default(),
+        };
+        repo.apply_usage_rollup(&event)
+            .await
+            .expect("apply usage rollup");
+
+        let key = repo
+            .get_public_usage_key_by_secret("secret")
+            .await
+            .expect("load usage lookup key")
+            .expect("public usage lookup row");
+        assert_eq!(key.usage_billable_tokens, 15);
+        assert_eq!(key.usage_credit_total, 1.25);
+        assert_eq!(key.usage_credit_missing_events, 0);
+        assert_eq!(key.last_used_at_ms, Some(1_700_000_000_001));
+    }
+
+    #[tokio::test]
+    async fn postgres_repository_creates_account_contribution_request() {
+        let Ok(database_url) = std::env::var("TEST_POSTGRES_URL") else {
+            eprintln!("skipping postgres integration test: TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let _guard = test_db_guard().await;
+        reset_test_db(&database_url)
+            .await
+            .expect("reset postgres test database");
+        let repo = super::PostgresControlRepository::connect(&database_url)
+            .await
+            .expect("connect postgres repository");
+
+        repo.create_public_account_contribution_request(NewPublicAccountContributionRequest {
+            request_id: "req-1".to_string(),
+            account_name: "acct-1".to_string(),
+            account_id: Some("acct-id-1".to_string()),
+            id_token: "id-token".to_string(),
+            access_token: "access-token".to_string(),
+            refresh_token: "refresh-token".to_string(),
+            requester_email: "user@example.com".to_string(),
+            contributor_message: "hello".to_string(),
+            github_id: None,
+            frontend_page_url: None,
+            show_on_public_wall: true,
+            fingerprint: "fp".to_string(),
+            client_ip: "127.0.0.1".to_string(),
+            ip_region: "local".to_string(),
+            created_at_ms: 1_700_000_000_100,
+        })
+        .await
+        .expect("create account contribution request");
+
+        let created = repo
+            .get_admin_account_contribution_request("req-1")
+            .await
+            .expect("load request")
+            .expect("request row");
+        assert_eq!(created.status, "pending");
+        assert_eq!(created.account_name, "acct-1");
+        assert_eq!(created.account_id.as_deref(), Some("acct-id-1"));
+    }
+}

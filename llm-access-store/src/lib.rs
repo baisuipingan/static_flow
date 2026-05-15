@@ -2,6 +2,8 @@
 
 /// DuckDB analytics writer helpers.
 pub mod duckdb;
+/// Postgres control-plane repository.
+pub mod postgres;
 /// Async repository adapters for runtime traits.
 pub mod repository;
 /// SQLite control-plane repository.
@@ -71,16 +73,14 @@ pub fn initialize_sqlite_target(conn: &rusqlite::Connection) -> anyhow::Result<(
 
 /// Initialize a Postgres control-plane database at `database_url`.
 pub async fn initialize_postgres_target(database_url: &str) -> anyhow::Result<()> {
-    let tls = postgres_native_tls::MakeTlsConnector::new(
-        native_tls::TlsConnector::new().context("build native tls connector")?,
-    );
-    let (client, connection) = tokio_postgres::connect(database_url, tls)
+    let pool = sqlx_postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(database_url)
         .await
         .context("connect postgres for initialization")?;
-    let _connection_task = tokio::spawn(async move {
-        let _ = connection.await;
-    });
-    llm_access_migrations::run_postgres_migrations(&client).await
+    llm_access_migrations::run_postgres_migrations(&pool).await?;
+    pool.close().await;
+    Ok(())
 }
 
 /// Return the DuckDB usage and audit schema SQL.

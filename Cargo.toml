@@ -52,9 +52,8 @@ chrono = { version = "0.4.42", features = ["serde"] }
 
 # HTTP 客户端
 reqwest = { version = "0.12", features = ["json", "socks"] }
-tokio-postgres = "0.7"
-native-tls = "0.2"
-postgres-native-tls = "0.5"
+sqlx-core = { version = "0.8.6", default-features = false, features = ["_rt-tokio", "_tls-native-tls", "chrono", "json"] }
+sqlx-postgres = { version = "0.8.6", default-features = false, features = ["chrono", "json"] }
 
 # Frontend 特定
 yew = { version = "0.21", features = ["csr"] }
@@ -76,7 +75,6 @@ lancedb = { path = "deps/lancedb/rust/lancedb" }
 arrow-array = "57.2"
 arrow-schema = "57.2"
 arrow = "57.2"
-# sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "chrono"] }
 # meilisearch-sdk = "0.25"
 
 # CLI 特定（暂时注释，Week 2 启用）

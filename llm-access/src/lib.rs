@@ -100,11 +100,21 @@ pub fn run_from_env() -> anyhow::Result<()> {
 /// Initialize llm-access storage paths.
 pub fn bootstrap_api_storage(config: &StorageConfig) -> anyhow::Result<()> {
     runtime::validate_state_root(config)?;
-    if let ControlStoreConfig::Sqlite {
-        path,
-    } = &config.control_store
-    {
-        llm_access_store::initialize_sqlite_target_path(path)?;
+    match &config.control_store {
+        ControlStoreConfig::Sqlite {
+            path,
+        } => llm_access_store::initialize_sqlite_target_path(path)?,
+        ControlStoreConfig::Postgres {
+            database_url_env,
+        } => {
+            let database_url = std::env::var(database_url_env)
+                .with_context(|| format!("missing control database env `{database_url_env}`"))?;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to create bootstrap runtime for postgres control")?
+                .block_on(llm_access_store::initialize_postgres_target(&database_url))?;
+        },
     }
     Ok(())
 }
@@ -112,11 +122,21 @@ pub fn bootstrap_api_storage(config: &StorageConfig) -> anyhow::Result<()> {
 /// Initialize only the storage paths required by the standalone usage worker.
 pub fn bootstrap_usage_worker_storage(config: &StorageConfig) -> anyhow::Result<()> {
     runtime::validate_usage_worker_state_root(config)?;
-    if let ControlStoreConfig::Sqlite {
-        path,
-    } = &config.control_store
-    {
-        llm_access_store::initialize_sqlite_target_path(path)?;
+    match &config.control_store {
+        ControlStoreConfig::Sqlite {
+            path,
+        } => llm_access_store::initialize_sqlite_target_path(path)?,
+        ControlStoreConfig::Postgres {
+            database_url_env,
+        } => {
+            let database_url = std::env::var(database_url_env)
+                .with_context(|| format!("missing control database env `{database_url_env}`"))?;
+            tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .context("failed to create bootstrap runtime for postgres control")?
+                .block_on(llm_access_store::initialize_postgres_target(&database_url))?;
+        },
     }
     Ok(())
 }

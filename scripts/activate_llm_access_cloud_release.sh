@@ -17,6 +17,7 @@ HEALTH_URL="${LLM_ACCESS_HEALTH_URL:-http://127.0.0.1:19080/healthz}"
 WORKER_HEALTH_URL="${LLM_ACCESS_USAGE_WORKER_HEALTH_URL:-http://127.0.0.1:19081/admin/llm-access/usage-worker/status}"
 VERSION_URL="${LLM_ACCESS_VERSION_URL:-http://127.0.0.1:19080/version}"
 JOURNAL_LINES="${JOURNAL_LINES:-80}"
+NEON_ENV_PATH="${LLM_ACCESS_CONTROL_DATABASE_URL_FILE:-/mnt/llm-access/config/neon.env}"
 STAGED_BIN="${1:-$RELEASE_DIR/llm-access.latest}"
 STAGED_WORKER_BIN="${2:-$RELEASE_DIR/llm-access-usage-worker.latest}"
 MANIFEST="${LLM_ACCESS_RELEASE_MANIFEST:-$RELEASE_DIR/release.latest.env}"
@@ -187,6 +188,9 @@ fi
 
 systemctl is-active juicefs-llm-access.service >/dev/null || fail "juicefs-llm-access.service is not active"
 findmnt -T /mnt/llm-access >/dev/null || fail "/mnt/llm-access is not mounted"
+sudo test -r "$NEON_ENV_PATH" || fail "missing shared Neon config: $NEON_ENV_PATH"
+sudo grep -q '^LLM_ACCESS_CONTROL_DATABASE_URL=' "$NEON_ENV_PATH" \
+  || fail "shared Neon config does not define LLM_ACCESS_CONTROL_DATABASE_URL: $NEON_ENV_PATH"
 if [[ "$ACTIVATE_TARGET" == "worker" || "$ACTIVATE_TARGET" == "both" ]]; then
   if findmnt -T /mnt/llm-access-usage >/dev/null; then
     log "/mnt/llm-access-usage is mounted before activation"
@@ -330,6 +334,7 @@ Installed llm-access release:
   api_backup: ${installed_sha:+$backup_path}
   usage_worker_sha256: ${installed_worker_sha:-skipped}
   usage_worker_backup: ${installed_worker_sha:+$worker_backup_path}
+  neon_env: $NEON_ENV_PATH
 
 Rollback command if needed:
   $rollback_cmd

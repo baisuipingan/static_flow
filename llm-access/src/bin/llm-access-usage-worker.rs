@@ -25,6 +25,7 @@ fn run() -> anyhow::Result<()> {
         sync::{Arc, RwLock},
     };
 
+    use anyhow::Context;
     use llm_access::{
         config::{CliCommand, ControlStoreConfig},
         usage_worker::{router, UsageWorker},
@@ -32,6 +33,7 @@ fn run() -> anyhow::Result<()> {
     use llm_access_core::store::AdminConfigStore;
     use llm_access_store::{
         duckdb::{DuckDbUsageConnectionConfig, DuckDbUsageRepository, TieredDuckDbUsageConfig},
+        postgres::PostgresControlRepository,
         repository::SqliteControlRepository,
     };
 
@@ -46,20 +48,29 @@ fn run() -> anyhow::Result<()> {
         CliCommand::Serve(config) => (config.bind_addr, config.storage),
     };
     llm_access::bootstrap_usage_worker_storage(&storage)?;
-    let control_path = match &storage.control_store {
-        ControlStoreConfig::Sqlite {
-            path,
-        } => path.clone(),
-        ControlStoreConfig::Postgres {
-            ..
-        } => {
-            anyhow::bail!("postgres control backend is not wired for usage worker yet");
-        },
-    };
-    let control = SqliteControlRepository::open_path(&control_path)?;
-    let runtime = tokio::runtime::Runtime::new()?;
+    let runtime = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    let control: Arc<dyn AdminConfigStore> = runtime.block_on(async {
+        match &storage.control_store {
+            ControlStoreConfig::Sqlite {
+                path,
+            } => Ok::<Arc<dyn AdminConfigStore>, anyhow::Error>(Arc::new(
+                SqliteControlRepository::open_path(path)?,
+            )
+                as Arc<dyn AdminConfigStore>),
+            ControlStoreConfig::Postgres {
+                database_url_env,
+            } => {
+                let database_url = std::env::var(database_url_env).with_context(|| {
+                    format!("missing control database env `{database_url_env}`")
+                })?;
+                Ok::<Arc<dyn AdminConfigStore>, anyhow::Error>(Arc::new(
+                    PostgresControlRepository::connect(&database_url).await?,
+                )
+                    as Arc<dyn AdminConfigStore>)
+            },
+        }
+    })?;
     let runtime_config = runtime.block_on(control.get_admin_runtime_config())?;
-    let sqlite_control_path = control_path;
     let bind_addr = if explicit_bind {
         bind_addr
     } else {
@@ -107,11 +118,9 @@ fn run() -> anyhow::Result<()> {
                 return;
             },
         };
-        if let Err(err) = runtime.block_on(run_forever_with_runtime_config(
-            worker,
-            sqlite_control_path,
-            connection_config,
-        )) {
+        if let Err(err) =
+            runtime.block_on(run_forever_with_runtime_config(worker, control, connection_config))
+        {
             tracing::error!("llm access usage worker import loop stopped: {err:#}");
         }
     });
@@ -125,22 +134,18 @@ fn run() -> anyhow::Result<()> {
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 async fn run_forever_with_runtime_config(
     worker: llm_access::usage_worker::UsageWorker,
-    sqlite_control_path: std::path::PathBuf,
+    control: std::sync::Arc<dyn llm_access_core::store::AdminConfigStore>,
     connection_config: std::sync::Arc<
         std::sync::RwLock<llm_access_store::duckdb::DuckDbUsageConnectionConfig>,
     >,
 ) -> anyhow::Result<()> {
     use std::time::{Duration, Instant};
 
-    use llm_access_core::store::AdminConfigStore;
-    use llm_access_store::{
-        duckdb::DuckDbUsageConnectionConfig, repository::SqliteControlRepository,
-    };
+    use llm_access_store::duckdb::DuckDbUsageConnectionConfig;
 
     const RUNTIME_CONFIG_REFRESH_INTERVAL: Duration = Duration::from_secs(60);
     const USAGE_ANALYTICS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(5 * 60);
 
-    let control = SqliteControlRepository::open_path(sqlite_control_path)?;
     let mut last_config_refresh = None::<Instant>;
     let mut last_maintenance = None::<Instant>;
     loop {
