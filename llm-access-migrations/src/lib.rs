@@ -81,6 +81,19 @@ const DUCKDB_MIGRATIONS: &[SqlMigration] = &[
     },
 ];
 
+const POSTGRES_MIGRATIONS: &[SqlMigration] = &[
+    SqlMigration {
+        version: 1,
+        name: "init",
+        sql: include_str!("../migrations/postgres/0001_init.sql"),
+    },
+    SqlMigration {
+        version: 2,
+        name: "followups",
+        sql: include_str!("../migrations/postgres/0002_followups.sql"),
+    },
+];
+
 /// Return target SQLite migrations in execution order.
 pub fn sqlite_migrations() -> &'static [SqlMigration] {
     SQLITE_MIGRATIONS
@@ -89,6 +102,11 @@ pub fn sqlite_migrations() -> &'static [SqlMigration] {
 /// Return target DuckDB migrations in execution order.
 pub fn duckdb_migrations() -> &'static [SqlMigration] {
     DUCKDB_MIGRATIONS
+}
+
+/// Return target Postgres migrations in execution order.
+pub fn postgres_migrations() -> &'static [SqlMigration] {
+    POSTGRES_MIGRATIONS
 }
 
 /// Return all DuckDB target schema SQL as one executable script.
@@ -147,6 +165,67 @@ pub fn run_sqlite_migrations(conn: &rusqlite::Connection) -> Result<()> {
         tx.commit()
             .with_context(|| format!("failed to commit migration {}", migration.version))?;
     }
+    Ok(())
+}
+
+/// Run pending target Postgres migrations and record applied versions.
+pub async fn run_postgres_migrations(client: &tokio_postgres::Client) -> Result<()> {
+    client
+        .batch_execute(
+            "CREATE TABLE IF NOT EXISTS llm_access_schema_migrations (
+                version BIGINT PRIMARY KEY,
+                name TEXT NOT NULL,
+                applied_at_ms BIGINT NOT NULL CHECK (applied_at_ms >= 0)
+            );",
+        )
+        .await
+        .context("failed to initialize postgres migration metadata")?;
+
+    for migration in POSTGRES_MIGRATIONS {
+        let row = client
+            .query_one(
+                "SELECT EXISTS(
+                    SELECT 1 FROM llm_access_schema_migrations WHERE version = $1
+                )",
+                &[&migration.version],
+            )
+            .await
+            .with_context(|| format!("failed to inspect migration {}", migration.version))?;
+        let already_applied: bool = row.get(0);
+        if already_applied {
+            continue;
+        }
+
+        client
+            .batch_execute("BEGIN")
+            .await
+            .with_context(|| format!("failed to begin migration {}", migration.version))?;
+        let result: Result<()> = async {
+            client
+                .batch_execute(migration.sql)
+                .await
+                .with_context(|| format!("failed to run migration {}", migration.version))?;
+            client
+                .execute(
+                    "INSERT INTO llm_access_schema_migrations (version, name, applied_at_ms)
+                     VALUES ($1, $2, (EXTRACT(EPOCH FROM clock_timestamp()) * 1000)::bigint)",
+                    &[&migration.version, &migration.name],
+                )
+                .await
+                .with_context(|| format!("failed to record migration {}", migration.version))?;
+            client
+                .batch_execute("COMMIT")
+                .await
+                .with_context(|| format!("failed to commit migration {}", migration.version))?;
+            Ok(())
+        }
+        .await;
+        if let Err(err) = result {
+            let _ = client.batch_execute("ROLLBACK").await;
+            return Err(err);
+        }
+    }
+
     Ok(())
 }
 
@@ -220,6 +299,20 @@ mod tests {
             .sql
             .contains("DROP INDEX IF EXISTS idx_usage_events_source_event_id"));
         assert!(!super::duckdb_schema_sql().contains("cdc_"));
+    }
+
+    #[test]
+    fn postgres_migrations_are_file_backed_and_versioned() {
+        let migrations = super::postgres_migrations();
+
+        assert_eq!(migrations[0].version, 1);
+        assert_eq!(migrations[0].name, "init");
+        assert!(migrations[0]
+            .sql
+            .contains("CREATE TABLE IF NOT EXISTS llm_keys"));
+        assert!(migrations
+            .iter()
+            .any(|migration| migration.sql.contains("llm_runtime_config")));
     }
 
     #[test]

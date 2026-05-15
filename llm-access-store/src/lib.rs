@@ -69,6 +69,20 @@ pub fn initialize_sqlite_target(conn: &rusqlite::Connection) -> anyhow::Result<(
     llm_access_migrations::run_sqlite_migrations(conn)
 }
 
+/// Initialize a Postgres control-plane database at `database_url`.
+pub async fn initialize_postgres_target(database_url: &str) -> anyhow::Result<()> {
+    let tls = postgres_native_tls::MakeTlsConnector::new(
+        native_tls::TlsConnector::new().context("build native tls connector")?,
+    );
+    let (client, connection) = tokio_postgres::connect(database_url, tls)
+        .await
+        .context("connect postgres for initialization")?;
+    let _connection_task = tokio::spawn(async move {
+        let _ = connection.await;
+    });
+    llm_access_migrations::run_postgres_migrations(&client).await
+}
+
 /// Return the DuckDB usage and audit schema SQL.
 pub fn duckdb_schema_sql() -> String {
     llm_access_migrations::duckdb_schema_sql()

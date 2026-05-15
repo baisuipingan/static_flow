@@ -10,3 +10,4 @@ workspace = true
 [dependencies]
 anyhow = { workspace = true }
 rusqlite = { version = "0.37", features = ["bundled"] }
+tokio-postgres = { workspace = true }
