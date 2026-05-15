@@ -1122,7 +1122,7 @@ async fn dispatch_codex_proxy(
                         is_fedramp_account: ctx.is_fedramp_account,
                     };
                     let retry = add_codex_upstream_headers(
-                        client.request(method.clone(), upstream_url),
+                        client.request(method.clone(), upstream_url.clone()),
                         &request_headers,
                         &prepared,
                         &auth,
@@ -1234,24 +1234,87 @@ async fn dispatch_codex_proxy(
             })
             .await;
         }
-        let status = response.status();
-        let upstream_headers = response.headers().clone();
-        let content_type = upstream_headers
+        let mut response_prepared = prepared.clone();
+        let mut status = response.status();
+        let mut upstream_headers = response.headers().clone();
+        let mut content_type = upstream_headers
             .get(reqwest::header::CONTENT_TYPE)
             .and_then(|value| value.to_str().ok())
             .unwrap_or("application/json")
             .to_string();
-        let bytes = match response.bytes().await {
+        let mut bytes = match response.bytes().await {
             Ok(bytes) => bytes,
             Err(_) => {
                 return (StatusCode::BAD_GATEWAY, "codex upstream response read failed")
                     .into_response()
             },
         };
+        if is_codex_invalid_encrypted_content_response(status, &bytes) {
+            if let Some(retry_prepared) = retry_codex_without_encrypted_reasoning(&prepared) {
+                let retry = add_codex_upstream_headers(
+                    client.request(method.clone(), upstream_url.clone()),
+                    &request_headers,
+                    &retry_prepared,
+                    &auth,
+                    &runtime_config.client_version,
+                );
+                response = match retry.send().await {
+                    Ok(response) => {
+                        usage_meta.mark_upstream_headers();
+                        response
+                    },
+                    Err(_) => {
+                        usage_meta.mark_failover();
+                        failed_accounts.insert(route.account_name.clone());
+                        if attempt_count >= account_attempt_limit {
+                            return (
+                                StatusCode::BAD_GATEWAY,
+                                "all eligible codex accounts failed for this request",
+                            )
+                                .into_response();
+                        }
+                        continue;
+                    },
+                };
+                if response.status().is_success() {
+                    let permits = vec![
+                        key_permit
+                            .take()
+                            .expect("codex key permit should be held until response is returned"),
+                        account_permit,
+                    ];
+                    return adapt_codex_upstream_response(response, CodexUpstreamResponseContext {
+                        prepared: retry_prepared,
+                        key,
+                        route,
+                        control_store,
+                        permits,
+                        usage_meta,
+                    })
+                    .await;
+                }
+                response_prepared = retry_prepared;
+                status = response.status();
+                upstream_headers = response.headers().clone();
+                content_type = upstream_headers
+                    .get(reqwest::header::CONTENT_TYPE)
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("application/json")
+                    .to_string();
+                bytes = match response.bytes().await {
+                    Ok(bytes) => bytes,
+                    Err(_) => {
+                        return (StatusCode::BAD_GATEWAY, "codex upstream response read failed")
+                            .into_response()
+                    },
+                };
+            }
+        }
         if let Some(cooldown) = codex_quota_exhaustion_cooldown(status, &bytes) {
             codex_account_cooldowns.mark_account_cooldown(&route.account_name, cooldown);
         }
-        if attempt_count < account_attempt_limit
+        if !is_codex_invalid_encrypted_content_response(status, &bytes)
+            && attempt_count < account_attempt_limit
             && routes.iter().any(|candidate| {
                 !failed_accounts.contains(&candidate.account_name)
                     && candidate.account_name != route.account_name
@@ -1275,7 +1338,7 @@ async fn dispatch_codex_proxy(
                 bytes,
             },
             CodexCompletedResponseContext {
-                prepared,
+                prepared: response_prepared,
                 key,
                 route,
                 control_store,
@@ -5314,6 +5377,212 @@ fn header_value(headers: &HeaderMap, name: &str) -> Option<String> {
         .map(ToString::to_string)
 }
 
+fn first_header_value(headers: &HeaderMap, names: &[&str]) -> Option<String> {
+    names.iter().find_map(|name| header_value(headers, name))
+}
+
+#[derive(Debug, Default)]
+struct CodexTurnMetadataHeader {
+    session_id: Option<String>,
+    thread_id: Option<String>,
+}
+
+fn parse_codex_turn_metadata_header(headers: &HeaderMap) -> CodexTurnMetadataHeader {
+    let Some(raw) = header_value(headers, "x-codex-turn-metadata") else {
+        return CodexTurnMetadataHeader::default();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return CodexTurnMetadataHeader::default();
+    };
+    CodexTurnMetadataHeader {
+        session_id: json_string_field(&value, "session_id"),
+        thread_id: json_string_field(&value, "thread_id"),
+    }
+}
+
+fn json_string_field(value: &Value, name: &str) -> Option<String> {
+    value
+        .get(name)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToString::to_string)
+}
+
+fn is_standard_codex_responses_path(prepared: &PreparedGatewayRequest) -> bool {
+    prepared
+        .upstream_path
+        .split('?')
+        .next()
+        .is_some_and(|path| path == "/v1/responses")
+}
+
+#[derive(Debug, Default)]
+struct CodexUpstreamSessionHeaders {
+    conversation_id: Option<String>,
+    session_id: Option<String>,
+    thread_id: Option<String>,
+    client_request_id: Option<String>,
+}
+
+fn resolve_codex_upstream_session_headers(
+    request_headers: &HeaderMap,
+    prepared: &PreparedGatewayRequest,
+) -> CodexUpstreamSessionHeaders {
+    let metadata = parse_codex_turn_metadata_header(request_headers);
+    let thread_anchor = prepared
+        .thread_anchor
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty());
+    let should_reconstruct = is_standard_codex_responses_path(prepared);
+    let session_id =
+        first_header_value(request_headers, &["session_id", "session-id"]).or_else(|| {
+            if should_reconstruct {
+                metadata
+                    .session_id
+                    .clone()
+                    .or_else(|| thread_anchor.map(ToString::to_string))
+            } else {
+                None
+            }
+        });
+    let thread_id =
+        first_header_value(request_headers, &["thread_id", "thread-id"]).or_else(|| {
+            if should_reconstruct {
+                metadata
+                    .thread_id
+                    .clone()
+                    .or_else(|| thread_anchor.map(ToString::to_string))
+                    .or_else(|| session_id.clone())
+            } else {
+                None
+            }
+        });
+    let conversation_id = header_value(request_headers, "conversation_id").or_else(|| {
+        if should_reconstruct {
+            thread_anchor
+                .map(ToString::to_string)
+                .or_else(|| metadata.thread_id.clone())
+        } else {
+            None
+        }
+    });
+    let client_request_id = header_value(request_headers, "x-client-request-id").or_else(|| {
+        if should_reconstruct {
+            thread_id
+                .clone()
+                .or_else(|| thread_anchor.map(ToString::to_string))
+        } else {
+            None
+        }
+    });
+
+    CodexUpstreamSessionHeaders {
+        conversation_id,
+        session_id,
+        thread_id,
+        client_request_id,
+    }
+}
+
+fn is_codex_invalid_encrypted_content_response(status: StatusCode, bytes: &Bytes) -> bool {
+    if status != StatusCode::BAD_REQUEST {
+        return false;
+    }
+    if codex_error_code_from_bytes(bytes).as_deref() == Some("invalid_encrypted_content") {
+        return true;
+    }
+    std::str::from_utf8(bytes.as_ref())
+        .map(|body| body.contains("invalid_encrypted_content"))
+        .unwrap_or(false)
+}
+
+fn codex_error_code_from_bytes(bytes: &Bytes) -> Option<String> {
+    serde_json::from_slice::<Value>(bytes)
+        .ok()
+        .and_then(|value| codex_error_code_from_value(&value))
+}
+
+fn codex_error_code_from_value(value: &Value) -> Option<String> {
+    let error = value.get("error").unwrap_or(value);
+    if let Some(code) = json_string_field(error, "code") {
+        return Some(code);
+    }
+    let message = json_string_field(error, "message")?;
+    serde_json::from_str::<Value>(&message)
+        .ok()
+        .and_then(|nested| codex_error_code_from_value(&nested))
+}
+
+fn retry_codex_without_encrypted_reasoning(
+    prepared: &PreparedGatewayRequest,
+) -> Option<PreparedGatewayRequest> {
+    let mut value = serde_json::from_slice::<Value>(&prepared.request_body).ok()?;
+    let root = value.as_object_mut()?;
+    if !strip_codex_encrypted_reasoning_items(root) {
+        return None;
+    }
+    let request_body = Bytes::from(serde_json::to_vec(&value).ok()?);
+    let mut retry = prepared.clone();
+    retry.request_body = request_body;
+    Some(retry)
+}
+
+fn strip_codex_encrypted_reasoning_items(root: &mut serde_json::Map<String, Value>) -> bool {
+    let Some(input) = root.get_mut("input") else {
+        return false;
+    };
+    let mut remove_input = false;
+    let changed = match input {
+        Value::Array(items) => {
+            let mut changed = false;
+            let mut filtered = Vec::with_capacity(items.len());
+            for mut item in std::mem::take(items) {
+                let keep = sanitize_codex_encrypted_reasoning_item(&mut item, &mut changed);
+                if keep {
+                    filtered.push(item);
+                }
+            }
+            if changed {
+                if filtered.is_empty() {
+                    remove_input = true;
+                } else {
+                    *items = filtered;
+                }
+            }
+            changed
+        },
+        Value::Object(_) => {
+            let mut changed = false;
+            let keep = sanitize_codex_encrypted_reasoning_item(input, &mut changed);
+            if changed && !keep {
+                remove_input = true;
+            }
+            changed
+        },
+        _ => false,
+    };
+    if remove_input {
+        root.remove("input");
+    }
+    changed
+}
+
+fn sanitize_codex_encrypted_reasoning_item(item: &mut Value, changed: &mut bool) -> bool {
+    let Some(obj) = item.as_object_mut() else {
+        return true;
+    };
+    if obj.get("type").and_then(Value::as_str) != Some("reasoning") {
+        return true;
+    }
+    if obj.remove("encrypted_content").is_none() {
+        return true;
+    }
+    *changed = true;
+    obj.len() > 1
+}
+
 fn add_codex_upstream_headers(
     mut upstream: reqwest::RequestBuilder,
     request_headers: &HeaderMap,
@@ -5321,9 +5590,7 @@ fn add_codex_upstream_headers(
     auth: &CodexAuthSnapshot,
     codex_client_version: &str,
 ) -> reqwest::RequestBuilder {
-    let incoming_conversation_id = header_value(request_headers, "conversation_id");
-    let incoming_session_id = header_value(request_headers, "session_id");
-    let incoming_client_request_id = header_value(request_headers, "x-client-request-id");
+    let session_headers = resolve_codex_upstream_session_headers(request_headers, prepared);
     let incoming_turn_state = header_value(request_headers, "x-codex-turn-state");
 
     upstream = upstream
@@ -5351,10 +5618,10 @@ fn add_codex_upstream_headers(
             .header(reqwest::header::CONTENT_TYPE, prepared.content_type.as_str())
             .body(prepared.request_body.clone());
     }
-    if let Some(conversation_id) = incoming_conversation_id.as_deref() {
+    if let Some(conversation_id) = session_headers.conversation_id.as_deref() {
         upstream = upstream.header("conversation_id", conversation_id);
     }
-    if let Some(client_request_id) = incoming_client_request_id.as_deref() {
+    if let Some(client_request_id) = session_headers.client_request_id.as_deref() {
         upstream = upstream.header("x-client-request-id", client_request_id);
     }
     if let Some(turn_state) = incoming_turn_state.as_deref() {
@@ -5378,8 +5645,15 @@ fn add_codex_upstream_headers(
             upstream = upstream.header(header_name, value);
         }
     }
-    if let Some(session_id) = incoming_session_id.as_deref() {
-        upstream = upstream.header("session_id", session_id);
+    if let Some(session_id) = session_headers.session_id.as_deref() {
+        upstream = upstream
+            .header("session_id", session_id)
+            .header("session-id", session_id);
+    }
+    if let Some(thread_id) = session_headers.thread_id.as_deref() {
+        upstream = upstream
+            .header("thread_id", thread_id)
+            .header("thread-id", thread_id);
     }
     if let Some(account_id) = auth.account_id.as_deref() {
         upstream = upstream.header("chatgpt-account-id", account_id);
@@ -7942,6 +8216,153 @@ mod tests {
         }
     }
 
+    fn codex_request_has_encrypted_reasoning_input(body: &serde_json::Value) -> bool {
+        fn item_has_encrypted_reasoning(item: &serde_json::Value) -> bool {
+            item.get("type").and_then(serde_json::Value::as_str) == Some("reasoning")
+                && item.get("encrypted_content").is_some()
+        }
+
+        match body.get("input") {
+            Some(serde_json::Value::Array(items)) => items.iter().any(item_has_encrypted_reasoning),
+            Some(item) => item_has_encrypted_reasoning(item),
+            None => false,
+        }
+    }
+
+    fn captured_codex_request(
+        headers: &HeaderMap,
+        path: String,
+        query: Option<String>,
+        body: serde_json::Value,
+    ) -> CapturedCodexRequest {
+        CapturedCodexRequest {
+            path,
+            query,
+            authorization: headers
+                .get(header::AUTHORIZATION)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            accept: headers
+                .get(header::ACCEPT)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            user_agent: headers
+                .get(header::USER_AGENT)
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            conversation_id: headers
+                .get("conversation_id")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            x_client_request_id: headers
+                .get("x-client-request-id")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            session_id: headers
+                .get("session_id")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            x_codex_turn_state: headers
+                .get("x-codex-turn-state")
+                .and_then(|value| value.to_str().ok())
+                .map(ToString::to_string),
+            body,
+        }
+    }
+
+    async fn fake_codex_responses_invalid_encrypted_until_trimmed(
+        State(captured): State<Arc<CapturedCodexUpstream>>,
+        headers: HeaderMap,
+        request: Request<Body>,
+    ) -> Response {
+        let path = request.uri().path().to_string();
+        let query = request.uri().query().map(ToString::to_string);
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("upstream request body");
+        let body = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice::<serde_json::Value>(&body).expect("upstream json")
+        };
+        captured
+            .requests
+            .lock()
+            .expect("captured requests")
+            .push(captured_codex_request(&headers, path, query, body.clone()));
+
+        if codex_request_has_encrypted_reasoning_input(&body) {
+            return Response::builder()
+                .status(StatusCode::BAD_REQUEST)
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{"error":{"code":"invalid_encrypted_content","type":"invalid_request_error","message":"The encrypted content could not be verified."}}"#,
+                ))
+                .expect("invalid encrypted content response");
+        }
+
+        Response::builder()
+            .status(StatusCode::OK)
+            .header(header::CONTENT_TYPE, "text/event-stream")
+            .body(Body::from(format!(
+                "event: response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: \
+                 {}\n\n",
+                json!({"delta":"recovered"}),
+                json!({
+                    "response": {
+                        "id": "rs_recovered",
+                        "created_at": 123,
+                        "model": "gpt-5.3-codex",
+                        "output": [{
+                            "type": "message",
+                            "content": [{
+                                "type": "output_text",
+                                "text": "recovered"
+                            }]
+                        }],
+                        "usage": {
+                            "input_tokens": 12,
+                            "input_tokens_details": {
+                                "cached_tokens": 2
+                            },
+                            "output_tokens": 3
+                        }
+                    }
+                })
+            )))
+            .expect("recovered upstream response")
+    }
+
+    async fn fake_codex_responses_always_invalid_encrypted_content(
+        State(captured): State<Arc<CapturedCodexUpstream>>,
+        headers: HeaderMap,
+        request: Request<Body>,
+    ) -> Response {
+        let path = request.uri().path().to_string();
+        let query = request.uri().query().map(ToString::to_string);
+        let body = to_bytes(request.into_body(), usize::MAX)
+            .await
+            .expect("upstream request body");
+        let body = if body.is_empty() {
+            serde_json::Value::Null
+        } else {
+            serde_json::from_slice::<serde_json::Value>(&body).expect("upstream json")
+        };
+        captured
+            .requests
+            .lock()
+            .expect("captured requests")
+            .push(captured_codex_request(&headers, path, query, body));
+
+        Response::builder()
+            .status(StatusCode::BAD_REQUEST)
+            .header(header::CONTENT_TYPE, "application/json")
+            .body(Body::from(
+                r#"{"error":{"code":"invalid_encrypted_content","type":"invalid_request_error","message":"The encrypted content could not be verified."}}"#,
+            ))
+            .expect("invalid encrypted content response")
+    }
+
     async fn fake_codex_responses_always_unauthorized(
         State(captured): State<Arc<CapturedCodexUpstream>>,
         headers: HeaderMap,
@@ -8810,6 +9231,188 @@ mod tests {
         assert_eq!(requests[0].x_client_request_id.as_deref(), Some("client-request"));
         assert_eq!(requests[0].x_codex_turn_state.as_deref(), Some("stale-turn-state"));
         assert_eq!(requests[0].body["prompt_cache_key"].as_str(), Some("thread-anchor"));
+    }
+
+    #[tokio::test]
+    async fn codex_dispatch_reconstructs_thread_headers_from_metadata_and_prompt_cache_key() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("codex upstream env lock");
+        let captured = Arc::new(CapturedCodexUpstream::default());
+        let app = Router::new()
+            .route("/v1/responses", post(fake_codex_responses))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake upstream");
+        });
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+
+        let state = super::ProviderState::new(Arc::new(TestStore), static_codex_route_store());
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(header::AUTHORIZATION, "Bearer codex-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .header(
+                    "x-codex-turn-metadata",
+                    r#"{"session_id":"session-from-metadata","thread_id":"thread-anchor","turn_id":"turn-1"}"#,
+                )
+                .body(Body::from(
+                    r#"{
+                        "model": "gpt-5.3-codex",
+                        "prompt_cache_key": "thread-anchor",
+                        "input": "hello",
+                        "stream": false
+                    }"#,
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = captured.requests.lock().expect("captured requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].session_id.as_deref(), Some("session-from-metadata"));
+        assert_eq!(requests[0].x_client_request_id.as_deref(), Some("thread-anchor"));
+        assert_eq!(requests[0].conversation_id.as_deref(), Some("thread-anchor"));
+    }
+
+    #[tokio::test]
+    async fn codex_dispatch_retries_invalid_encrypted_content_without_cross_account_failover() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("codex upstream env lock");
+        let captured = Arc::new(CapturedCodexUpstream::default());
+        let app = Router::new()
+            .route("/v1/responses", post(fake_codex_responses_invalid_encrypted_until_trimmed))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake upstream");
+        });
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+
+        let route_store = Arc::new(StaticMultiCodexRouteStore {
+            codex_routes: vec![
+                codex_route_for_account("codex-a", "upstream-token-a"),
+                codex_route_for_account("codex-b", "upstream-token-b"),
+            ],
+            kiro_route: static_kiro_route(),
+        });
+        let state = super::ProviderState::new(Arc::new(TestStore), route_store);
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(header::AUTHORIZATION, "Bearer codex-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model": "gpt-5.3-codex",
+                        "prompt_cache_key": "thread-anchor",
+                        "input": [
+                            {
+                                "type": "reasoning",
+                                "encrypted_content": "sealed"
+                            },
+                            {
+                                "type": "message",
+                                "role": "user",
+                                "content": [{"type": "input_text", "text": "hello"}]
+                            }
+                        ],
+                        "stream": false
+                    }"#,
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = captured.requests.lock().expect("captured requests");
+        assert_eq!(requests.len(), 2);
+        assert_eq!(
+            requests
+                .iter()
+                .map(|request| request.authorization.as_deref())
+                .collect::<Vec<_>>(),
+            vec![Some("Bearer upstream-token-a"), Some("Bearer upstream-token-a")]
+        );
+        assert!(codex_request_has_encrypted_reasoning_input(&requests[0].body));
+        assert!(!codex_request_has_encrypted_reasoning_input(&requests[1].body));
+    }
+
+    #[tokio::test]
+    async fn codex_dispatch_does_not_failover_unrecoverable_invalid_encrypted_content() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("codex upstream env lock");
+        let captured = Arc::new(CapturedCodexUpstream::default());
+        let app = Router::new()
+            .route("/v1/responses", post(fake_codex_responses_always_invalid_encrypted_content))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake upstream");
+        });
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+
+        let route_store = Arc::new(StaticMultiCodexRouteStore {
+            codex_routes: vec![
+                codex_route_for_account("codex-a", "upstream-token-a"),
+                codex_route_for_account("codex-b", "upstream-token-b"),
+            ],
+            kiro_route: static_kiro_route(),
+        });
+        let state = super::ProviderState::new(Arc::new(TestStore), route_store);
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(header::AUTHORIZATION, "Bearer codex-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model": "gpt-5.3-codex",
+                        "prompt_cache_key": "thread-anchor",
+                        "input": "hello",
+                        "stream": false
+                    }"#,
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        let requests = captured.requests.lock().expect("captured requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].authorization.as_deref(), Some("Bearer upstream-token-a"));
     }
 
     #[tokio::test]
