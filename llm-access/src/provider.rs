@@ -802,6 +802,77 @@ async fn select_kiro_route_with_account_permit(
     }
 }
 
+async fn hydrate_codex_route_for_dispatch(
+    route: ProviderCodexRoute,
+    route_store: &dyn ProviderRouteStore,
+) -> Result<ProviderCodexRoute, Response> {
+    if !route.auth_json.is_empty() {
+        return Ok(route);
+    }
+    let account_name = route.account_name.clone();
+    let loaded = route_store
+        .resolve_codex_account_route(&account_name)
+        .await
+        .map_err(|_| {
+            (StatusCode::INTERNAL_SERVER_ERROR, "codex route resolution failed").into_response()
+        })?;
+    let Some(loaded) = loaded else {
+        return Err((
+            StatusCode::BAD_GATEWAY,
+            "all eligible codex accounts failed for this request",
+        )
+            .into_response());
+    };
+    let mut route = route;
+    route.auth_json = loaded.auth_json;
+    route.map_gpt53_codex_to_spark = loaded.map_gpt53_codex_to_spark;
+    route.auth_refresh_enabled = loaded.auth_refresh_enabled;
+    route.account_request_max_concurrency = loaded.account_request_max_concurrency;
+    route.account_request_min_start_interval_ms = loaded.account_request_min_start_interval_ms;
+    route.cached_error_message = loaded.cached_error_message;
+    route.proxy = loaded.proxy;
+    Ok(route)
+}
+
+async fn hydrate_kiro_route_for_dispatch(
+    route: ProviderKiroRoute,
+    route_store: &dyn ProviderRouteStore,
+) -> Result<ProviderKiroRoute, Response> {
+    if !route.auth_json.is_empty() {
+        return Ok(route);
+    }
+    let account_name = route.account_name.clone();
+    let loaded = route_store
+        .resolve_kiro_account_route(&account_name)
+        .await
+        .map_err(|_| {
+            kiro_json_error(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "api_error",
+                "kiro route resolution failed",
+            )
+        })?;
+    let Some(loaded) = loaded else {
+        return Err(kiro_json_error(
+            StatusCode::BAD_GATEWAY,
+            "api_error",
+            "all eligible kiro accounts failed for this request",
+        ));
+    };
+    let mut route = route;
+    route.auth_json = loaded.auth_json;
+    if route.profile_arn.is_none() {
+        route.profile_arn = loaded.profile_arn;
+    }
+    if route.api_region.trim().is_empty() {
+        route.api_region = loaded.api_region;
+    }
+    route.account_request_max_concurrency = loaded.account_request_max_concurrency;
+    route.account_request_min_start_interval_ms = loaded.account_request_min_start_interval_ms;
+    route.proxy = loaded.proxy;
+    Ok(route)
+}
+
 fn selection_ordered_kiro_routes<'a>(
     routes: &'a [ProviderKiroRoute],
     scheduler: &KiroRequestScheduler,
@@ -946,6 +1017,10 @@ async fn dispatch_codex_proxy(
             return (StatusCode::SERVICE_UNAVAILABLE, "codex route is not configured")
                 .into_response();
         };
+        let route = match hydrate_codex_route_for_dispatch(route, route_store.as_ref()).await {
+            Ok(route) => route,
+            Err(response) => return response,
+        };
         return codex_openai_models_response(
             route,
             route_store,
@@ -1048,6 +1123,22 @@ async fn dispatch_codex_proxy(
         };
         usage_meta.add_routing_wait(clamp_duration_ms(route_started.elapsed()));
         attempt_count = attempt_count.saturating_add(1);
+        let selected_account_name = route.account_name.clone();
+        let route = match hydrate_codex_route_for_dispatch(route, route_store.as_ref()).await {
+            Ok(route) => route,
+            Err(_) => {
+                usage_meta.mark_failover();
+                failed_accounts.insert(selected_account_name);
+                if attempt_count >= account_attempt_limit {
+                    return (
+                        StatusCode::BAD_GATEWAY,
+                        "all eligible codex accounts failed for this request",
+                    )
+                        .into_response();
+                }
+                continue;
+            },
+        };
         let mut auth = match codex_refresh::ensure_context_for_route(
             &route,
             route_store.as_ref(),
@@ -2557,6 +2648,17 @@ async fn describe_kiro_images_with_sonnet_bridge(
             Ok(value) => value,
             Err(response) => return Err(response),
         };
+        let selected_account_name = route.account_name.clone();
+        let route = match hydrate_kiro_route_for_dispatch(route, route_store).await {
+            Ok(route) => route,
+            Err(response) => {
+                failed_accounts.insert(selected_account_name);
+                if has_remaining_kiro_candidate(routes, &failed_accounts, "") {
+                    continue;
+                }
+                return Err(response);
+            },
+        };
         let request_body = match build_kiro_vision_bridge_request(&route, images, user_context) {
             Ok(body) => body,
             Err(err) => {
@@ -2943,6 +3045,18 @@ async fn dispatch_kiro_proxy(
             Err(response) => return response,
         };
         usage_meta.add_routing_wait(clamp_duration_ms(route_started.elapsed()));
+        let selected_account_name = route.account_name.clone();
+        let route = match hydrate_kiro_route_for_dispatch(route, route_store.as_ref()).await {
+            Ok(route) => route,
+            Err(response) => {
+                usage_meta.mark_failover();
+                failed_accounts.insert(selected_account_name);
+                if has_remaining_kiro_candidate(&routes, &failed_accounts, "") {
+                    continue;
+                }
+                return response;
+            },
+        };
         let mut conversation_state = base_conversation_state.clone();
         let mut cache_ctx =
             match build_kiro_cache_context(&route, &conversation_state, &kiro_cache_simulator) {
@@ -3240,6 +3354,18 @@ async fn dispatch_kiro_websearch(input: KiroWebsearchDispatch) -> Response {
             Err(response) => return response,
         };
         usage_meta.add_routing_wait(clamp_duration_ms(route_started.elapsed()));
+        let selected_account_name = route.account_name.clone();
+        let route = match hydrate_kiro_route_for_dispatch(route, route_store.as_ref()).await {
+            Ok(route) => route,
+            Err(response) => {
+                usage_meta.mark_failover();
+                failed_accounts.insert(selected_account_name);
+                if has_remaining_kiro_candidate(&routes, &failed_accounts, "") {
+                    continue;
+                }
+                return response;
+            },
+        };
         let mut route_usage_meta = usage_meta.clone();
         match call_kiro_mcp_for_route(&route, route_store.as_ref(), &request_body).await {
             Ok(mcp_response) => {

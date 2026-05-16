@@ -1,6 +1,10 @@
 //! Postgres control-plane repository for `llm-access`.
 
-use std::collections::{BTreeMap, HashMap};
+use std::{
+    collections::{BTreeMap, HashMap},
+    env,
+    time::Duration,
+};
 
 use anyhow::Context;
 use async_trait::async_trait;
@@ -10,10 +14,11 @@ use llm_access_core::{
         self as core_store, default_proxy_bindings, AdminAccountContributionRequest,
         AdminAccountContributionRequestsPage, AdminAccountGroup, AdminAccountGroupPatch,
         AdminAccountGroupStore, AdminCodexAccount, AdminCodexAccountPatch, AdminCodexAccountStore,
-        AdminCodexImportJobDetail, AdminCodexImportJobItem, AdminCodexImportJobItemResult,
-        AdminCodexImportJobSummary, AdminConfigStore, AdminKey, AdminKeyPatch, AdminKeyStore,
-        AdminKiroAccount, AdminKiroAccountPatch, AdminKiroAccountStore, AdminKiroBalanceView,
-        AdminKiroCacheView, AdminKiroStatusCacheUpdate, AdminLegacyKiroProxyMigration,
+        AdminCodexAccountsPage, AdminCodexImportJobDetail, AdminCodexImportJobItem,
+        AdminCodexImportJobItemResult, AdminCodexImportJobSummary, AdminConfigStore, AdminKey,
+        AdminKeyPatch, AdminKeyStore, AdminKeysPage, AdminKiroAccount, AdminKiroAccountPatch,
+        AdminKiroAccountStore, AdminKiroAccountsPage, AdminKiroBalanceView, AdminKiroCacheView,
+        AdminKiroStatusCacheUpdate, AdminLegacyKiroProxyMigration, AdminPageRequest,
         AdminProxyBinding, AdminProxyConfig, AdminProxyConfigPatch, AdminProxyStore,
         AdminReviewQueueAction, AdminReviewQueueQuery, AdminReviewQueueStore, AdminRuntimeConfig,
         AdminSponsorRequest, AdminSponsorRequestsPage, AdminTokenRequest, AdminTokenRequestsPage,
@@ -87,6 +92,33 @@ const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
 const USAGE_ROLLUP_PARAMS_PER_ROW: usize = 8;
 const USAGE_ROLLUP_BATCH_ROW_LIMIT: usize = POSTGRES_MAX_BIND_PARAMS / USAGE_ROLLUP_PARAMS_PER_ROW;
 
+#[derive(Debug, Clone)]
+struct CodexRouteCandidateRow {
+    account_name: String,
+    status: String,
+    settings_json: String,
+    last_refresh_at_ms: Option<i64>,
+    last_error: Option<String>,
+    access_token: Option<String>,
+}
+
+#[derive(Debug, Clone)]
+struct KiroRouteCandidateRow {
+    account_name: String,
+    profile_arn: Option<String>,
+    user_id: Option<String>,
+    status: String,
+    max_concurrency: Option<i64>,
+    min_start_interval_ms: Option<i64>,
+    proxy_config_id: Option<String>,
+    disabled: bool,
+    minimum_remaining_credits_before_block: f64,
+    auth_profile_arn: Option<String>,
+    api_region: Option<String>,
+    proxy_mode: Option<String>,
+    auth_proxy_config_id: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq)]
 struct UsageRollupDelta {
     input_uncached_tokens: i64,
@@ -138,8 +170,17 @@ struct SqlxClient {
 
 impl SqlxClient {
     async fn connect(database_url: &str) -> anyhow::Result<Self> {
+        let max_connections = env::var("LLM_ACCESS_CONTROL_PG_MAX_CONNECTIONS")
+            .ok()
+            .and_then(|value| value.parse::<u32>().ok())
+            .map(|value| value.clamp(1, 32))
+            .unwrap_or(4);
         let pool = PgPoolOptions::new()
-            .max_connections(8)
+            .max_connections(max_connections)
+            .min_connections(0)
+            .acquire_timeout(Duration::from_secs(10))
+            .idle_timeout(Duration::from_secs(60))
+            .max_lifetime(Duration::from_secs(30 * 60))
             .connect(database_url)
             .await
             .context("connect sqlx postgres control repository")?;
@@ -561,6 +602,108 @@ impl PostgresControlRepository {
         rows.into_iter()
             .map(decode_key_bundle_row)
             .collect::<anyhow::Result<Vec<_>>>()
+    }
+
+    async fn list_key_bundles_page(
+        &self,
+        provider_type: Option<&str>,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminKeysPage> {
+        self.ensure_connection_alive()?;
+        let provider = provider_type.map(str::to_string);
+        let total = self
+            .client
+            .query_one(
+                "SELECT COUNT(*)
+                 FROM llm_keys k
+                 JOIN llm_key_route_config r ON r.key_id = k.key_id
+                 JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 WHERE ($1::text IS NULL OR k.provider_type = $1)",
+                &[&provider],
+            )
+            .await
+            .context("count postgres key bundles page")?
+            .get::<_, i64>(0)
+            .max(0) as usize;
+        let limit = page.limit.max(1);
+        let offset = page.offset;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    k.key_id, k.name, k.secret, k.key_hash, k.status, k.provider_type,
+                    k.protocol_family, k.public_visible, k.quota_billable_limit,
+                    k.created_at_ms, k.updated_at_ms,
+                    r.route_strategy, r.fixed_account_name, r.auto_account_names_json::text,
+                    r.account_group_id, r.model_name_map_json::text,
+                    r.request_max_concurrency, r.request_min_start_interval_ms,
+                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
+                    r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.kiro_cache_policy_override_json::text,
+                    r.kiro_billable_model_multipliers_override_json::text,
+                    u.input_uncached_tokens, u.input_cached_tokens, u.output_tokens,
+                    u.billable_tokens, u.credit_total, u.credit_missing_events,
+                    u.last_used_at_ms, u.updated_at_ms
+                 FROM llm_keys k
+                 JOIN llm_key_route_config r ON r.key_id = k.key_id
+                 JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 WHERE ($1::text IS NULL OR k.provider_type = $1)
+                 ORDER BY k.created_at_ms DESC, k.key_id DESC
+                 LIMIT $2 OFFSET $3",
+                &[&provider, &(limit as i64), &(offset as i64)],
+            )
+            .await
+            .context("list postgres key bundles page")?;
+        let keys = rows
+            .into_iter()
+            .map(decode_key_bundle_row)
+            .map(|bundle| bundle.map(|bundle| admin_key_from_bundle(&bundle)))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(AdminKeysPage {
+            has_more: page.has_more(keys.len(), total),
+            keys,
+            total,
+            limit,
+            offset,
+        })
+    }
+
+    async fn find_key_referencing_account_group(
+        &self,
+        provider_type: &str,
+        group_id: &str,
+    ) -> anyhow::Result<Option<AdminKey>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT
+                    k.key_id, k.name, k.secret, k.key_hash, k.status, k.provider_type,
+                    k.protocol_family, k.public_visible, k.quota_billable_limit,
+                    k.created_at_ms, k.updated_at_ms,
+                    r.route_strategy, r.fixed_account_name, r.auto_account_names_json::text,
+                    r.account_group_id, r.model_name_map_json::text,
+                    r.request_max_concurrency, r.request_min_start_interval_ms,
+                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
+                    r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.kiro_cache_policy_override_json::text,
+                    r.kiro_billable_model_multipliers_override_json::text,
+                    u.input_uncached_tokens, u.input_cached_tokens, u.output_tokens,
+                    u.billable_tokens, u.credit_total, u.credit_missing_events,
+                    u.last_used_at_ms, u.updated_at_ms
+                 FROM llm_keys k
+                 JOIN llm_key_route_config r ON r.key_id = k.key_id
+                 JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 WHERE k.provider_type = $1 AND r.account_group_id = $2
+                 ORDER BY k.created_at_ms DESC, k.key_id DESC
+                 LIMIT 1",
+                &[&provider_type, &group_id],
+            )
+            .await
+            .context("find postgres key referencing account group")?;
+        row.map(decode_key_bundle_row)
+            .transpose()
+            .map(|bundle| bundle.map(|bundle| admin_key_from_bundle(&bundle)))
     }
 
     async fn list_public_access_keys_rows(&self) -> anyhow::Result<Vec<PublicAccessKey>> {
@@ -995,6 +1138,34 @@ impl PostgresControlRepository {
         Ok(rows.into_iter().map(decode_codex_account_row).collect())
     }
 
+    async fn list_codex_accounts_rows_page(
+        &self,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<(Vec<CodexAccountRecord>, usize)> {
+        self.ensure_connection_alive()?;
+        let total = self
+            .client
+            .query_one("SELECT COUNT(*) FROM llm_codex_accounts", &[])
+            .await
+            .context("count postgres codex accounts")?
+            .get::<_, i64>(0)
+            .max(0) as usize;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    account_name, account_id, email, status, auth_json::text, settings_json::text,
+                    last_refresh_at_ms, last_error, created_at_ms, updated_at_ms
+                 FROM llm_codex_accounts
+                 ORDER BY created_at_ms DESC, account_name DESC
+                 LIMIT $1 OFFSET $2",
+                &[&(page.limit.max(1) as i64), &(page.offset as i64)],
+            )
+            .await
+            .context("list postgres codex accounts page")?;
+        Ok((rows.into_iter().map(decode_codex_account_row).collect(), total))
+    }
+
     async fn get_codex_account_row(
         &self,
         name: &str,
@@ -1015,6 +1186,42 @@ impl PostgresControlRepository {
         Ok(row.map(decode_codex_account_row))
     }
 
+    async fn list_codex_route_candidate_rows(&self) -> anyhow::Result<Vec<CodexRouteCandidateRow>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    account_name,
+                    status,
+                    settings_json::text,
+                    last_refresh_at_ms,
+                    last_error,
+                    COALESCE(
+                        auth_json #>> '{tokens,access_token}',
+                        auth_json #>> '{tokens,accessToken}',
+                        auth_json ->> 'access_token',
+                        auth_json ->> 'accessToken'
+                    )
+                 FROM llm_codex_accounts
+                 ORDER BY account_name",
+                &[],
+            )
+            .await
+            .context("list postgres codex route candidates")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| CodexRouteCandidateRow {
+                account_name: row.get(0),
+                status: row.get(1),
+                settings_json: row.get(2),
+                last_refresh_at_ms: row.get(3),
+                last_error: row.get(4),
+                access_token: row.get(5),
+            })
+            .collect())
+    }
+
     async fn list_kiro_accounts_rows(&self) -> anyhow::Result<Vec<KiroAccountRecord>> {
         self.ensure_connection_alive()?;
         let rows = self
@@ -1031,6 +1238,35 @@ impl PostgresControlRepository {
             .await
             .context("list kiro accounts")?;
         Ok(rows.into_iter().map(decode_kiro_account_row).collect())
+    }
+
+    async fn list_kiro_accounts_rows_page(
+        &self,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<(Vec<KiroAccountRecord>, usize)> {
+        self.ensure_connection_alive()?;
+        let total = self
+            .client
+            .query_one("SELECT COUNT(*) FROM llm_kiro_accounts", &[])
+            .await
+            .context("count postgres kiro accounts")?
+            .get::<_, i64>(0)
+            .max(0) as usize;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    account_name, auth_method, account_id, profile_arn, user_id, status,
+                    auth_json::text, max_concurrency, min_start_interval_ms, proxy_config_id,
+                    last_refresh_at_ms, last_error, created_at_ms, updated_at_ms
+                 FROM llm_kiro_accounts
+                 ORDER BY created_at_ms DESC, account_name DESC
+                 LIMIT $1 OFFSET $2",
+                &[&(page.limit.max(1) as i64), &(page.offset as i64)],
+            )
+            .await
+            .context("list postgres kiro accounts page")?;
+        Ok((rows.into_iter().map(decode_kiro_account_row).collect(), total))
     }
 
     async fn get_kiro_account_row(
@@ -1052,6 +1288,71 @@ impl PostgresControlRepository {
             .await
             .context("load kiro account")?;
         Ok(row.map(decode_kiro_account_row))
+    }
+
+    async fn list_kiro_route_candidate_rows(&self) -> anyhow::Result<Vec<KiroRouteCandidateRow>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    account_name,
+                    profile_arn,
+                    user_id,
+                    status,
+                    max_concurrency,
+                    min_start_interval_ms,
+                    proxy_config_id,
+                    CASE
+                        WHEN jsonb_typeof(auth_json -> 'disabled') = 'boolean'
+                        THEN (auth_json ->> 'disabled')::boolean
+                        ELSE FALSE
+                    END,
+                    COALESCE(
+                        CASE
+                            WHEN jsonb_typeof(auth_json -> 'minimumRemainingCreditsBeforeBlock') = \
+                 'number'
+                            THEN (auth_json ->> 'minimumRemainingCreditsBeforeBlock')::double \
+                 precision
+                        END,
+                        CASE
+                            WHEN jsonb_typeof(auth_json -> \
+                 'minimum_remaining_credits_before_block') = 'number'
+                            THEN (auth_json ->> 'minimum_remaining_credits_before_block')::double \
+                 precision
+                        END,
+                        0.0
+                    ),
+                    NULLIF(COALESCE(auth_json ->> 'profileArn', auth_json ->> 'profile_arn'), ''),
+                    NULLIF(COALESCE(auth_json ->> 'apiRegion', auth_json ->> 'api_region', \
+                 auth_json ->> 'region'), ''),
+                    NULLIF(COALESCE(auth_json ->> 'proxyMode', auth_json ->> 'proxy_mode'), ''),
+                    NULLIF(COALESCE(auth_json ->> 'proxyConfigId', auth_json ->> \
+                 'proxy_config_id'), '')
+                 FROM llm_kiro_accounts
+                 ORDER BY account_name",
+                &[],
+            )
+            .await
+            .context("list postgres kiro route candidates")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| KiroRouteCandidateRow {
+                account_name: row.get(0),
+                profile_arn: row.get(1),
+                user_id: row.get(2),
+                status: row.get(3),
+                max_concurrency: row.get(4),
+                min_start_interval_ms: row.get(5),
+                proxy_config_id: row.get(6),
+                disabled: row.get(7),
+                minimum_remaining_credits_before_block: row.get::<_, f64>(8).max(0.0),
+                auth_profile_arn: row.get(9),
+                api_region: row.get(10),
+                proxy_mode: row.get(11),
+                auth_proxy_config_id: row.get(12),
+            })
+            .collect())
     }
 
     async fn list_kiro_cached_status_parts_rows(
@@ -2587,6 +2888,15 @@ fn codex_access_token_is_still_usable(auth_json: &str) -> bool {
     expires_at_ms > now_ms()
 }
 
+fn minimal_codex_auth_json_for_access_token(access_token: Option<&str>) -> String {
+    match access_token {
+        Some(token) if !token.trim().is_empty() => {
+            serde_json::json!({ "access_token": token }).to_string()
+        },
+        _ => "{}".to_string(),
+    }
+}
+
 fn effective_kiro_cache_policy_json(
     runtime_policy_json: &str,
     override_json: Option<&str>,
@@ -2705,6 +3015,30 @@ impl AdminKeyStore for PostgresControlRepository {
             .iter()
             .map(admin_key_from_bundle)
             .collect())
+    }
+
+    async fn get_admin_key(&self, key_id: &str) -> anyhow::Result<Option<AdminKey>> {
+        Ok(self
+            .load_key_bundle_by_id(key_id)
+            .await?
+            .map(|bundle| admin_key_from_bundle(&bundle)))
+    }
+
+    async fn list_admin_keys_page(
+        &self,
+        provider_type: Option<&str>,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminKeysPage> {
+        self.list_key_bundles_page(provider_type, page).await
+    }
+
+    async fn find_admin_key_referencing_account_group(
+        &self,
+        provider_type: &str,
+        group_id: &str,
+    ) -> anyhow::Result<Option<AdminKey>> {
+        self.find_key_referencing_account_group(provider_type, group_id)
+            .await
     }
 
     async fn create_admin_key(&self, key: NewAdminKey) -> anyhow::Result<AdminKey> {
@@ -3181,6 +3515,29 @@ impl AdminCodexAccountStore for PostgresControlRepository {
             .iter()
             .map(|record| self.admin_codex_account_from_record_with_context(record, &context))
             .collect()
+    }
+
+    async fn list_admin_codex_accounts_page(
+        &self,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminCodexAccountsPage> {
+        let page = AdminPageRequest {
+            limit: page.limit.max(1),
+            offset: page.offset,
+        };
+        let (records, total) = self.list_codex_accounts_rows_page(page).await?;
+        let context = self.load_codex_admin_account_view_context().await?;
+        let accounts = records
+            .iter()
+            .map(|record| self.admin_codex_account_from_record_with_context(record, &context))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(AdminCodexAccountsPage {
+            has_more: page.has_more(accounts.len(), total),
+            accounts,
+            total,
+            limit: page.limit,
+            offset: page.offset,
+        })
     }
 
     async fn list_codex_status_refresh_targets(
@@ -3662,6 +4019,29 @@ impl AdminKiroAccountStore for PostgresControlRepository {
             .collect()
     }
 
+    async fn list_admin_kiro_accounts_page(
+        &self,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminKiroAccountsPage> {
+        let page = AdminPageRequest {
+            limit: page.limit.max(1),
+            offset: page.offset,
+        };
+        let (records, total) = self.list_kiro_accounts_rows_page(page).await?;
+        let context = self.load_kiro_admin_account_view_context().await?;
+        let accounts = records
+            .iter()
+            .map(|record| self.admin_kiro_account_from_record_with_context(record, &context))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(AdminKiroAccountsPage {
+            has_more: page.has_more(accounts.len(), total),
+            accounts,
+            total,
+            limit: page.limit,
+            offset: page.offset,
+        })
+    }
+
     async fn list_kiro_status_refresh_targets(
         &self,
     ) -> anyhow::Result<Vec<KiroStatusRefreshTarget>> {
@@ -3989,7 +4369,7 @@ impl ProviderRouteStore for PostgresControlRepository {
         }
 
         let runtime_config = self.load_runtime_config_record().await?.unwrap_or_default();
-        let records = self.list_codex_accounts_rows().await?;
+        let records = self.list_codex_route_candidate_rows().await?;
         let account_names = self
             .resolve_route_account_names(
                 core_store::PROVIDER_CODEX,
@@ -4042,19 +4422,21 @@ impl ProviderRouteStore for PostgresControlRepository {
                 settings.proxy_config_id.as_deref(),
                 &proxy_context,
             )?;
+            let minimal_auth_json =
+                minimal_codex_auth_json_for_access_token(record.access_token.as_deref());
             let cached_error_message = codex_cached_error_message(
                 &account_name,
                 record.last_error.as_deref(),
                 record.last_refresh_at_ms,
                 settings.auth_refresh_enabled,
-                &record.auth_json,
+                &minimal_auth_json,
                 &status_by_account,
             );
             routes.push(ProviderCodexRoute {
                 account_name: record.account_name,
                 account_group_id_at_event: account_group_id_at_event.clone(),
                 route_strategy_at_event,
-                auth_json: record.auth_json,
+                auth_json: String::new(),
                 map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
                 auth_refresh_enabled: settings.auth_refresh_enabled,
                 request_max_concurrency: bundle
@@ -4111,7 +4493,7 @@ impl ProviderRouteStore for PostgresControlRepository {
         }
 
         let runtime_config = self.load_runtime_config_record().await?.unwrap_or_default();
-        let records = self.list_kiro_accounts_rows().await?;
+        let records = self.list_kiro_route_candidate_rows().await?;
         let account_names = self
             .resolve_route_account_names(
                 core_store::PROVIDER_KIRO,
@@ -4145,17 +4527,11 @@ impl ProviderRouteStore for PostgresControlRepository {
             if record.status != core_store::KEY_STATUS_ACTIVE {
                 continue;
             }
-            let auth_json = serde_json::from_str::<serde_json::Value>(&record.auth_json)
-                .context("parse kiro account auth json")?;
-            if optional_json_bool_any(&auth_json, &["disabled"]).unwrap_or(false) {
+            if record.disabled {
                 continue;
             }
-            let minimum_remaining_credits_before_block = optional_json_f64_any(&auth_json, &[
-                "minimumRemainingCreditsBeforeBlock",
-                "minimum_remaining_credits_before_block",
-            ])
-            .unwrap_or(0.0)
-            .max(0.0);
+            let minimum_remaining_credits_before_block =
+                record.minimum_remaining_credits_before_block;
             let cached_status = status_by_account.get(&record.account_name).cloned();
             if let Some((balance, cache)) = &cached_status {
                 if matches!(cache.status.as_str(), "disabled" | "quota_exhausted") {
@@ -4184,28 +4560,27 @@ impl ProviderRouteStore for PostgresControlRepository {
             let profile_arn = record
                 .profile_arn
                 .clone()
-                .or_else(|| optional_json_string(&auth_json, "profileArn"))
-                .or_else(|| optional_json_string(&auth_json, "profile_arn"));
-            let api_region = optional_json_string(&auth_json, "apiRegion")
-                .or_else(|| optional_json_string(&auth_json, "api_region"))
-                .or_else(|| optional_json_string(&auth_json, "region"))
+                .or_else(|| record.auth_profile_arn.clone());
+            let api_region = record
+                .api_region
+                .clone()
                 .unwrap_or_else(|| "us-east-1".to_string());
             let billable_model_multipliers_json = bundle
                 .route
                 .kiro_billable_model_multipliers_override_json
                 .clone()
                 .unwrap_or_else(|| runtime_config.kiro_billable_model_multipliers_json.clone());
-            let proxy_mode = optional_json_string_any(&auth_json, &["proxyMode", "proxy_mode"])
-                .unwrap_or_else(|| {
-                    if record.proxy_config_id.is_some() {
-                        "fixed".to_string()
-                    } else {
-                        "inherit".to_string()
-                    }
-                });
-            let proxy_config_id = record.proxy_config_id.clone().or_else(|| {
-                optional_json_string_any(&auth_json, &["proxyConfigId", "proxy_config_id"])
+            let proxy_mode = record.proxy_mode.clone().unwrap_or_else(|| {
+                if record.proxy_config_id.is_some() {
+                    "fixed".to_string()
+                } else {
+                    "inherit".to_string()
+                }
             });
+            let proxy_config_id = record
+                .proxy_config_id
+                .clone()
+                .or_else(|| record.auth_proxy_config_id.clone());
             let proxy = resolve_provider_proxy_config_from_context(
                 &proxy_mode,
                 proxy_config_id.as_deref(),
@@ -4215,7 +4590,7 @@ impl ProviderRouteStore for PostgresControlRepository {
                 account_name: record.account_name,
                 account_group_id_at_event: account_group_id_at_event.clone(),
                 route_strategy_at_event,
-                auth_json: record.auth_json,
+                auth_json: String::new(),
                 profile_arn,
                 api_region,
                 request_validation_enabled: bundle.route.kiro_request_validation_enabled,
@@ -4268,6 +4643,13 @@ impl ProviderRouteStore for PostgresControlRepository {
             });
         }
         Ok(routes)
+    }
+
+    async fn resolve_kiro_account_route(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<Option<ProviderKiroRoute>> {
+        self.resolve_admin_kiro_account_route(account_name).await
     }
 
     async fn save_kiro_auth_update(&self, _update: ProviderKiroAuthUpdate) -> anyhow::Result<()> {

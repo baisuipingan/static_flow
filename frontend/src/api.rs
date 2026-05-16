@@ -6020,6 +6020,10 @@ pub struct AdminLlmGatewayKeyView {
 pub struct AdminLlmGatewayKeysResponse {
     pub keys: Vec<AdminLlmGatewayKeyView>,
     pub auth_cache_ttl_seconds: u64,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
+    pub has_more: bool,
     pub generated_at: i64,
 }
 
@@ -7858,20 +7862,24 @@ pub async fn import_admin_legacy_kiro_proxy_configs(
     }
 }
 
-/// Fetch the full admin key inventory, including secrets and current counters.
+/// Fetch the first admin key page, including secrets and current counters.
 pub async fn fetch_admin_llm_gateway_keys() -> Result<AdminLlmGatewayKeysResponse, String> {
     #[cfg(feature = "mock")]
     {
         Ok(AdminLlmGatewayKeysResponse {
             keys: vec![],
             auth_cache_ttl_seconds: 60,
+            total: 0,
+            limit: 0,
+            offset: 0,
+            has_more: false,
             generated_at: 0,
         })
     }
 
     #[cfg(not(feature = "mock"))]
     {
-        let url = format!("{}/admin/llm-gateway/keys", admin_base());
+        let url = format!("{}/admin/llm-gateway/keys?limit=200&offset=0", admin_base());
         let response = api_get(&url)
             .send()
             .await
@@ -8890,6 +8898,10 @@ impl Default for AccountSummaryView {
 #[serde(default)]
 pub struct AccountListResponse {
     pub accounts: Vec<AccountSummaryView>,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
+    pub has_more: bool,
     pub generated_at: i64,
 }
 
@@ -8945,13 +8957,17 @@ pub async fn fetch_admin_llm_gateway_accounts() -> Result<AccountListResponse, S
     {
         Ok(AccountListResponse {
             accounts: vec![],
+            total: 0,
+            limit: 0,
+            offset: 0,
+            has_more: false,
             generated_at: 0,
         })
     }
 
     #[cfg(not(feature = "mock"))]
     {
-        let url = format!("{}/admin/llm-gateway/accounts", admin_base());
+        let url = format!("{}/admin/llm-gateway/accounts?limit=200&offset=0", admin_base());
         let response = api_get(&url)
             .send()
             .await
@@ -9616,6 +9632,10 @@ pub struct PatchKiroAccountInput {
 #[serde(default)]
 pub struct AdminKiroAccountsResponse {
     pub accounts: Vec<KiroAccountView>,
+    pub total: usize,
+    pub limit: usize,
+    pub offset: usize,
+    pub has_more: bool,
     pub generated_at: i64,
 }
 
@@ -9751,13 +9771,21 @@ pub async fn fetch_admin_kiro_keys() -> Result<AdminLlmGatewayKeysResponse, Stri
         Ok(AdminLlmGatewayKeysResponse {
             keys: vec![],
             auth_cache_ttl_seconds: 60,
+            total: 0,
+            limit: 0,
+            offset: 0,
+            has_more: false,
             generated_at: 0,
         })
     }
 
     #[cfg(not(feature = "mock"))]
     {
-        let url = format!("{}/admin/kiro-gateway/keys?_ts={}", admin_base(), Date::now() as u64);
+        let url = format!(
+            "{}/admin/kiro-gateway/keys?limit=200&offset=0&_ts={}",
+            admin_base(),
+            Date::now() as u64
+        );
         let response = api_get(&url)
             .header("Cache-Control", "no-cache, no-store, max-age=0")
             .header("Pragma", "no-cache")
@@ -10261,13 +10289,17 @@ pub async fn fetch_admin_kiro_accounts() -> Result<AdminKiroAccountsResponse, St
     {
         Ok(AdminKiroAccountsResponse {
             accounts: vec![],
+            total: 0,
+            limit: 0,
+            offset: 0,
+            has_more: false,
             generated_at: 0,
         })
     }
 
     #[cfg(not(feature = "mock"))]
     {
-        let url = format!("{}/admin/kiro-gateway/accounts", admin_base());
+        let url = format!("{}/admin/kiro-gateway/accounts?limit=200&offset=0", admin_base());
         let response = api_get(&url)
             .send()
             .await

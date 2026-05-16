@@ -22,8 +22,8 @@ use llm_access_core::store::{
 };
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use llm_access_core::store::{
-    AdminKey, AdminKeyPatch, AdminRuntimeConfig, AuthenticatedKey, NewAdminKey, PublicAccessKey,
-    PublicUsageLookupKey, UsageEventSink,
+    AdminKey, AdminKeyPatch, AdminKeysPage, AdminPageRequest, AdminRuntimeConfig, AuthenticatedKey,
+    NewAdminKey, PublicAccessKey, PublicUsageLookupKey, UsageEventSink,
 };
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use llm_access_core::usage::UsageEvent;
@@ -1229,6 +1229,43 @@ impl AdminKeyStore for UsageAccountingAdminKeyStore {
             .into_iter()
             .map(|key| self.usage_accounting.overlay_admin_key(key))
             .collect())
+    }
+
+    async fn get_admin_key(&self, key_id: &str) -> anyhow::Result<Option<AdminKey>> {
+        Ok(self
+            .admin_key_store
+            .get_admin_key(key_id)
+            .await?
+            .map(|key| self.usage_accounting.overlay_admin_key(key)))
+    }
+
+    async fn list_admin_keys_page(
+        &self,
+        provider_type: Option<&str>,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminKeysPage> {
+        let mut page = self
+            .admin_key_store
+            .list_admin_keys_page(provider_type, page)
+            .await?;
+        page.keys = page
+            .keys
+            .into_iter()
+            .map(|key| self.usage_accounting.overlay_admin_key(key))
+            .collect();
+        Ok(page)
+    }
+
+    async fn find_admin_key_referencing_account_group(
+        &self,
+        provider_type: &str,
+        group_id: &str,
+    ) -> anyhow::Result<Option<AdminKey>> {
+        Ok(self
+            .admin_key_store
+            .find_admin_key_referencing_account_group(provider_type, group_id)
+            .await?
+            .map(|key| self.usage_accounting.overlay_admin_key(key)))
     }
 
     async fn create_admin_key(&self, key: NewAdminKey) -> anyhow::Result<AdminKey> {

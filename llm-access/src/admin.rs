@@ -90,6 +90,8 @@ const MAX_CODEX_KEY_REQUEST_MAX_CONCURRENCY: u64 = 1_024;
 const MAX_CODEX_KEY_REQUEST_MIN_START_INTERVAL_MS: u64 = 300_000;
 const DEFAULT_ADMIN_REVIEW_QUEUE_LIMIT: usize = 50;
 const MAX_ADMIN_REVIEW_QUEUE_LIMIT: usize = 200;
+const DEFAULT_ADMIN_LIST_LIMIT: usize = 50;
+const MAX_ADMIN_LIST_LIMIT: usize = 200;
 const DEFAULT_ADMIN_IMPORT_JOB_LIMIT: usize = 20;
 const MAX_ADMIN_IMPORT_JOB_LIMIT: usize = 50;
 const PROXY_CONNECTIVITY_CHECK_TIMEOUT_SECONDS: u64 = 10;
@@ -107,6 +109,10 @@ struct ErrorResponse {
 struct AdminKeysResponse {
     keys: Vec<core_store::AdminKey>,
     auth_cache_ttl_seconds: u64,
+    total: usize,
+    limit: usize,
+    offset: usize,
+    has_more: bool,
     generated_at: i64,
 }
 
@@ -137,6 +143,10 @@ struct AdminProxyBindingsResponse {
 #[derive(Debug, Serialize)]
 struct AdminAccountsResponse {
     accounts: Vec<core_store::AdminCodexAccount>,
+    total: usize,
+    limit: usize,
+    offset: usize,
+    has_more: bool,
     generated_at: i64,
 }
 
@@ -156,6 +166,10 @@ struct AdminCodexImportJobsResponse {
 #[derive(Debug, Serialize)]
 struct AdminKiroAccountsResponse {
     accounts: Vec<core_store::AdminKiroAccount>,
+    total: usize,
+    limit: usize,
+    offset: usize,
+    has_more: bool,
     generated_at: i64,
 }
 
@@ -184,6 +198,12 @@ struct AdminTokenRequestsResponse {
     has_more: bool,
     requests: Vec<core_store::AdminTokenRequest>,
     generated_at: i64,
+}
+
+#[derive(Debug, Deserialize, Default)]
+pub(crate) struct AdminListQuery {
+    limit: Option<usize>,
+    offset: Option<usize>,
 }
 
 #[derive(Debug, Serialize)]
@@ -679,25 +699,35 @@ pub(crate) async fn post_llm_gateway_config(
 pub(crate) async fn list_llm_gateway_keys(
     State(state): State<HttpState>,
     headers: HeaderMap,
+    Query(query): Query<AdminListQuery>,
 ) -> Response {
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
     }
-    let keys = match state.admin_key_store.list_admin_keys().await {
-        Ok(keys) => keys,
+    let page_request = admin_page_request(query);
+    let page = match state
+        .admin_key_store
+        .list_admin_keys_page(Some(PROVIDER_CODEX), page_request)
+        .await
+    {
+        Ok(page) => page,
         Err(_) => return internal_error("Failed to list llm gateway keys").into_response(),
     };
     let config = match state.admin_config_store.get_admin_runtime_config().await {
         Ok(config) => config,
         Err(_) => return internal_error("Failed to load llm gateway config").into_response(),
     };
-    let keys = match apply_effective_kiro_cache_policies(keys, &config) {
+    let keys = match apply_effective_kiro_cache_policies(page.keys, &config) {
         Ok(keys) => keys,
         Err(_) => return internal_error("Failed to resolve Kiro cache policy").into_response(),
     };
     Json(AdminKeysResponse {
         keys,
         auth_cache_ttl_seconds: config.auth_cache_ttl_seconds,
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+        has_more: page.has_more,
         generated_at: now_ms(),
     })
     .into_response()
@@ -897,14 +927,15 @@ pub(crate) async fn delete_llm_gateway_account_group(
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
     }
-    let keys = match state.admin_key_store.list_admin_keys().await {
-        Ok(keys) => keys,
+    let key = match state
+        .admin_key_store
+        .find_admin_key_referencing_account_group(PROVIDER_CODEX, &group_id)
+        .await
+    {
+        Ok(key) => key,
         Err(_) => return internal_error("Failed to inspect llm gateway keys").into_response(),
     };
-    if let Some(key) = keys
-        .iter()
-        .find(|key| key.account_group_id.as_deref() == Some(group_id.as_str()))
-    {
+    if let Some(key) = key {
         return bad_request(&format!("account group is still referenced by key `{}`", key.name))
             .into_response();
     }
@@ -1315,16 +1346,18 @@ pub(crate) async fn get_usage_journal_preview(
 pub(crate) async fn list_llm_gateway_accounts(
     State(state): State<HttpState>,
     headers: HeaderMap,
+    Query(query): Query<AdminListQuery>,
 ) -> Response {
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
     }
-    let accounts = match state
+    let page_request = admin_page_request(query);
+    let page = match state
         .admin_codex_account_store
-        .list_admin_codex_accounts()
+        .list_admin_codex_accounts_page(page_request)
         .await
     {
-        Ok(accounts) => accounts,
+        Ok(page) => page,
         Err(_) => return internal_error("Failed to list llm gateway accounts").into_response(),
     };
     let status = match state.public_status_store.codex_rate_limit_status().await {
@@ -1334,7 +1367,11 @@ pub(crate) async fn list_llm_gateway_accounts(
         },
     };
     Json(AdminAccountsResponse {
-        accounts: apply_cached_codex_status_to_admin_accounts(accounts, status),
+        accounts: apply_cached_codex_status_to_admin_accounts(page.accounts, status),
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+        has_more: page.has_more,
         generated_at: now_ms(),
     })
     .into_response()
@@ -1859,28 +1896,35 @@ pub(crate) async fn probe_llm_gateway_account_models(
 pub(crate) async fn list_admin_kiro_keys(
     State(state): State<HttpState>,
     headers: HeaderMap,
+    Query(query): Query<AdminListQuery>,
 ) -> Response {
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
     }
-    let keys = match state.admin_key_store.list_admin_keys().await {
-        Ok(keys) => keys
-            .into_iter()
-            .filter(|key| key.provider_type == PROVIDER_KIRO)
-            .collect(),
+    let page_request = admin_page_request(query);
+    let page = match state
+        .admin_key_store
+        .list_admin_keys_page(Some(PROVIDER_KIRO), page_request)
+        .await
+    {
+        Ok(page) => page,
         Err(_) => return internal_error("Failed to list Kiro gateway keys").into_response(),
     };
     let config = match state.admin_config_store.get_admin_runtime_config().await {
         Ok(config) => config,
         Err(_) => return internal_error("Failed to load llm gateway config").into_response(),
     };
-    let keys = match apply_effective_kiro_cache_policies(keys, &config) {
+    let keys = match apply_effective_kiro_cache_policies(page.keys, &config) {
         Ok(keys) => keys,
         Err(_) => return internal_error("Failed to resolve Kiro cache policy").into_response(),
     };
     Json(AdminKeysResponse {
         keys,
         auth_cache_ttl_seconds: config.auth_cache_ttl_seconds,
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+        has_more: page.has_more,
         generated_at: now_ms(),
     })
     .into_response()
@@ -2040,17 +2084,23 @@ pub(crate) async fn get_admin_kiro_usage_event(
 pub(crate) async fn list_admin_kiro_accounts(
     State(state): State<HttpState>,
     headers: HeaderMap,
+    Query(query): Query<AdminListQuery>,
 ) -> Response {
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
     }
+    let page_request = admin_page_request(query);
     match state
         .admin_kiro_account_store
-        .list_admin_kiro_accounts()
+        .list_admin_kiro_accounts_page(page_request)
         .await
     {
-        Ok(accounts) => Json(AdminKiroAccountsResponse {
-            accounts,
+        Ok(page) => Json(AdminKiroAccountsResponse {
+            accounts: page.accounts,
+            total: page.total,
+            limit: page.limit,
+            offset: page.offset,
+            has_more: page.has_more,
             generated_at: now_ms(),
         })
         .into_response(),
@@ -2927,23 +2977,18 @@ pub(crate) async fn delete_llm_gateway_sponsor_request(
 async fn admin_key_matches_provider(state: &HttpState, key_id: &str, provider_type: &str) -> bool {
     state
         .admin_key_store
-        .list_admin_keys()
+        .get_admin_key(key_id)
         .await
         .ok()
-        .and_then(|keys| {
-            keys.into_iter()
-                .find(|key| key.id == key_id && key.provider_type == provider_type)
-        })
-        .is_some()
+        .flatten()
+        .is_some_and(|key| key.provider_type == provider_type)
 }
 
 async fn admin_key_provider(state: &HttpState, key_id: &str) -> anyhow::Result<Option<String>> {
     Ok(state
         .admin_key_store
-        .list_admin_keys()
+        .get_admin_key(key_id)
         .await?
-        .into_iter()
-        .find(|key| key.id == key_id)
         .map(|key| key.provider_type))
 }
 
@@ -3064,14 +3109,15 @@ async fn delete_account_group_for_provider(
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
     }
-    let keys = match state.admin_key_store.list_admin_keys().await {
-        Ok(keys) => keys,
+    let key = match state
+        .admin_key_store
+        .find_admin_key_referencing_account_group(provider_type, &group_id)
+        .await
+    {
+        Ok(key) => key,
         Err(_) => return internal_error("Failed to inspect gateway keys").into_response(),
     };
-    if let Some(key) = keys.iter().find(|key| {
-        key.provider_type == provider_type
-            && key.account_group_id.as_deref() == Some(group_id.as_str())
-    }) {
+    if let Some(key) = key {
         return bad_request(&format!("account group is still referenced by key `{}`", key.name))
             .into_response();
     }
@@ -3473,6 +3519,16 @@ fn now_ms() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
+}
+
+fn admin_page_request(query: AdminListQuery) -> core_store::AdminPageRequest {
+    core_store::AdminPageRequest {
+        limit: query
+            .limit
+            .unwrap_or(DEFAULT_ADMIN_LIST_LIMIT)
+            .clamp(1, MAX_ADMIN_LIST_LIMIT),
+        offset: query.offset.unwrap_or(0),
+    }
 }
 
 fn generate_id(prefix: &str) -> String {

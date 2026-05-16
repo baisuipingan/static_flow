@@ -554,6 +554,37 @@ pub struct AdminKey {
     pub uses_global_kiro_billable_model_multipliers: bool,
 }
 
+/// Offset pagination request shared by admin list endpoints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AdminPageRequest {
+    /// Maximum number of rows to return.
+    pub limit: usize,
+    /// Number of rows to skip.
+    pub offset: usize,
+}
+
+impl AdminPageRequest {
+    /// Return true when at least one row remains after this page.
+    pub fn has_more(self, returned: usize, total: usize) -> bool {
+        self.offset.saturating_add(returned) < total
+    }
+}
+
+/// Page of admin-managed API keys.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminKeysPage {
+    /// Page rows.
+    pub keys: Vec<AdminKey>,
+    /// Total rows matching the query before pagination.
+    pub total: usize,
+    /// Page limit.
+    pub limit: usize,
+    /// Page offset.
+    pub offset: usize,
+    /// Whether another page is available.
+    pub has_more: bool,
+}
+
 /// New admin key row after request validation and secret generation.
 #[derive(Debug, Clone, PartialEq)]
 pub struct NewAdminKey {
@@ -790,6 +821,21 @@ pub struct AdminCodexAccount {
     pub last_usage_success_at: Option<i64>,
     /// Last usage refresh error.
     pub usage_error_message: Option<String>,
+}
+
+/// Page of admin Codex accounts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminCodexAccountsPage {
+    /// Page rows.
+    pub accounts: Vec<AdminCodexAccount>,
+    /// Total rows matching the query before pagination.
+    pub total: usize,
+    /// Page limit.
+    pub limit: usize,
+    /// Page offset.
+    pub offset: usize,
+    /// Whether another page is available.
+    pub has_more: bool,
 }
 
 /// Minimal Codex account projection used by background status refresh.
@@ -1076,6 +1122,21 @@ pub struct AdminKiroAccount {
     pub balance: Option<AdminKiroBalanceView>,
     /// Cached status metadata.
     pub cache: AdminKiroCacheView,
+}
+
+/// Page of admin Kiro accounts.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+pub struct AdminKiroAccountsPage {
+    /// Page rows.
+    pub accounts: Vec<AdminKiroAccount>,
+    /// Total rows matching the query before pagination.
+    pub total: usize,
+    /// Page limit.
+    pub limit: usize,
+    /// Page offset.
+    pub offset: usize,
+    /// Whether another page is available.
+    pub has_more: bool,
 }
 
 /// New persisted Kiro account row.
@@ -1888,6 +1949,14 @@ pub trait ProviderRouteStore: Send + Sync {
         Ok(self.resolve_kiro_route(key).await?.into_iter().collect())
     }
 
+    /// Reload one active Kiro account route by account name.
+    async fn resolve_kiro_account_route(
+        &self,
+        _account_name: &str,
+    ) -> anyhow::Result<Option<ProviderKiroRoute>> {
+        Ok(None)
+    }
+
     /// Persist a refreshed Kiro credential snapshot.
     async fn save_kiro_auth_update(&self, update: ProviderKiroAuthUpdate) -> anyhow::Result<()>;
 
@@ -2033,6 +2102,23 @@ pub trait AdminKeyStore: Send + Sync {
     /// List all managed keys.
     async fn list_admin_keys(&self) -> anyhow::Result<Vec<AdminKey>>;
 
+    /// Load one managed key by id.
+    async fn get_admin_key(&self, key_id: &str) -> anyhow::Result<Option<AdminKey>>;
+
+    /// List one page of managed keys, optionally scoped to one provider.
+    async fn list_admin_keys_page(
+        &self,
+        provider_type: Option<&str>,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminKeysPage>;
+
+    /// Find one key that references an account group.
+    async fn find_admin_key_referencing_account_group(
+        &self,
+        provider_type: &str,
+        group_id: &str,
+    ) -> anyhow::Result<Option<AdminKey>>;
+
     /// Create one managed key.
     async fn create_admin_key(&self, key: NewAdminKey) -> anyhow::Result<AdminKey>;
 
@@ -2128,6 +2214,12 @@ pub trait AdminProxyStore: Send + Sync {
 pub trait AdminCodexAccountStore: Send + Sync {
     /// List all imported Codex accounts.
     async fn list_admin_codex_accounts(&self) -> anyhow::Result<Vec<AdminCodexAccount>>;
+
+    /// List one page of imported Codex accounts.
+    async fn list_admin_codex_accounts_page(
+        &self,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminCodexAccountsPage>;
 
     /// List the minimal Codex account fields needed by background status
     /// refresh.
@@ -2233,6 +2325,12 @@ pub trait AdminCodexAccountStore: Send + Sync {
 pub trait AdminKiroAccountStore: Send + Sync {
     /// List all persisted Kiro accounts with cached status information.
     async fn list_admin_kiro_accounts(&self) -> anyhow::Result<Vec<AdminKiroAccount>>;
+
+    /// List one page of persisted Kiro accounts.
+    async fn list_admin_kiro_accounts_page(
+        &self,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminKiroAccountsPage>;
 
     /// List the minimal Kiro account fields needed by background status
     /// refresh.
@@ -2589,6 +2687,32 @@ impl AdminKeyStore for EmptyAdminKeyStore {
         Ok(Vec::new())
     }
 
+    async fn get_admin_key(&self, _key_id: &str) -> anyhow::Result<Option<AdminKey>> {
+        Ok(None)
+    }
+
+    async fn list_admin_keys_page(
+        &self,
+        _provider_type: Option<&str>,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminKeysPage> {
+        Ok(AdminKeysPage {
+            keys: Vec::new(),
+            total: 0,
+            limit: page.limit,
+            offset: page.offset,
+            has_more: false,
+        })
+    }
+
+    async fn find_admin_key_referencing_account_group(
+        &self,
+        _provider_type: &str,
+        _group_id: &str,
+    ) -> anyhow::Result<Option<AdminKey>> {
+        Ok(None)
+    }
+
     async fn create_admin_key(&self, key: NewAdminKey) -> anyhow::Result<AdminKey> {
         Ok(AdminKey {
             id: key.id,
@@ -2766,6 +2890,19 @@ impl AdminCodexAccountStore for EmptyAdminCodexAccountStore {
         Ok(Vec::new())
     }
 
+    async fn list_admin_codex_accounts_page(
+        &self,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminCodexAccountsPage> {
+        Ok(AdminCodexAccountsPage {
+            accounts: Vec::new(),
+            total: 0,
+            limit: page.limit,
+            offset: page.offset,
+            has_more: false,
+        })
+    }
+
     async fn list_codex_status_refresh_targets(
         &self,
     ) -> anyhow::Result<Vec<CodexStatusRefreshTarget>> {
@@ -2941,6 +3078,19 @@ impl AdminCodexAccountStore for EmptyAdminCodexAccountStore {
 impl AdminKiroAccountStore for EmptyAdminKiroAccountStore {
     async fn list_admin_kiro_accounts(&self) -> anyhow::Result<Vec<AdminKiroAccount>> {
         Ok(Vec::new())
+    }
+
+    async fn list_admin_kiro_accounts_page(
+        &self,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminKiroAccountsPage> {
+        Ok(AdminKiroAccountsPage {
+            accounts: Vec::new(),
+            total: 0,
+            limit: page.limit,
+            offset: page.offset,
+            has_more: false,
+        })
     }
 
     async fn list_kiro_status_refresh_targets(

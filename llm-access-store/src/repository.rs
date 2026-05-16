@@ -8,21 +8,22 @@ use llm_access_core::{
     store::{
         AdminAccountContributionRequest, AdminAccountContributionRequestsPage, AdminAccountGroup,
         AdminAccountGroupPatch, AdminAccountGroupStore, AdminCodexAccount, AdminCodexAccountPatch,
-        AdminCodexAccountStore, AdminCodexImportJobDetail, AdminCodexImportJobItemResult,
-        AdminCodexImportJobSummary, AdminConfigStore, AdminKey, AdminKeyPatch, AdminKeyStore,
-        AdminKiroAccount, AdminKiroAccountPatch, AdminKiroAccountStore, AdminKiroBalanceView,
-        AdminKiroStatusCacheUpdate, AdminProxyBinding, AdminProxyConfig, AdminProxyConfigPatch,
-        AdminProxyStore, AdminReviewQueueAction, AdminReviewQueueQuery, AdminReviewQueueStore,
-        AdminRuntimeConfig, AdminSponsorRequest, AdminSponsorRequestsPage, AdminTokenRequest,
-        AdminTokenRequestsPage, AuthenticatedKey, CodexRateLimitStatus, CodexStatusRefreshTarget,
-        ControlStore, KiroStatusRefreshTarget, NewAdminAccountGroup, NewAdminCodexAccount,
-        NewAdminCodexImportJob, NewAdminKey, NewAdminKiroAccount, NewAdminProxyConfig,
-        NewPublicAccountContributionRequest, NewPublicSponsorRequest, NewPublicTokenRequest,
-        ProviderCodexAuthUpdate, ProviderCodexRoute, ProviderKiroAuthUpdate, ProviderKiroRoute,
-        ProviderRouteStore, PublicAccessKey, PublicAccessStore, PublicAccountContribution,
-        PublicCommunityStore, PublicSponsor, PublicStatusStore, PublicSubmissionStore,
-        PublicUsageLookupKey, PublicUsageStore, UsageEventSink, DEFAULT_AUTH_CACHE_TTL_SECONDS,
-        DEFAULT_CODEX_STATUS_REFRESH_SECONDS,
+        AdminCodexAccountStore, AdminCodexAccountsPage, AdminCodexImportJobDetail,
+        AdminCodexImportJobItemResult, AdminCodexImportJobSummary, AdminConfigStore, AdminKey,
+        AdminKeyPatch, AdminKeyStore, AdminKeysPage, AdminKiroAccount, AdminKiroAccountPatch,
+        AdminKiroAccountStore, AdminKiroAccountsPage, AdminKiroBalanceView,
+        AdminKiroStatusCacheUpdate, AdminPageRequest, AdminProxyBinding, AdminProxyConfig,
+        AdminProxyConfigPatch, AdminProxyStore, AdminReviewQueueAction, AdminReviewQueueQuery,
+        AdminReviewQueueStore, AdminRuntimeConfig, AdminSponsorRequest, AdminSponsorRequestsPage,
+        AdminTokenRequest, AdminTokenRequestsPage, AuthenticatedKey, CodexRateLimitStatus,
+        CodexStatusRefreshTarget, ControlStore, KiroStatusRefreshTarget, NewAdminAccountGroup,
+        NewAdminCodexAccount, NewAdminCodexImportJob, NewAdminKey, NewAdminKiroAccount,
+        NewAdminProxyConfig, NewPublicAccountContributionRequest, NewPublicSponsorRequest,
+        NewPublicTokenRequest, ProviderCodexAuthUpdate, ProviderCodexRoute, ProviderKiroAuthUpdate,
+        ProviderKiroRoute, ProviderRouteStore, PublicAccessKey, PublicAccessStore,
+        PublicAccountContribution, PublicCommunityStore, PublicSponsor, PublicStatusStore,
+        PublicSubmissionStore, PublicUsageLookupKey, PublicUsageStore, UsageEventSink,
+        DEFAULT_AUTH_CACHE_TTL_SECONDS, DEFAULT_CODEX_STATUS_REFRESH_SECONDS,
     },
     usage::UsageEvent,
 };
@@ -130,6 +131,54 @@ impl AdminKeyStore for SqliteControlRepository {
         })
         .await
         .context("sqlite control repository admin key list task failed")?
+    }
+
+    async fn get_admin_key(&self, key_id: &str) -> anyhow::Result<Option<AdminKey>> {
+        let key_id = key_id.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.get_admin_key(&key_id)
+        })
+        .await
+        .context("sqlite control repository admin key get task failed")?
+    }
+
+    async fn list_admin_keys_page(
+        &self,
+        provider_type: Option<&str>,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminKeysPage> {
+        let provider_type = provider_type.map(str::to_string);
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.list_admin_keys_page(provider_type.as_deref(), page.limit, page.offset)
+        })
+        .await
+        .context("sqlite control repository admin key page task failed")?
+    }
+
+    async fn find_admin_key_referencing_account_group(
+        &self,
+        provider_type: &str,
+        group_id: &str,
+    ) -> anyhow::Result<Option<AdminKey>> {
+        let provider_type = provider_type.to_string();
+        let group_id = group_id.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.find_admin_key_referencing_account_group(&provider_type, &group_id)
+        })
+        .await
+        .context("sqlite control repository admin key group reference task failed")?
     }
 
     async fn create_admin_key(&self, key: NewAdminKey) -> anyhow::Result<AdminKey> {
@@ -376,6 +425,21 @@ impl AdminCodexAccountStore for SqliteControlRepository {
         })
         .await
         .context("sqlite control repository codex account list task failed")?
+    }
+
+    async fn list_admin_codex_accounts_page(
+        &self,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminCodexAccountsPage> {
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.list_admin_codex_accounts_page(page.limit, page.offset)
+        })
+        .await
+        .context("sqlite control repository codex account page task failed")?
     }
 
     async fn list_codex_status_refresh_targets(
@@ -637,6 +701,21 @@ impl AdminKiroAccountStore for SqliteControlRepository {
         .context("sqlite control repository kiro account list task failed")?
     }
 
+    async fn list_admin_kiro_accounts_page(
+        &self,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminKiroAccountsPage> {
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.list_admin_kiro_accounts_page(page.limit, page.offset)
+        })
+        .await
+        .context("sqlite control repository kiro account page task failed")?
+    }
+
     async fn list_kiro_status_refresh_targets(
         &self,
     ) -> anyhow::Result<Vec<KiroStatusRefreshTarget>> {
@@ -872,6 +951,22 @@ impl ProviderRouteStore for SqliteControlRepository {
         })
         .await
         .context("sqlite control repository provider kiro route candidates task failed")?
+    }
+
+    async fn resolve_kiro_account_route(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<Option<ProviderKiroRoute>> {
+        let account_name = account_name.to_string();
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.resolve_admin_kiro_account_route(&account_name)
+        })
+        .await
+        .context("sqlite control repository provider kiro account route task failed")?
     }
 
     async fn save_kiro_auth_update(&self, update: ProviderKiroAuthUpdate) -> anyhow::Result<()> {

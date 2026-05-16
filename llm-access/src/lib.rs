@@ -1976,6 +1976,10 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(value["auth_cache_ttl_seconds"], 60);
         assert_eq!(value["keys"].as_array().expect("keys array").len(), 0);
+        assert_eq!(value["total"], 0);
+        assert_eq!(value["limit"], 50);
+        assert_eq!(value["offset"], 0);
+        assert_eq!(value["has_more"], false);
     }
 
     #[tokio::test]
@@ -2336,6 +2340,10 @@ mod tests {
             .expect("body");
         let value: serde_json::Value = serde_json::from_slice(&body).expect("json body");
         assert_eq!(value["accounts"].as_array().expect("accounts array").len(), 0);
+        assert_eq!(value["total"], 0);
+        assert_eq!(value["limit"], 50);
+        assert_eq!(value["offset"], 0);
+        assert_eq!(value["has_more"], false);
     }
 
     #[tokio::test]

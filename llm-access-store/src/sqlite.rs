@@ -8,18 +8,19 @@ use llm_access_core::{
     store::{
         self as core_store, AdminAccountContributionRequest, AdminAccountContributionRequestsPage,
         AdminAccountGroup, AdminAccountGroupPatch, AdminCodexAccount, AdminCodexAccountPatch,
-        AdminCodexImportJobDetail, AdminCodexImportJobItem, AdminCodexImportJobItemResult,
-        AdminCodexImportJobSummary, AdminKey, AdminKeyPatch, AdminKiroAccount,
-        AdminKiroAccountPatch, AdminKiroBalanceView, AdminKiroCacheView,
-        AdminKiroStatusCacheUpdate, AdminLegacyKiroProxyMigration, AdminProxyBinding,
-        AdminProxyConfig, AdminProxyConfigPatch, AdminReviewQueueAction, AdminReviewQueueQuery,
-        AdminRuntimeConfig, AdminSponsorRequest, AdminSponsorRequestsPage, AdminTokenRequest,
-        AdminTokenRequestsPage, AuthenticatedKey, CodexRateLimitStatus, CodexStatusRefreshTarget,
-        KiroStatusRefreshTarget, NewAdminAccountGroup, NewAdminCodexAccount,
-        NewAdminCodexImportJob, NewAdminKey, NewAdminKiroAccount, NewAdminProxyConfig,
-        NewPublicAccountContributionRequest, NewPublicSponsorRequest, NewPublicTokenRequest,
-        ProviderCodexAuthUpdate, ProviderCodexRoute, ProviderKiroAuthUpdate, ProviderProxyConfig,
-        PublicAccessKey, PublicAccountContribution, PublicSponsor, PublicUsageLookupKey,
+        AdminCodexAccountsPage, AdminCodexImportJobDetail, AdminCodexImportJobItem,
+        AdminCodexImportJobItemResult, AdminCodexImportJobSummary, AdminKey, AdminKeyPatch,
+        AdminKeysPage, AdminKiroAccount, AdminKiroAccountPatch, AdminKiroAccountsPage,
+        AdminKiroBalanceView, AdminKiroCacheView, AdminKiroStatusCacheUpdate,
+        AdminLegacyKiroProxyMigration, AdminProxyBinding, AdminProxyConfig, AdminProxyConfigPatch,
+        AdminReviewQueueAction, AdminReviewQueueQuery, AdminRuntimeConfig, AdminSponsorRequest,
+        AdminSponsorRequestsPage, AdminTokenRequest, AdminTokenRequestsPage, AuthenticatedKey,
+        CodexRateLimitStatus, CodexStatusRefreshTarget, KiroStatusRefreshTarget,
+        NewAdminAccountGroup, NewAdminCodexAccount, NewAdminCodexImportJob, NewAdminKey,
+        NewAdminKiroAccount, NewAdminProxyConfig, NewPublicAccountContributionRequest,
+        NewPublicSponsorRequest, NewPublicTokenRequest, ProviderCodexAuthUpdate,
+        ProviderCodexRoute, ProviderKiroAuthUpdate, ProviderProxyConfig, PublicAccessKey,
+        PublicAccountContribution, PublicSponsor, PublicUsageLookupKey,
         PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED,
         PUBLIC_SPONSOR_REQUEST_STATUS_PAYMENT_EMAIL_SENT, PUBLIC_SPONSOR_REQUEST_STATUS_SUBMITTED,
         PUBLIC_TOKEN_REQUEST_STATUS_PENDING,
@@ -568,6 +569,110 @@ impl SqliteControlStore {
             .collect::<Result<Vec<_>, _>>()
             .context("collect admin key list")?;
         Ok(keys)
+    }
+
+    /// Load one admin-visible key row with route config and usage rollup.
+    pub fn get_admin_key(&self, key_id: &str) -> anyhow::Result<Option<AdminKey>> {
+        self.get_key(key_id)
+            .map(|bundle| bundle.map(|bundle| admin_key_from_bundle(&bundle)))
+    }
+
+    /// List one admin key page with optional provider filtering.
+    pub fn list_admin_keys_page(
+        &self,
+        provider_type: Option<&str>,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<AdminKeysPage> {
+        let limit = limit.max(1);
+        let total = self
+            .conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM llm_keys k
+                 JOIN llm_key_route_config r ON r.key_id = k.key_id
+                 JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 WHERE (?1 IS NULL OR k.provider_type = ?1)",
+                [provider_type],
+                |row| row.get::<_, i64>(0),
+            )
+            .context("count admin key page")?
+            .max(0) as usize;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT
+                    k.key_id, k.name, k.secret, k.key_hash, k.status, k.provider_type,
+                    k.protocol_family, k.public_visible, k.quota_billable_limit,
+                    k.created_at_ms, k.updated_at_ms,
+                    r.route_strategy, r.fixed_account_name, r.auto_account_names_json,
+                    r.account_group_id, r.model_name_map_json,
+                    r.request_max_concurrency, r.request_min_start_interval_ms,
+                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
+                    r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.kiro_cache_policy_override_json,
+                    r.kiro_billable_model_multipliers_override_json,
+                    u.input_uncached_tokens, u.input_cached_tokens, u.output_tokens,
+                    u.billable_tokens, u.credit_total, u.credit_missing_events,
+                    u.last_used_at_ms, u.updated_at_ms
+                 FROM llm_keys k
+                 JOIN llm_key_route_config r ON r.key_id = k.key_id
+                 JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 WHERE (?1 IS NULL OR k.provider_type = ?1)
+                 ORDER BY k.created_at_ms DESC, k.key_id DESC
+                 LIMIT ?2 OFFSET ?3",
+            )
+            .context("prepare admin key page")?;
+        let keys = stmt
+            .query_map(params![provider_type, limit as i64, offset as i64], decode_key_bundle)
+            .context("query admin key page")?
+            .map(|row| row.map(|bundle| admin_key_from_bundle(&bundle)))
+            .collect::<Result<Vec<_>, _>>()
+            .context("collect admin key page")?;
+        Ok(AdminKeysPage {
+            has_more: offset.saturating_add(keys.len()) < total,
+            keys,
+            total,
+            limit,
+            offset,
+        })
+    }
+
+    /// Find one key that still references an account group.
+    pub fn find_admin_key_referencing_account_group(
+        &self,
+        provider_type: &str,
+        group_id: &str,
+    ) -> anyhow::Result<Option<AdminKey>> {
+        self.conn
+            .query_row(
+                "SELECT
+                    k.key_id, k.name, k.secret, k.key_hash, k.status, k.provider_type,
+                    k.protocol_family, k.public_visible, k.quota_billable_limit,
+                    k.created_at_ms, k.updated_at_ms,
+                    r.route_strategy, r.fixed_account_name, r.auto_account_names_json,
+                    r.account_group_id, r.model_name_map_json,
+                    r.request_max_concurrency, r.request_min_start_interval_ms,
+                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
+                    r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.kiro_cache_policy_override_json,
+                    r.kiro_billable_model_multipliers_override_json,
+                    u.input_uncached_tokens, u.input_cached_tokens, u.output_tokens,
+                    u.billable_tokens, u.credit_total, u.credit_missing_events,
+                    u.last_used_at_ms, u.updated_at_ms
+                 FROM llm_keys k
+                 JOIN llm_key_route_config r ON r.key_id = k.key_id
+                 JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 WHERE k.provider_type = ?1 AND r.account_group_id = ?2
+                 ORDER BY k.created_at_ms DESC, k.key_id DESC
+                 LIMIT 1",
+                params![provider_type, group_id],
+                decode_key_bundle,
+            )
+            .optional()
+            .context("find admin key referencing account group")?
+            .map(|bundle| Ok(admin_key_from_bundle(&bundle)))
+            .transpose()
     }
 
     /// Create one admin-managed provider key.
@@ -1624,6 +1729,47 @@ impl SqliteControlStore {
             .collect()
     }
 
+    /// List one imported Codex account page for the admin UI.
+    pub fn list_admin_codex_accounts_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<AdminCodexAccountsPage> {
+        let limit = limit.max(1);
+        let total = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM llm_codex_accounts", [], |row| row.get::<_, i64>(0))
+            .context("count admin codex account page")?
+            .max(0) as usize;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT
+                    account_name, account_id, email, status, auth_json, settings_json,
+                    last_refresh_at_ms, last_error, created_at_ms, updated_at_ms
+                 FROM llm_codex_accounts
+                 ORDER BY account_name
+                 LIMIT ?1 OFFSET ?2",
+            )
+            .context("prepare admin codex account page")?;
+        let records = stmt
+            .query_map(params![limit as i64, offset as i64], decode_codex_account)?
+            .collect::<Result<Vec<_>, _>>()
+            .context("list admin codex account page")?;
+        let context = self.load_codex_admin_account_view_context()?;
+        let accounts = records
+            .iter()
+            .map(|record| self.admin_codex_account_from_record_with_context(record, &context))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(AdminCodexAccountsPage {
+            has_more: offset.saturating_add(accounts.len()) < total,
+            accounts,
+            total,
+            limit,
+            offset,
+        })
+    }
+
     /// List only the Codex fields needed by background status refresh.
     pub fn list_codex_status_refresh_targets(
         &self,
@@ -2270,6 +2416,49 @@ impl SqliteControlStore {
             .iter()
             .map(|record| self.admin_kiro_account_from_record_with_context(record, &context))
             .collect()
+    }
+
+    /// List one persisted Kiro account page for the admin UI.
+    pub fn list_admin_kiro_accounts_page(
+        &self,
+        limit: usize,
+        offset: usize,
+    ) -> anyhow::Result<AdminKiroAccountsPage> {
+        let limit = limit.max(1);
+        let total = self
+            .conn
+            .query_row("SELECT COUNT(*) FROM llm_kiro_accounts", [], |row| row.get::<_, i64>(0))
+            .context("count admin kiro account page")?
+            .max(0) as usize;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT
+                    account_name, auth_method, account_id, profile_arn, user_id,
+                    status, auth_json, max_concurrency, min_start_interval_ms,
+                    proxy_config_id, last_refresh_at_ms, last_error, created_at_ms,
+                    updated_at_ms
+                 FROM llm_kiro_accounts
+                 ORDER BY account_name
+                 LIMIT ?1 OFFSET ?2",
+            )
+            .context("prepare admin kiro account page")?;
+        let records = stmt
+            .query_map(params![limit as i64, offset as i64], decode_kiro_account)?
+            .collect::<Result<Vec<_>, _>>()
+            .context("list admin kiro account page")?;
+        let context = self.load_kiro_admin_account_view_context()?;
+        let accounts = records
+            .iter()
+            .map(|record| self.admin_kiro_account_from_record_with_context(record, &context))
+            .collect::<anyhow::Result<Vec<_>>>()?;
+        Ok(AdminKiroAccountsPage {
+            has_more: offset.saturating_add(accounts.len()) < total,
+            accounts,
+            total,
+            limit,
+            offset,
+        })
     }
 
     /// List only the Kiro fields needed by background status refresh.
@@ -5629,6 +5818,92 @@ mod tests {
         assert_eq!(loaded.key.key_id, "key-by-hash");
         assert_eq!(loaded.route.fixed_account_name.as_deref(), Some("account-a"));
         assert_eq!(loaded.rollup.billable_tokens, 4);
+    }
+
+    #[test]
+    fn key_repository_pages_admin_keys_and_finds_group_references() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlStore::new(conn);
+
+        for (index, provider, group_id) in
+            [(0, "codex", Some("codex-group")), (1, "codex", None), (2, "kiro", Some("kiro-group"))]
+        {
+            let key_id = format!("key-{index}");
+            repo.upsert_key_bundle(
+                &super::KeyRecord {
+                    key_id: key_id.clone(),
+                    name: format!("key {index}"),
+                    secret: format!("sk-{index}"),
+                    key_hash: format!("hash-{index}"),
+                    status: "active".to_string(),
+                    provider_type: provider.to_string(),
+                    protocol_family: if provider == "kiro" { "anthropic" } else { "openai" }
+                        .to_string(),
+                    public_visible: false,
+                    quota_billable_limit: 1000,
+                    created_at_ms: 10 + index,
+                    updated_at_ms: 20 + index,
+                },
+                &super::KeyRouteConfig {
+                    key_id: key_id.clone(),
+                    route_strategy: Some("auto".to_string()),
+                    fixed_account_name: None,
+                    auto_account_names_json: None,
+                    account_group_id: group_id.map(str::to_string),
+                    model_name_map_json: None,
+                    request_max_concurrency: None,
+                    request_min_start_interval_ms: None,
+                    kiro_request_validation_enabled: true,
+                    kiro_cache_estimation_enabled: true,
+                    kiro_zero_cache_debug_enabled: false,
+                    kiro_full_request_logging_enabled: false,
+                    kiro_cache_policy_override_json: None,
+                    kiro_billable_model_multipliers_override_json: None,
+                },
+                &super::KeyUsageRollup {
+                    key_id,
+                    input_uncached_tokens: 0,
+                    input_cached_tokens: 0,
+                    output_tokens: 0,
+                    billable_tokens: 0,
+                    credit_total: 0.0,
+                    credit_missing_events: 0,
+                    last_used_at_ms: None,
+                    updated_at_ms: 20 + index,
+                },
+            )
+            .expect("upsert key");
+        }
+
+        let page = repo
+            .list_admin_keys_page(None, 1, 1)
+            .expect("page admin keys");
+        assert_eq!(page.total, 3);
+        assert_eq!(page.keys.len(), 1);
+        assert_eq!(page.limit, 1);
+        assert_eq!(page.offset, 1);
+        assert!(page.has_more);
+
+        let codex_page = repo
+            .list_admin_keys_page(Some("codex"), 10, 0)
+            .expect("page codex admin keys");
+        assert_eq!(codex_page.total, 2);
+        assert!(codex_page
+            .keys
+            .iter()
+            .all(|key| key.provider_type == "codex"));
+
+        let referenced = repo
+            .find_admin_key_referencing_account_group("kiro", "kiro-group")
+            .expect("find group reference")
+            .expect("referencing key");
+        assert_eq!(referenced.provider_type, "kiro");
+        assert_eq!(referenced.account_group_id.as_deref(), Some("kiro-group"));
+        assert!(repo
+            .find_admin_key_referencing_account_group("codex", "kiro-group")
+            .expect("find absent reference")
+            .is_none());
     }
 
     #[test]
