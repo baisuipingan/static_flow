@@ -51,11 +51,11 @@ pub fn set_media_metadata(title: &str, artist: &str, album: &str, cover_url: &st
 
     // new MediaMetadata(init)
     if let Ok(ctor) = js_sys::Reflect::get(&js_sys::global(), &"MediaMetadata".into()) {
-        if let Ok(metadata) = js_sys::Reflect::construct(ctor.unchecked_ref(), &{
-            let args = js_sys::Array::new();
-            args.push(&init);
-            args
-        }) {
+        let args = js_sys::Array::new();
+        args.push(&init);
+        if let Ok(metadata) =
+            js_sys::Reflect::construct::<fn() -> JsValue>(ctor.unchecked_ref(), &args)
+        {
             let _ = js_sys::Reflect::set(&ms, &"metadata".into(), &metadata);
         }
     }
