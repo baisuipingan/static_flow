@@ -17,15 +17,16 @@ use llm_access_core::{
         AdminProxyBinding, AdminProxyConfig, AdminProxyConfigPatch, AdminProxyStore,
         AdminReviewQueueAction, AdminReviewQueueQuery, AdminReviewQueueStore, AdminRuntimeConfig,
         AdminSponsorRequest, AdminSponsorRequestsPage, AdminTokenRequest, AdminTokenRequestsPage,
-        AuthenticatedKey, CodexPublicAccountStatus, CodexRateLimitStatus, ControlStore,
-        NewAdminAccountGroup, NewAdminCodexAccount, NewAdminCodexImportJob, NewAdminKey,
-        NewAdminKiroAccount, NewAdminProxyConfig, NewPublicAccountContributionRequest,
-        NewPublicSponsorRequest, NewPublicTokenRequest, ProviderCodexAuthUpdate,
-        ProviderCodexRoute, ProviderKiroAuthUpdate, ProviderKiroRoute, ProviderProxyConfig,
-        ProviderRouteStore, PublicAccessKey, PublicAccessStore, PublicAccountContribution,
-        PublicCommunityStore, PublicSponsor, PublicStatusStore, PublicSubmissionStore,
-        PublicUsageLookupKey, PublicUsageStore, UsageEventSink, DEFAULT_AUTH_CACHE_TTL_SECONDS,
-        DEFAULT_CODEX_STATUS_REFRESH_SECONDS, PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED,
+        AuthenticatedKey, CodexPublicAccountStatus, CodexRateLimitStatus, CodexStatusRefreshTarget,
+        ControlStore, KiroStatusRefreshTarget, NewAdminAccountGroup, NewAdminCodexAccount,
+        NewAdminCodexImportJob, NewAdminKey, NewAdminKiroAccount, NewAdminProxyConfig,
+        NewPublicAccountContributionRequest, NewPublicSponsorRequest, NewPublicTokenRequest,
+        ProviderCodexAuthUpdate, ProviderCodexRoute, ProviderKiroAuthUpdate, ProviderKiroRoute,
+        ProviderProxyConfig, ProviderRouteStore, PublicAccessKey, PublicAccessStore,
+        PublicAccountContribution, PublicCommunityStore, PublicSponsor, PublicStatusStore,
+        PublicSubmissionStore, PublicUsageLookupKey, PublicUsageStore, UsageEventSink,
+        DEFAULT_AUTH_CACHE_TTL_SECONDS, DEFAULT_CODEX_STATUS_REFRESH_SECONDS,
+        PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED,
         PUBLIC_SPONSOR_REQUEST_STATUS_PAYMENT_EMAIL_SENT, PUBLIC_SPONSOR_REQUEST_STATUS_SUBMITTED,
         PUBLIC_TOKEN_REQUEST_STATUS_PENDING,
     },
@@ -3182,6 +3183,29 @@ impl AdminCodexAccountStore for PostgresControlRepository {
             .collect()
     }
 
+    async fn list_codex_status_refresh_targets(
+        &self,
+    ) -> anyhow::Result<Vec<CodexStatusRefreshTarget>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT account_name, status
+                 FROM llm_codex_accounts
+                 ORDER BY account_name",
+                &[],
+            )
+            .await
+            .context("list postgres codex status refresh targets")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| CodexStatusRefreshTarget {
+                name: row.get(0),
+                status: row.get(1),
+            })
+            .collect())
+    }
+
     async fn get_admin_codex_account(
         &self,
         name: &str,
@@ -3636,6 +3660,56 @@ impl AdminKiroAccountStore for PostgresControlRepository {
             .iter()
             .map(|record| self.admin_kiro_account_from_record_with_context(record, &context))
             .collect()
+    }
+
+    async fn list_kiro_status_refresh_targets(
+        &self,
+    ) -> anyhow::Result<Vec<KiroStatusRefreshTarget>> {
+        self.ensure_connection_alive()?;
+        let refresh_interval_seconds = self
+            .load_runtime_config_record()
+            .await?
+            .map(|config| config.kiro_status_refresh_max_interval_seconds.max(0) as u64)
+            .unwrap_or(core_store::DEFAULT_KIRO_STATUS_REFRESH_MAX_INTERVAL_SECONDS);
+        let default_cache = AdminKiroCacheView {
+            refresh_interval_seconds,
+            ..AdminKiroCacheView::default()
+        };
+        let mut status_by_account = self.list_kiro_cached_status_parts_rows().await?;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    account_name,
+                    status,
+                    CASE
+                        WHEN jsonb_typeof(auth_json -> 'disabled') = 'boolean'
+                        THEN (auth_json ->> 'disabled')::boolean
+                        ELSE false
+                    END
+                 FROM llm_kiro_accounts
+                 ORDER BY account_name",
+                &[],
+            )
+            .await
+            .context("list postgres kiro status refresh targets")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                let name: String = row.get(0);
+                let status: String = row.get(1);
+                let disabled_json: bool = row.get(2);
+                let cache = status_by_account
+                    .remove(&name)
+                    .map(|(_, cache)| cache)
+                    .unwrap_or_else(|| default_cache.clone());
+                KiroStatusRefreshTarget {
+                    name,
+                    disabled: disabled_json || status != core_store::KEY_STATUS_ACTIVE,
+                    cache,
+                }
+            })
+            .collect())
     }
 
     async fn create_admin_kiro_account(

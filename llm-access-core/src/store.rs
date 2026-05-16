@@ -792,6 +792,15 @@ pub struct AdminCodexAccount {
     pub usage_error_message: Option<String>,
 }
 
+/// Minimal Codex account projection used by background status refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CodexStatusRefreshTarget {
+    /// Account display name.
+    pub name: String,
+    /// Runtime status.
+    pub status: String,
+}
+
 /// New imported Codex account row.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NewAdminCodexAccount {
@@ -1130,6 +1139,17 @@ pub struct AdminKiroStatusCacheUpdate {
     pub expires_at_ms: i64,
     /// Last refresh error.
     pub last_error: Option<String>,
+}
+
+/// Minimal Kiro account projection used by background status refresh.
+#[derive(Debug, Clone, PartialEq)]
+pub struct KiroStatusRefreshTarget {
+    /// Account display name.
+    pub name: String,
+    /// Whether refresh should be skipped and persisted as disabled.
+    pub disabled: bool,
+    /// Cached status metadata used when preserving disabled state.
+    pub cache: AdminKiroCacheView,
 }
 
 /// Key state used on the hot request path.
@@ -2109,6 +2129,12 @@ pub trait AdminCodexAccountStore: Send + Sync {
     /// List all imported Codex accounts.
     async fn list_admin_codex_accounts(&self) -> anyhow::Result<Vec<AdminCodexAccount>>;
 
+    /// List the minimal Codex account fields needed by background status
+    /// refresh.
+    async fn list_codex_status_refresh_targets(
+        &self,
+    ) -> anyhow::Result<Vec<CodexStatusRefreshTarget>>;
+
     /// Get one imported Codex account by name.
     async fn get_admin_codex_account(
         &self,
@@ -2207,6 +2233,12 @@ pub trait AdminCodexAccountStore: Send + Sync {
 pub trait AdminKiroAccountStore: Send + Sync {
     /// List all persisted Kiro accounts with cached status information.
     async fn list_admin_kiro_accounts(&self) -> anyhow::Result<Vec<AdminKiroAccount>>;
+
+    /// List the minimal Kiro account fields needed by background status
+    /// refresh.
+    async fn list_kiro_status_refresh_targets(
+        &self,
+    ) -> anyhow::Result<Vec<KiroStatusRefreshTarget>>;
 
     /// Create or replace one Kiro account.
     async fn create_admin_kiro_account(
@@ -2734,6 +2766,12 @@ impl AdminCodexAccountStore for EmptyAdminCodexAccountStore {
         Ok(Vec::new())
     }
 
+    async fn list_codex_status_refresh_targets(
+        &self,
+    ) -> anyhow::Result<Vec<CodexStatusRefreshTarget>> {
+        Ok(Vec::new())
+    }
+
     async fn get_admin_codex_account(
         &self,
         _name: &str,
@@ -2902,6 +2940,12 @@ impl AdminCodexAccountStore for EmptyAdminCodexAccountStore {
 #[async_trait]
 impl AdminKiroAccountStore for EmptyAdminKiroAccountStore {
     async fn list_admin_kiro_accounts(&self) -> anyhow::Result<Vec<AdminKiroAccount>> {
+        Ok(Vec::new())
+    }
+
+    async fn list_kiro_status_refresh_targets(
+        &self,
+    ) -> anyhow::Result<Vec<KiroStatusRefreshTarget>> {
         Ok(Vec::new())
     }
 

@@ -6,8 +6,8 @@ use anyhow::Context;
 use llm_access_core::store::{
     is_terminal_codex_auth_error, AdminCodexAccount, AdminCodexAccountStore, AdminConfigStore,
     AdminRuntimeConfig, CodexCredits, CodexPublicAccountStatus, CodexRateLimitBucket,
-    CodexRateLimitStatus, CodexRateLimitWindow, ProviderCodexRoute, ProviderRouteStore,
-    PublicStatusStore, KEY_STATUS_ACTIVE,
+    CodexRateLimitStatus, CodexRateLimitWindow, CodexStatusRefreshTarget, ProviderCodexRoute,
+    ProviderRouteStore, PublicStatusStore, KEY_STATUS_ACTIVE,
 };
 use rand::Rng;
 use serde::Deserialize;
@@ -71,6 +71,66 @@ enum UsageBalanceValue {
     Integer(i64),
 }
 
+trait CodexStatusAccount {
+    fn name(&self) -> &str;
+    fn status(&self) -> &str;
+    fn plan_type(&self) -> Option<&str> {
+        None
+    }
+    fn primary_remaining_percent(&self) -> Option<f64> {
+        None
+    }
+    fn secondary_remaining_percent(&self) -> Option<f64> {
+        None
+    }
+    fn last_usage_success_at(&self) -> Option<i64> {
+        None
+    }
+    fn usage_error_message(&self) -> Option<&str> {
+        None
+    }
+}
+
+impl CodexStatusAccount for AdminCodexAccount {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn status(&self) -> &str {
+        &self.status
+    }
+
+    fn plan_type(&self) -> Option<&str> {
+        self.plan_type.as_deref()
+    }
+
+    fn primary_remaining_percent(&self) -> Option<f64> {
+        self.primary_remaining_percent
+    }
+
+    fn secondary_remaining_percent(&self) -> Option<f64> {
+        self.secondary_remaining_percent
+    }
+
+    fn last_usage_success_at(&self) -> Option<i64> {
+        self.last_usage_success_at
+    }
+
+    fn usage_error_message(&self) -> Option<&str> {
+        self.usage_error_message.as_deref()
+    }
+}
+
+impl CodexStatusAccount for CodexStatusRefreshTarget {
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn status(&self) -> &str {
+        &self.status
+    }
+}
+
 /// Start Codex public status warmup and periodic refresh for `/llm-access`.
 pub(crate) fn spawn_codex_status_refresher(runtime: &LlmAccessRuntime) {
     let config_store = runtime.admin_config_store();
@@ -122,9 +182,9 @@ async fn refresh_codex_status(
         .await
         .context("load Codex status refresh config")?;
     let accounts = account_store
-        .list_admin_codex_accounts()
+        .list_codex_status_refresh_targets()
         .await
-        .context("list Codex accounts for status refresh")?;
+        .context("list Codex status refresh targets")?;
     let source_url = compute_usage_url(&provider::codex_upstream_base_url());
     let existing = status_store.codex_rate_limit_status().await.ok();
     let mut refreshed = seed_full_refresh_statuses(&accounts, existing);
@@ -161,9 +221,9 @@ async fn refresh_codex_status(
         .await;
         refreshed[index] = merge_background_refresh_result(previous, next);
         let latest_accounts = account_store
-            .list_admin_codex_accounts()
+            .list_codex_status_refresh_targets()
             .await
-            .context("reload Codex accounts during status refresh")?;
+            .context("reload Codex status refresh targets during status refresh")?;
         let latest_snapshot = status_store.codex_rate_limit_status().await.ok();
         status_store
             .save_codex_rate_limit_status(build_background_refresh_snapshot(
@@ -332,8 +392,8 @@ async fn refresh_single_codex_account_status_with_mode(
     }
 }
 
-fn seed_full_refresh_statuses(
-    accounts: &[AdminCodexAccount],
+fn seed_full_refresh_statuses<A: CodexStatusAccount>(
+    accounts: &[A],
     existing: Option<CodexRateLimitStatus>,
 ) -> Vec<AccountStatusRefresh> {
     let Some(existing) = existing else {
@@ -359,16 +419,16 @@ fn seed_full_refresh_statuses(
     accounts
         .iter()
         .map(|account| {
-            if account.status != KEY_STATUS_ACTIVE {
+            if account.status() != KEY_STATUS_ACTIVE {
                 return initial_account_status(account);
             }
-            let Some(public_account) = existing_accounts.remove(&account.name) else {
+            let Some(public_account) = existing_accounts.remove(account.name()) else {
                 return initial_account_status(account);
             };
-            if public_account.status != account.status {
+            if public_account.status != account.status() {
                 return initial_account_status(account);
             }
-            let buckets = existing_buckets.remove(&account.name).unwrap_or_default();
+            let buckets = existing_buckets.remove(account.name()).unwrap_or_default();
             if !buckets.is_empty() {
                 AccountStatusRefresh::Ready {
                     account: public_account,
@@ -387,19 +447,19 @@ fn seed_full_refresh_statuses(
         .collect()
 }
 
-fn account_status_refresh_from_cached_snapshot(
-    account: &AdminCodexAccount,
+fn account_status_refresh_from_cached_snapshot<A: CodexStatusAccount>(
+    account: &A,
     existing_accounts: &mut BTreeMap<String, CodexPublicAccountStatus>,
     existing_buckets: &mut BTreeMap<String, Vec<CodexRateLimitBucket>>,
 ) -> Option<AccountStatusRefresh> {
-    if account.status != KEY_STATUS_ACTIVE {
+    if account.status() != KEY_STATUS_ACTIVE {
         return None;
     }
-    let public_account = existing_accounts.remove(&account.name)?;
-    if public_account.status != account.status {
+    let public_account = existing_accounts.remove(account.name())?;
+    if public_account.status != account.status() {
         return None;
     }
-    let buckets = existing_buckets.remove(&account.name).unwrap_or_default();
+    let buckets = existing_buckets.remove(account.name()).unwrap_or_default();
     if !buckets.is_empty() {
         Some(AccountStatusRefresh::Ready {
             account: public_account,
@@ -416,8 +476,8 @@ fn account_status_refresh_from_cached_snapshot(
     }
 }
 
-fn rebase_unprocessed_refresh_statuses(
-    accounts: &[AdminCodexAccount],
+fn rebase_unprocessed_refresh_statuses<A: CodexStatusAccount>(
+    accounts: &[A],
     mut refreshed: Vec<AccountStatusRefresh>,
     latest: Option<CodexRateLimitStatus>,
     processed_until: usize,
@@ -453,8 +513,8 @@ fn rebase_unprocessed_refresh_statuses(
     refreshed
 }
 
-fn initial_account_status(account: &AdminCodexAccount) -> AccountStatusRefresh {
-    if account.status == KEY_STATUS_ACTIVE {
+fn initial_account_status<A: CodexStatusAccount>(account: &A) -> AccountStatusRefresh {
+    if account.status() == KEY_STATUS_ACTIVE {
         AccountStatusRefresh::Error {
             account: account_error_status(
                 account,
@@ -465,43 +525,43 @@ fn initial_account_status(account: &AdminCodexAccount) -> AccountStatusRefresh {
     } else {
         AccountStatusRefresh::Skipped {
             account: CodexPublicAccountStatus {
-                name: account.name.clone(),
-                status: account.status.clone(),
-                plan_type: account.plan_type.clone(),
-                primary_remaining_percent: account.primary_remaining_percent,
-                secondary_remaining_percent: account.secondary_remaining_percent,
+                name: account.name().to_string(),
+                status: account.status().to_string(),
+                plan_type: account.plan_type().map(str::to_string),
+                primary_remaining_percent: account.primary_remaining_percent(),
+                secondary_remaining_percent: account.secondary_remaining_percent(),
                 last_usage_checked_at: None,
-                last_usage_success_at: account.last_usage_success_at,
-                usage_error_message: account.usage_error_message.clone(),
+                last_usage_success_at: account.last_usage_success_at(),
+                usage_error_message: account.usage_error_message().map(str::to_string),
             },
         }
     }
 }
 
-async fn refresh_account_status(
-    account: &AdminCodexAccount,
+async fn refresh_account_status<A: CodexStatusAccount>(
+    account: &A,
     account_store: &dyn AdminCodexAccountStore,
     route_store: &dyn ProviderRouteStore,
     config: &AdminRuntimeConfig,
     force_refresh: bool,
 ) -> AccountStatusRefresh {
     let now = now_ms();
-    if account.status != KEY_STATUS_ACTIVE {
+    if account.status() != KEY_STATUS_ACTIVE {
         return AccountStatusRefresh::Skipped {
             account: CodexPublicAccountStatus {
-                name: account.name.clone(),
-                status: account.status.clone(),
-                plan_type: account.plan_type.clone(),
-                primary_remaining_percent: account.primary_remaining_percent,
-                secondary_remaining_percent: account.secondary_remaining_percent,
+                name: account.name().to_string(),
+                status: account.status().to_string(),
+                plan_type: account.plan_type().map(str::to_string),
+                primary_remaining_percent: account.primary_remaining_percent(),
+                secondary_remaining_percent: account.secondary_remaining_percent(),
                 last_usage_checked_at: Some(now),
-                last_usage_success_at: account.last_usage_success_at,
-                usage_error_message: account.usage_error_message.clone(),
+                last_usage_success_at: account.last_usage_success_at(),
+                usage_error_message: account.usage_error_message().map(str::to_string),
             },
         };
     }
     let Some(route) = account_store
-        .resolve_admin_codex_account_route(&account.name)
+        .resolve_admin_codex_account_route(account.name())
         .await
         .ok()
         .flatten()
@@ -521,29 +581,29 @@ async fn refresh_account_status(
     }
 }
 
-async fn refresh_account_status_with_current_access_token_only(
-    account: &AdminCodexAccount,
+async fn refresh_account_status_with_current_access_token_only<A: CodexStatusAccount>(
+    account: &A,
     account_store: &dyn AdminCodexAccountStore,
     route_store: &dyn ProviderRouteStore,
     config: &AdminRuntimeConfig,
 ) -> AccountStatusRefresh {
     let now = now_ms();
-    if account.status != KEY_STATUS_ACTIVE {
+    if account.status() != KEY_STATUS_ACTIVE {
         return AccountStatusRefresh::Skipped {
             account: CodexPublicAccountStatus {
-                name: account.name.clone(),
-                status: account.status.clone(),
-                plan_type: account.plan_type.clone(),
-                primary_remaining_percent: account.primary_remaining_percent,
-                secondary_remaining_percent: account.secondary_remaining_percent,
+                name: account.name().to_string(),
+                status: account.status().to_string(),
+                plan_type: account.plan_type().map(str::to_string),
+                primary_remaining_percent: account.primary_remaining_percent(),
+                secondary_remaining_percent: account.secondary_remaining_percent(),
                 last_usage_checked_at: Some(now),
-                last_usage_success_at: account.last_usage_success_at,
-                usage_error_message: account.usage_error_message.clone(),
+                last_usage_success_at: account.last_usage_success_at(),
+                usage_error_message: account.usage_error_message().map(str::to_string),
             },
         };
     }
     let Some(route) = account_store
-        .resolve_admin_codex_account_route(&account.name)
+        .resolve_admin_codex_account_route(account.name())
         .await
         .ok()
         .flatten()
@@ -677,8 +737,8 @@ fn merge_account_status_refresh(
     build_status_snapshot(merged, source_url, refresh_interval_seconds)
 }
 
-fn build_background_refresh_snapshot(
-    accounts: &[AdminCodexAccount],
+fn build_background_refresh_snapshot<A: CodexStatusAccount>(
+    accounts: &[A],
     refreshed: &[AccountStatusRefresh],
     existing: Option<CodexRateLimitStatus>,
     preserved_name: Option<&str>,
@@ -695,8 +755,8 @@ fn build_background_refresh_snapshot(
     build_status_snapshot(merged, source_url, refresh_interval_seconds)
 }
 
-fn merge_background_refresh_accounts(
-    accounts: &[AdminCodexAccount],
+fn merge_background_refresh_accounts<A: CodexStatusAccount>(
+    accounts: &[A],
     mut refreshed_by_name: BTreeMap<String, AccountStatusRefresh>,
     existing: Option<CodexRateLimitStatus>,
     preserved_name: Option<&str>,
@@ -730,8 +790,8 @@ fn merge_background_refresh_accounts(
     accounts
         .iter()
         .map(|account| {
-            if preserved_name == Some(account.name.as_str()) {
-                if let Some(status) = refreshed_by_name.remove(&account.name) {
+            if preserved_name == Some(account.name()) {
+                if let Some(status) = refreshed_by_name.remove(account.name()) {
                     return status;
                 }
             }
@@ -743,7 +803,7 @@ fn merge_background_refresh_accounts(
                 return status;
             }
             refreshed_by_name
-                .remove(&account.name)
+                .remove(account.name())
                 .unwrap_or_else(|| initial_account_status(account))
         })
         .collect()
@@ -1000,15 +1060,15 @@ fn build_status_snapshot(
     }
 }
 
-fn account_ready_status(
-    account: &AdminCodexAccount,
+fn account_ready_status<A: CodexStatusAccount>(
+    account: &A,
     checked_at: i64,
     buckets: &[CodexRateLimitBucket],
 ) -> CodexPublicAccountStatus {
     let primary = buckets.iter().find(|bucket| bucket.is_primary);
     CodexPublicAccountStatus {
-        name: account.name.clone(),
-        status: account.status.clone(),
+        name: account.name().to_string(),
+        status: account.status().to_string(),
         plan_type: primary.and_then(|bucket| bucket.plan_type.clone()),
         primary_remaining_percent: primary
             .and_then(|bucket| bucket.primary.as_ref())
@@ -1022,19 +1082,19 @@ fn account_ready_status(
     }
 }
 
-fn account_error_status(
-    account: &AdminCodexAccount,
+fn account_error_status<A: CodexStatusAccount>(
+    account: &A,
     checked_at: i64,
     message: &str,
 ) -> CodexPublicAccountStatus {
     CodexPublicAccountStatus {
-        name: account.name.clone(),
-        status: account.status.clone(),
-        plan_type: account.plan_type.clone(),
-        primary_remaining_percent: account.primary_remaining_percent,
-        secondary_remaining_percent: account.secondary_remaining_percent,
+        name: account.name().to_string(),
+        status: account.status().to_string(),
+        plan_type: account.plan_type().map(str::to_string),
+        primary_remaining_percent: account.primary_remaining_percent(),
+        secondary_remaining_percent: account.secondary_remaining_percent(),
         last_usage_checked_at: Some(checked_at),
-        last_usage_success_at: account.last_usage_success_at,
+        last_usage_success_at: account.last_usage_success_at(),
         usage_error_message: Some(message.to_string()),
     }
 }

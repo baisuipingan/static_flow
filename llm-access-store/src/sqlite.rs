@@ -14,12 +14,13 @@ use llm_access_core::{
         AdminKiroStatusCacheUpdate, AdminLegacyKiroProxyMigration, AdminProxyBinding,
         AdminProxyConfig, AdminProxyConfigPatch, AdminReviewQueueAction, AdminReviewQueueQuery,
         AdminRuntimeConfig, AdminSponsorRequest, AdminSponsorRequestsPage, AdminTokenRequest,
-        AdminTokenRequestsPage, AuthenticatedKey, CodexRateLimitStatus, NewAdminAccountGroup,
-        NewAdminCodexAccount, NewAdminCodexImportJob, NewAdminKey, NewAdminKiroAccount,
-        NewAdminProxyConfig, NewPublicAccountContributionRequest, NewPublicSponsorRequest,
-        NewPublicTokenRequest, ProviderCodexAuthUpdate, ProviderCodexRoute, ProviderKiroAuthUpdate,
-        ProviderProxyConfig, PublicAccessKey, PublicAccountContribution, PublicSponsor,
-        PublicUsageLookupKey, PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED,
+        AdminTokenRequestsPage, AuthenticatedKey, CodexRateLimitStatus, CodexStatusRefreshTarget,
+        KiroStatusRefreshTarget, NewAdminAccountGroup, NewAdminCodexAccount,
+        NewAdminCodexImportJob, NewAdminKey, NewAdminKiroAccount, NewAdminProxyConfig,
+        NewPublicAccountContributionRequest, NewPublicSponsorRequest, NewPublicTokenRequest,
+        ProviderCodexAuthUpdate, ProviderCodexRoute, ProviderKiroAuthUpdate, ProviderProxyConfig,
+        PublicAccessKey, PublicAccountContribution, PublicSponsor, PublicUsageLookupKey,
+        PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED,
         PUBLIC_SPONSOR_REQUEST_STATUS_PAYMENT_EMAIL_SENT, PUBLIC_SPONSOR_REQUEST_STATUS_SUBMITTED,
         PUBLIC_TOKEN_REQUEST_STATUS_PENDING,
     },
@@ -1623,6 +1624,30 @@ impl SqliteControlStore {
             .collect()
     }
 
+    /// List only the Codex fields needed by background status refresh.
+    pub fn list_codex_status_refresh_targets(
+        &self,
+    ) -> anyhow::Result<Vec<CodexStatusRefreshTarget>> {
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT account_name, status
+                 FROM llm_codex_accounts
+                 ORDER BY account_name",
+            )
+            .context("prepare list codex status refresh targets")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok(CodexStatusRefreshTarget {
+                    name: row.get(0)?,
+                    status: row.get(1)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("list codex status refresh targets")?;
+        Ok(rows)
+    }
+
     /// Load one imported Codex account for the admin UI.
     pub fn get_admin_codex_account(&self, name: &str) -> anyhow::Result<Option<AdminCodexAccount>> {
         self.get_codex_account(name)?
@@ -2245,6 +2270,53 @@ impl SqliteControlStore {
             .iter()
             .map(|record| self.admin_kiro_account_from_record_with_context(record, &context))
             .collect()
+    }
+
+    /// List only the Kiro fields needed by background status refresh.
+    pub fn list_kiro_status_refresh_targets(&self) -> anyhow::Result<Vec<KiroStatusRefreshTarget>> {
+        let refresh_interval_seconds = self
+            .get_runtime_config_or_default()
+            .map(|config| config.kiro_status_refresh_max_interval_seconds.max(0) as u64)
+            .unwrap_or(core_store::DEFAULT_KIRO_STATUS_REFRESH_MAX_INTERVAL_SECONDS);
+        let default_cache = AdminKiroCacheView {
+            refresh_interval_seconds,
+            ..AdminKiroCacheView::default()
+        };
+        let mut status_by_account = self.list_kiro_cached_status_parts()?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT
+                    account_name,
+                    status,
+                    CASE
+                        WHEN json_type(auth_json, '$.disabled') = 'true' THEN 1
+                        ELSE 0
+                    END
+                 FROM llm_kiro_accounts
+                 ORDER BY account_name",
+            )
+            .context("prepare list kiro status refresh targets")?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?, row.get::<_, i64>(2)? != 0))
+            })?
+            .collect::<Result<Vec<_>, _>>()
+            .context("list kiro status refresh targets")?;
+        Ok(rows
+            .into_iter()
+            .map(|(name, status, disabled_json)| {
+                let cache = status_by_account
+                    .remove(&name)
+                    .map(|(_, cache)| cache)
+                    .unwrap_or_else(|| default_cache.clone());
+                KiroStatusRefreshTarget {
+                    name,
+                    disabled: disabled_json || status != core_store::KEY_STATUS_ACTIVE,
+                    cache,
+                }
+            })
+            .collect())
     }
 
     /// Create or replace one Kiro account.
@@ -7020,6 +7092,68 @@ mod tests {
         assert!(account.disabled);
         assert_eq!(account.balance, None);
         assert_eq!(account.subscription_title, None);
+    }
+
+    #[test]
+    fn codex_status_refresh_targets_do_not_require_auth_payloads() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlStore::new(conn);
+
+        repo.upsert_codex_account(&super::CodexAccountRecord {
+            account_name: "codex-refresh-target".to_string(),
+            account_id: Some("acct-refresh-target".to_string()),
+            email: None,
+            status: "active".to_string(),
+            auth_json: r#"{"large":"auth payload deliberately irrelevant here"}"#.to_string(),
+            settings_json: "{}".to_string(),
+            last_refresh_at_ms: Some(100),
+            last_error: None,
+            created_at_ms: 10,
+            updated_at_ms: 20,
+        })
+        .expect("upsert codex account");
+
+        let targets = repo
+            .list_codex_status_refresh_targets()
+            .expect("list codex status refresh targets");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "codex-refresh-target");
+        assert_eq!(targets[0].status, "active");
+    }
+
+    #[test]
+    fn kiro_status_refresh_targets_preserve_disabled_auth_flag() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlStore::new(conn);
+
+        repo.upsert_kiro_account(&super::KiroAccountRecord {
+            account_name: "kiro-refresh-target".to_string(),
+            auth_method: "idc".to_string(),
+            account_id: Some("kiro-account".to_string()),
+            profile_arn: Some("arn:aws:kiro:test".to_string()),
+            user_id: Some("user-1".to_string()),
+            status: "active".to_string(),
+            auth_json: r#"{"accessToken":"a","disabled":true}"#.to_string(),
+            max_concurrency: Some(2),
+            min_start_interval_ms: Some(100),
+            proxy_config_id: None,
+            last_refresh_at_ms: Some(200),
+            last_error: None,
+            created_at_ms: 30,
+            updated_at_ms: 40,
+        })
+        .expect("upsert kiro account");
+
+        let targets = repo
+            .list_kiro_status_refresh_targets()
+            .expect("list kiro status refresh targets");
+
+        assert_eq!(targets.len(), 1);
+        assert_eq!(targets[0].name, "kiro-refresh-target");
+        assert!(targets[0].disabled);
     }
 
     #[test]

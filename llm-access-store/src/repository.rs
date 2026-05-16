@@ -14,14 +14,14 @@ use llm_access_core::{
         AdminKiroStatusCacheUpdate, AdminProxyBinding, AdminProxyConfig, AdminProxyConfigPatch,
         AdminProxyStore, AdminReviewQueueAction, AdminReviewQueueQuery, AdminReviewQueueStore,
         AdminRuntimeConfig, AdminSponsorRequest, AdminSponsorRequestsPage, AdminTokenRequest,
-        AdminTokenRequestsPage, AuthenticatedKey, CodexRateLimitStatus, ControlStore,
-        NewAdminAccountGroup, NewAdminCodexAccount, NewAdminCodexImportJob, NewAdminKey,
-        NewAdminKiroAccount, NewAdminProxyConfig, NewPublicAccountContributionRequest,
-        NewPublicSponsorRequest, NewPublicTokenRequest, ProviderCodexAuthUpdate,
-        ProviderCodexRoute, ProviderKiroAuthUpdate, ProviderKiroRoute, ProviderRouteStore,
-        PublicAccessKey, PublicAccessStore, PublicAccountContribution, PublicCommunityStore,
-        PublicSponsor, PublicStatusStore, PublicSubmissionStore, PublicUsageLookupKey,
-        PublicUsageStore, UsageEventSink, DEFAULT_AUTH_CACHE_TTL_SECONDS,
+        AdminTokenRequestsPage, AuthenticatedKey, CodexRateLimitStatus, CodexStatusRefreshTarget,
+        ControlStore, KiroStatusRefreshTarget, NewAdminAccountGroup, NewAdminCodexAccount,
+        NewAdminCodexImportJob, NewAdminKey, NewAdminKiroAccount, NewAdminProxyConfig,
+        NewPublicAccountContributionRequest, NewPublicSponsorRequest, NewPublicTokenRequest,
+        ProviderCodexAuthUpdate, ProviderCodexRoute, ProviderKiroAuthUpdate, ProviderKiroRoute,
+        ProviderRouteStore, PublicAccessKey, PublicAccessStore, PublicAccountContribution,
+        PublicCommunityStore, PublicSponsor, PublicStatusStore, PublicSubmissionStore,
+        PublicUsageLookupKey, PublicUsageStore, UsageEventSink, DEFAULT_AUTH_CACHE_TTL_SECONDS,
         DEFAULT_CODEX_STATUS_REFRESH_SECONDS,
     },
     usage::UsageEvent,
@@ -378,6 +378,20 @@ impl AdminCodexAccountStore for SqliteControlRepository {
         .context("sqlite control repository codex account list task failed")?
     }
 
+    async fn list_codex_status_refresh_targets(
+        &self,
+    ) -> anyhow::Result<Vec<CodexStatusRefreshTarget>> {
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.list_codex_status_refresh_targets()
+        })
+        .await
+        .context("sqlite control repository codex status target list task failed")?
+    }
+
     async fn get_admin_codex_account(
         &self,
         name: &str,
@@ -621,6 +635,20 @@ impl AdminKiroAccountStore for SqliteControlRepository {
         })
         .await
         .context("sqlite control repository kiro account list task failed")?
+    }
+
+    async fn list_kiro_status_refresh_targets(
+        &self,
+    ) -> anyhow::Result<Vec<KiroStatusRefreshTarget>> {
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || {
+            let store = inner
+                .lock()
+                .map_err(|_| anyhow!("sqlite control store mutex poisoned"))?;
+            store.list_kiro_status_refresh_targets()
+        })
+        .await
+        .context("sqlite control repository kiro status target list task failed")?
     }
 
     async fn create_admin_kiro_account(

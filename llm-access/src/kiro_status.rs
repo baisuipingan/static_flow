@@ -4,8 +4,8 @@ use std::{sync::Arc, time::Duration};
 
 use anyhow::Context;
 use llm_access_core::store::{
-    AdminConfigStore, AdminKiroAccount, AdminKiroAccountStore, AdminKiroBalanceView,
-    AdminKiroCacheView, AdminKiroStatusCacheUpdate, AdminRuntimeConfig, ProviderKiroRoute,
+    AdminConfigStore, AdminKiroAccountStore, AdminKiroBalanceView, AdminKiroCacheView,
+    AdminKiroStatusCacheUpdate, AdminRuntimeConfig, KiroStatusRefreshTarget, ProviderKiroRoute,
     ProviderRouteStore,
 };
 use llm_access_kiro::wire::UsageLimitsResponse;
@@ -60,9 +60,9 @@ async fn refresh_all_kiro_statuses(
         .await
         .context("load Kiro status refresh config")?;
     let accounts = account_store
-        .list_admin_kiro_accounts()
+        .list_kiro_status_refresh_targets()
         .await
-        .context("list Kiro accounts for status refresh")?;
+        .context("list Kiro status refresh targets")?;
     for (index, account) in accounts.into_iter().enumerate() {
         if index > 0 {
             let jitter = next_kiro_account_jitter(&config);
@@ -84,7 +84,7 @@ async fn refresh_all_kiro_statuses(
 }
 
 async fn refresh_account_status(
-    account: &AdminKiroAccount,
+    account: &KiroStatusRefreshTarget,
     account_store: &dyn AdminKiroAccountStore,
     route_store: &dyn ProviderRouteStore,
 ) -> anyhow::Result<()> {
@@ -178,7 +178,7 @@ fn build_error_status_update(
 }
 
 fn build_disabled_status_update(
-    account: &AdminKiroAccount,
+    account: &KiroStatusRefreshTarget,
     now: i64,
 ) -> AdminKiroStatusCacheUpdate {
     let refresh_interval_seconds = account.cache.refresh_interval_seconds;
@@ -191,7 +191,7 @@ fn build_disabled_status_update(
     };
     AdminKiroStatusCacheUpdate {
         account_name: account.name.clone(),
-        balance: account.balance.clone(),
+        balance: None,
         refreshed_at_ms: now,
         expires_at_ms: status_expires_at(now, refresh_interval_seconds),
         cache,
