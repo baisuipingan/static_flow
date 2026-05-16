@@ -52,6 +52,7 @@ chrono = { version = "0.4.42", features = ["serde"] }
 
 # HTTP 客户端
 reqwest = { version = "0.12", features = ["json", "socks"] }
+redis = { version = "0.28", default-features = false, features = ["tokio-comp", "connection-manager", "script"] }
 sqlx-core = { version = "0.8.6", default-features = false, features = ["_rt-tokio", "_tls-native-tls", "chrono", "json"] }
 sqlx-postgres = { version = "0.8.6", default-features = false, features = ["chrono", "json"] }
 

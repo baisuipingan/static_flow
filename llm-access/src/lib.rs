@@ -667,6 +667,7 @@ mod tests {
             control_store: crate::config::ControlStoreConfig::Sqlite {
                 path: root.join("control/llm-access.sqlite3"),
             },
+            request_cache: None,
             duckdb: root.join("analytics/usage.duckdb"),
             usage_journal_dir: root.join("usage-journal"),
             duckdb_tiered: None,
@@ -1489,6 +1490,7 @@ mod tests {
             control_store: crate::config::ControlStoreConfig::Sqlite {
                 path: root.join("control/llm-access.sqlite3"),
             },
+            request_cache: None,
             duckdb: root.join("analytics/usage.duckdb"),
             usage_journal_dir: root.join("usage-journal"),
             duckdb_tiered: None,
@@ -1556,6 +1558,7 @@ mod tests {
             control_store: crate::config::ControlStoreConfig::Sqlite {
                 path: control_root.join("control/llm-access.sqlite3"),
             },
+            request_cache: None,
             duckdb: root.join("analytics/usage.duckdb"),
             usage_journal_dir: root.join("usage-journal"),
             duckdb_tiered: None,

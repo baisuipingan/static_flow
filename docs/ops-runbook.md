@@ -110,6 +110,44 @@ private env files, not in tracked docs.
   `gc`, `fsck`, `sync`, and `destroy`, unless separately tested for this R2
   bucket and accepted for the operation.
 
+## llm-access Request-Path Valkey Cache
+
+- The request-path Valkey cache is separate from JuiceFS metadata. It only
+  caches hot Postgres control-plane reads used during bearer auth, route
+  snapshot loading, runtime-config reads, Codex status snapshot reads,
+  account-view selection, and selected-account auth hydration.
+- Local private request-cache config lives in `.local/common/valkey/lb7666.env`
+  and must stay ignored by git with mode `0600`. Source it explicitly when
+  testing from this workstation:
+  ```bash
+  set -a
+  source .local/common/valkey/lb7666.env
+  set +a
+  ```
+- The shared env var name for the Valkey URL is
+  `LLM_ACCESS_REQUEST_CACHE_URL`. The live GCP `/etc/llm-access/llm-access.env`
+  should export that variable for both `llm-access.service` and
+  `llm-access-usage-worker.service`.
+- When the cloud `llm-access` API or usage worker uses Postgres control-plane
+  state, start them with:
+  - `--request-cache-url-env LLM_ACCESS_REQUEST_CACHE_URL`
+  - `--request-cache-key-prefix llma`
+- The request-cache key prefix must stay stable across all nodes that should
+  share the same cache namespace. Changing the prefix intentionally cold-starts
+  the cache.
+- Postgres remains the only durable source of truth. Valkey cache loss, TTL
+  expiry, or entry invalidation must never lose quota/account state.
+- Cache freshness is maintained by explicit invalidation and generation bumps on
+  key, group, proxy, runtime-config, auth-refresh, and account-state writes.
+  TTL only bounds stale leftovers and memory growth; it is not the freshness
+  mechanism.
+- The request path is intentionally resilient to cache failures. If Valkey is
+  unavailable or an entry decode fails, `llm-access` falls back to the current
+  Postgres query path and logs a warning instead of rejecting user traffic.
+- Current TTL policy uses deterministic jitter around multi-hour base TTLs to
+  avoid synchronized expiry bursts. Do not replace that with identical fixed
+  TTL values for all keys.
+
 ## Cloud llm-access Deployment Shape
 
 - `llm-access` must keep a single active writer for its auth JSON files, local

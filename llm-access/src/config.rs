@@ -7,6 +7,7 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
+use llm_access_store::request_cache as store_request_cache;
 
 const DEFAULT_TIERED_DUCKDB_ROLLOVER_BYTES: u64 = 64 * 1024 * 1024;
 
@@ -46,6 +47,8 @@ pub struct StorageConfig {
     pub state_root: PathBuf,
     /// Control-plane backing store configuration.
     pub control_store: ControlStoreConfig,
+    /// Optional request-path cache configuration backed by Valkey.
+    pub request_cache: Option<RequestCacheConfig>,
     /// DuckDB analytics database path.
     pub duckdb: PathBuf,
     /// Hot local usage journal directory.
@@ -58,6 +61,30 @@ pub struct StorageConfig {
     pub codex_auths_dir: PathBuf,
     /// Runtime log directory.
     pub logs_dir: PathBuf,
+}
+
+/// Optional request-path cache configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RequestCacheConfig {
+    /// Env var name that contains the Valkey URL.
+    pub url_env: String,
+    /// Stable key prefix shared by all cache entries for this deployment.
+    pub key_prefix: String,
+}
+
+/// Resolve the optional request-path cache config into the store-layer shape.
+pub fn resolve_request_cache_config(
+    storage: &StorageConfig,
+) -> anyhow::Result<Option<store_request_cache::RequestCacheConfig>> {
+    let Some(config) = &storage.request_cache else {
+        return Ok(None);
+    };
+    let url = std::env::var(&config.url_env)
+        .with_context(|| format!("missing request cache env `{}`", config.url_env))?;
+    Ok(Some(store_request_cache::RequestCacheConfig {
+        url,
+        key_prefix: config.key_prefix.clone(),
+    }))
 }
 
 /// Tiered DuckDB analytics storage paths.
@@ -153,6 +180,8 @@ where
     let mut state_root = None;
     let mut sqlite_control = None;
     let mut postgres_control_database_url_env = None;
+    let mut request_cache_url_env = None;
+    let mut request_cache_key_prefix = None;
     let mut duckdb = None;
     let mut duckdb_active_dir = None;
     let mut duckdb_archive_dir = None;
@@ -181,6 +210,22 @@ where
                         .ok_or_else(|| {
                             anyhow!("--postgres-control-database-url-env requires an env name")
                         })?
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            },
+            "--request-cache-url-env" => {
+                request_cache_url_env = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--request-cache-url-env requires an env name"))?
+                        .to_string_lossy()
+                        .to_string(),
+                );
+            },
+            "--request-cache-key-prefix" => {
+                request_cache_key_prefix = Some(
+                    args.next()
+                        .ok_or_else(|| anyhow!("--request-cache-key-prefix requires a value"))?
                         .to_string_lossy()
                         .to_string(),
                 );
@@ -245,6 +290,16 @@ where
         },
         _ => return Err(anyhow!("exactly one control backend must be configured")),
     };
+    let request_cache = match (request_cache_url_env, request_cache_key_prefix) {
+        (Some(url_env), Some(key_prefix)) => Some(RequestCacheConfig {
+            url_env,
+            key_prefix,
+        }),
+        (None, None) => None,
+        _ => {
+            return Err(anyhow!("request cache url env and key prefix must be configured together"))
+        },
+    };
     let duckdb = duckdb.unwrap_or_else(|| state_root.join("analytics/usage.duckdb"));
     let usage_journal_dir = usage_journal_dir.unwrap_or_else(|| state_root.join("usage-journal"));
     let duckdb_tiered = parse_tiered_duckdb_config(
@@ -276,6 +331,7 @@ where
         logs_dir: state_root.join("logs"),
         state_root,
         control_store,
+        request_cache,
         duckdb,
         usage_journal_dir,
         duckdb_tiered,
@@ -551,5 +607,48 @@ mod tests {
         .expect_err("sqlite outside state root must fail");
 
         assert!(err.to_string().contains("must live under --state-root"));
+    }
+
+    #[test]
+    fn parses_optional_request_cache_config() {
+        let command = super::CliCommand::parse([
+            "llm-access",
+            "serve",
+            "--state-root",
+            "/mnt/llm-access",
+            "--postgres-control-database-url-env",
+            "LLM_ACCESS_CONTROL_DATABASE_URL",
+            "--request-cache-url-env",
+            "LLM_ACCESS_REQUEST_CACHE_URL",
+            "--request-cache-key-prefix",
+            "llma:test",
+        ])
+        .expect("parse serve config with request cache");
+
+        let super::CliCommand::Serve(config) = command else {
+            panic!("expected serve command");
+        };
+        let request_cache = config.storage.request_cache.expect("request cache");
+        assert_eq!(request_cache.url_env, "LLM_ACCESS_REQUEST_CACHE_URL");
+        assert_eq!(request_cache.key_prefix, "llma:test");
+    }
+
+    #[test]
+    fn rejects_partial_request_cache_config() {
+        let err = super::CliCommand::parse([
+            "llm-access",
+            "serve",
+            "--state-root",
+            "/mnt/llm-access",
+            "--postgres-control-database-url-env",
+            "LLM_ACCESS_CONTROL_DATABASE_URL",
+            "--request-cache-url-env",
+            "LLM_ACCESS_REQUEST_CACHE_URL",
+        ])
+        .expect_err("partial request cache config must fail");
+
+        assert!(err
+            .to_string()
+            .contains("request cache url env and key prefix must be configured together"));
     }
 }

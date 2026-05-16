@@ -48,9 +48,12 @@ use sqlx_core::{
 use sqlx_postgres::{PgArguments, PgPool, PgPoolOptions, PgRow as SqlxPgRow, Postgres};
 use tokio::sync::{Mutex, RwLock};
 
-use crate::sqlite::{
-    CodexAccountRecord, KeyBundle, KeyRecord, KeyRouteConfig, KeyUsageRollup, KiroAccountRecord,
-    RuntimeConfigRecord,
+use crate::{
+    request_cache::{RequestCache, RequestCacheConfig},
+    sqlite::{
+        CodexAccountRecord, KeyBundle, KeyRecord, KeyRouteConfig, KeyUsageRollup,
+        KiroAccountRecord, RuntimeConfigRecord,
+    },
 };
 
 trait SqlxBindParam {
@@ -313,6 +316,7 @@ impl<'a> SqlxTransaction<'a> {
 pub struct PostgresControlRepository {
     client: SqlxClient,
     codex_status_cache: Arc<RwLock<Option<CachedCodexRateLimitStatus>>>,
+    request_cache: Option<RequestCache>,
 }
 
 #[derive(Debug, Clone)]
@@ -419,12 +423,17 @@ impl Default for CodexAccountSettings {
 
 impl PostgresControlRepository {
     /// Connect to the Postgres control plane and run pending migrations.
-    pub async fn connect(database_url: &str) -> anyhow::Result<Self> {
+    pub async fn connect(
+        database_url: &str,
+        request_cache_config: Option<RequestCacheConfig>,
+    ) -> anyhow::Result<Self> {
         let client = SqlxClient::connect(database_url).await?;
         llm_access_migrations::run_postgres_migrations(&client.pool).await?;
+        let request_cache = request_cache_config.map(RequestCache::new).transpose()?;
         Ok(Self {
             client,
             codex_status_cache: Arc::new(RwLock::new(None)),
+            request_cache,
         })
     }
 
@@ -495,6 +504,64 @@ impl PostgresControlRepository {
         row.map(decode_runtime_config_row).transpose()
     }
 
+    async fn load_runtime_config_record_cached(
+        &self,
+    ) -> anyhow::Result<Option<RuntimeConfigRecord>> {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return self.load_runtime_config_record().await;
+        };
+        let cache_key = cache.runtime_config_key();
+        match cache
+            .get_json::<crate::request_cache::CachedRuntimeConfigLookup>(&cache_key)
+            .await
+        {
+            Ok(Some(lookup)) => return Ok(lookup.record),
+            Ok(None) => {},
+            Err(err) => {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache runtime-config read failed; falling back to postgres"
+                );
+            },
+        }
+        let record = self.load_runtime_config_record().await?;
+        let lookup = crate::request_cache::CachedRuntimeConfigLookup {
+            record: record.clone(),
+        };
+        if let Err(err) = cache
+            .set_json(&cache_key, &lookup, cache.runtime_config_ttl())
+            .await
+        {
+            tracing::warn!(
+                key = %cache_key,
+                error = %err,
+                "request cache runtime-config write failed"
+            );
+        }
+        Ok(record)
+    }
+
+    async fn store_runtime_config_record_cached(&self, record: Option<&RuntimeConfigRecord>) {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return;
+        };
+        let cache_key = cache.runtime_config_key();
+        let lookup = crate::request_cache::CachedRuntimeConfigLookup {
+            record: record.cloned(),
+        };
+        if let Err(err) = cache
+            .set_json(&cache_key, &lookup, cache.runtime_config_ttl())
+            .await
+        {
+            tracing::warn!(
+                key = %cache_key,
+                error = %err,
+                "request cache runtime-config write-through failed"
+            );
+        }
+    }
+
     async fn load_authenticated_key_by_hash(
         &self,
         key_hash: &str,
@@ -529,6 +596,30 @@ impl PostgresControlRepository {
         }))
     }
 
+    async fn load_key_hashes_by_ids(
+        &self,
+        key_ids: &[String],
+    ) -> anyhow::Result<BTreeMap<String, String>> {
+        if key_ids.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT key_id, key_hash
+                 FROM llm_keys
+                 WHERE key_id = ANY($1)",
+                &[&key_ids.to_vec()],
+            )
+            .await
+            .context("load key hashes by ids")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| (row.get::<_, String>(0), row.get::<_, String>(1)))
+            .collect())
+    }
+
     fn ensure_connection_alive(&self) -> anyhow::Result<()> {
         if self.client.is_closed() {
             anyhow::bail!("sqlx postgres control pool is closed");
@@ -553,13 +644,753 @@ impl PostgresControlRepository {
         });
     }
 
+    async fn current_dispatch_generation(&self, provider: &str) -> i64 {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return 0;
+        };
+        let key = cache.dispatch_generation_key(provider);
+        match cache.get_i64(&key).await {
+            Ok(Some(value)) => value,
+            Ok(None) => 0,
+            Err(err) => {
+                tracing::warn!(
+                    provider,
+                    key = %key,
+                    error = %err,
+                    "request cache generation read failed; falling back to generation=0"
+                );
+                0
+            },
+        }
+    }
+
+    async fn bump_dispatch_generation(&self, provider: &str) {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return;
+        };
+        let key = cache.dispatch_generation_key(provider);
+        if let Err(err) = cache.incr(&key).await {
+            tracing::warn!(
+                provider,
+                key = %key,
+                error = %err,
+                "request cache generation bump failed"
+            );
+        }
+    }
+
+    async fn load_authenticated_key_cached(
+        &self,
+        key_hash: &str,
+    ) -> anyhow::Result<Option<AuthenticatedKey>> {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return self.load_authenticated_key_by_hash(key_hash).await;
+        };
+        let cache_key = cache.auth_key(key_hash);
+        match cache
+            .get_json::<crate::request_cache::CachedAuthLookup>(&cache_key)
+            .await
+        {
+            Ok(Some(lookup)) => return Ok(lookup.key.map(authenticated_key_from_cached)),
+            Ok(None) => {},
+            Err(err) => {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache auth read failed; falling back to postgres"
+                );
+            },
+        }
+        let key = self.load_authenticated_key_by_hash(key_hash).await?;
+        let lookup = crate::request_cache::CachedAuthLookup {
+            key: key
+                .clone()
+                .map(|value| cached_authenticated_key_from_value(&value)),
+        };
+        let ttl = if key.is_some() {
+            cache.auth_ttl(key_hash)
+        } else {
+            cache.negative_auth_ttl(key_hash)
+        };
+        if let Err(err) = cache.set_json(&cache_key, &lookup, ttl).await {
+            tracing::warn!(
+                key = %cache_key,
+                error = %err,
+                "request cache auth write failed"
+            );
+        }
+        Ok(key)
+    }
+
+    async fn invalidate_authenticated_key_cache_by_ids(&self, key_ids: &[String]) {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return;
+        };
+        let key_hashes = match self.load_key_hashes_by_ids(key_ids).await {
+            Ok(value) => value,
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to load key hashes for auth-cache invalidation");
+                return;
+            },
+        };
+        let cache_keys = key_hashes
+            .values()
+            .map(|key_hash| cache.auth_key(key_hash))
+            .collect::<Vec<_>>();
+        let cache_key_refs = cache_keys.iter().map(String::as_str).collect::<Vec<_>>();
+        if let Err(err) = cache.delete_many(cache_key_refs).await {
+            tracing::warn!(error = %err, "failed to invalidate auth cache keys");
+        }
+    }
+
+    async fn invalidate_request_snapshot_cache(&self, provider: &str, key_id: &str) {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return;
+        };
+        let cache_key = cache.request_snapshot_key(provider, key_id);
+        if let Err(err) = cache.delete(&cache_key).await {
+            tracing::warn!(
+                provider,
+                key = %cache_key,
+                error = %err,
+                "failed to invalidate request snapshot cache"
+            );
+        }
+    }
+
+    async fn invalidate_account_cache(&self, provider: &str, account_name: &str) {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return;
+        };
+        let view_key = cache.account_view_key(provider, account_name);
+        let auth_key = cache.account_auth_key(provider, account_name);
+        if let Err(err) = cache
+            .delete_many([view_key.as_str(), auth_key.as_str()])
+            .await
+        {
+            tracing::warn!(
+                provider,
+                account_name,
+                error = %err,
+                "failed to invalidate account cache entries"
+            );
+        }
+    }
+
+    async fn invalidate_all_account_views_for_provider(&self, provider: &str) {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return;
+        };
+        let account_names = match provider {
+            core_store::PROVIDER_CODEX => match self.list_codex_route_candidate_rows().await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| row.account_name)
+                    .collect::<Vec<_>>(),
+                Err(err) => {
+                    tracing::warn!(provider, error = %err, "failed to list codex accounts for cache invalidation");
+                    return;
+                },
+            },
+            core_store::PROVIDER_KIRO => match self.list_kiro_route_candidate_rows().await {
+                Ok(rows) => rows
+                    .into_iter()
+                    .map(|row| row.account_name)
+                    .collect::<Vec<_>>(),
+                Err(err) => {
+                    tracing::warn!(provider, error = %err, "failed to list kiro accounts for cache invalidation");
+                    return;
+                },
+            },
+            _ => return,
+        };
+        let view_keys = account_names
+            .iter()
+            .map(|name| cache.account_view_key(provider, name))
+            .collect::<Vec<_>>();
+        let view_key_refs = view_keys.iter().map(String::as_str).collect::<Vec<_>>();
+        if let Err(err) = cache.delete_many(view_key_refs).await {
+            tracing::warn!(provider, error = %err, "failed to invalidate provider account view cache");
+        }
+    }
+
+    async fn load_codex_request_snapshot_cached(
+        &self,
+        key_id: &str,
+    ) -> anyhow::Result<Option<crate::request_cache::CachedCodexRequestSnapshot>> {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return self.build_codex_request_snapshot(key_id, 0).await;
+        };
+        let generation = self
+            .current_dispatch_generation(core_store::PROVIDER_CODEX)
+            .await;
+        let cache_key = cache.request_snapshot_key(core_store::PROVIDER_CODEX, key_id);
+        match cache
+            .get_json::<crate::request_cache::CachedCodexRequestSnapshot>(&cache_key)
+            .await
+        {
+            Ok(Some(snapshot)) if snapshot.generation == generation => return Ok(Some(snapshot)),
+            Ok(_) => {},
+            Err(err) => {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache codex snapshot read failed; rebuilding from postgres"
+                );
+            },
+        }
+        let snapshot = self
+            .build_codex_request_snapshot(key_id, generation)
+            .await?;
+        if let Some(snapshot_ref) = snapshot.as_ref() {
+            if let Err(err) = cache
+                .set_json(
+                    &cache_key,
+                    snapshot_ref,
+                    cache.request_snapshot_ttl(core_store::PROVIDER_CODEX, key_id),
+                )
+                .await
+            {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache codex snapshot write failed"
+                );
+            }
+        }
+        Ok(snapshot)
+    }
+
+    async fn load_kiro_request_snapshot_cached(
+        &self,
+        key_id: &str,
+    ) -> anyhow::Result<Option<crate::request_cache::CachedKiroRequestSnapshot>> {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return self.build_kiro_request_snapshot(key_id, 0).await;
+        };
+        let generation = self
+            .current_dispatch_generation(core_store::PROVIDER_KIRO)
+            .await;
+        let cache_key = cache.request_snapshot_key(core_store::PROVIDER_KIRO, key_id);
+        match cache
+            .get_json::<crate::request_cache::CachedKiroRequestSnapshot>(&cache_key)
+            .await
+        {
+            Ok(Some(snapshot)) if snapshot.generation == generation => return Ok(Some(snapshot)),
+            Ok(_) => {},
+            Err(err) => {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache kiro snapshot read failed; rebuilding from postgres"
+                );
+            },
+        }
+        let snapshot = self.build_kiro_request_snapshot(key_id, generation).await?;
+        if let Some(snapshot_ref) = snapshot.as_ref() {
+            if let Err(err) = cache
+                .set_json(
+                    &cache_key,
+                    snapshot_ref,
+                    cache.request_snapshot_ttl(core_store::PROVIDER_KIRO, key_id),
+                )
+                .await
+            {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache kiro snapshot write failed"
+                );
+            }
+        }
+        Ok(snapshot)
+    }
+
+    async fn build_codex_request_snapshot(
+        &self,
+        key_id: &str,
+        generation: i64,
+    ) -> anyhow::Result<Option<crate::request_cache::CachedCodexRequestSnapshot>> {
+        let Some(bundle) = self.load_key_bundle_by_id(key_id).await? else {
+            return Ok(None);
+        };
+        if bundle.key.provider_type != core_store::PROVIDER_CODEX {
+            return Ok(None);
+        }
+        let runtime_config = self
+            .load_runtime_config_record_cached()
+            .await?
+            .unwrap_or_default();
+        let records = self.list_codex_route_candidate_rows().await?;
+        let selected_account_names = self
+            .resolve_route_account_names(
+                core_store::PROVIDER_CODEX,
+                &bundle.route,
+                records
+                    .iter()
+                    .filter(|record| record.status == core_store::KEY_STATUS_ACTIVE)
+                    .map(|record| record.account_name.clone())
+                    .collect(),
+            )
+            .await?;
+        Ok(Some(crate::request_cache::CachedCodexRequestSnapshot {
+            key: cached_authenticated_key_from_bundle(&bundle),
+            generation,
+            route_strategy: bundle
+                .route
+                .route_strategy
+                .clone()
+                .unwrap_or_else(|| "auto".to_string()),
+            account_group_id_at_event: bundle.route.account_group_id.clone(),
+            selected_account_names,
+            use_all_active_accounts: false,
+            request_max_concurrency: bundle
+                .route
+                .request_max_concurrency
+                .and_then(non_negative_i64_to_u64),
+            request_min_start_interval_ms: bundle
+                .route
+                .request_min_start_interval_ms
+                .and_then(non_negative_i64_to_u64),
+            codex_weight_free: runtime_config.codex_weight_free,
+            codex_weight_plus: runtime_config.codex_weight_plus,
+            codex_weight_pro5x: runtime_config.codex_weight_pro5x,
+            codex_weight_pro20x: runtime_config.codex_weight_pro20x,
+        }))
+    }
+
+    async fn build_kiro_request_snapshot(
+        &self,
+        key_id: &str,
+        generation: i64,
+    ) -> anyhow::Result<Option<crate::request_cache::CachedKiroRequestSnapshot>> {
+        let Some(bundle) = self.load_key_bundle_by_id(key_id).await? else {
+            return Ok(None);
+        };
+        if bundle.key.provider_type != core_store::PROVIDER_KIRO {
+            return Ok(None);
+        }
+        let runtime_config = self
+            .load_runtime_config_record_cached()
+            .await?
+            .unwrap_or_default();
+        let records = self.list_kiro_route_candidate_rows().await?;
+        let selected_account_names = self
+            .resolve_route_account_names(
+                core_store::PROVIDER_KIRO,
+                &bundle.route,
+                records
+                    .iter()
+                    .filter(|record| record.status == core_store::KEY_STATUS_ACTIVE)
+                    .map(|record| record.account_name.clone())
+                    .collect(),
+            )
+            .await?;
+        let cache_policy_json = effective_kiro_cache_policy_json(
+            &runtime_config.kiro_cache_policy_json,
+            bundle.route.kiro_cache_policy_override_json.as_deref(),
+        )?;
+        Ok(Some(crate::request_cache::CachedKiroRequestSnapshot {
+            key: cached_authenticated_key_from_bundle(&bundle),
+            generation,
+            route_strategy: bundle
+                .route
+                .route_strategy
+                .clone()
+                .unwrap_or_else(|| "auto".to_string()),
+            account_group_id_at_event: bundle.route.account_group_id.clone(),
+            selected_account_names,
+            use_all_active_accounts: false,
+            request_max_concurrency: bundle
+                .route
+                .request_max_concurrency
+                .and_then(non_negative_i64_to_u64),
+            request_min_start_interval_ms: bundle
+                .route
+                .request_min_start_interval_ms
+                .and_then(non_negative_i64_to_u64),
+            request_validation_enabled: bundle.route.kiro_request_validation_enabled,
+            cache_estimation_enabled: bundle.route.kiro_cache_estimation_enabled,
+            zero_cache_debug_enabled: bundle.route.kiro_zero_cache_debug_enabled,
+            full_request_logging_enabled: bundle.route.kiro_full_request_logging_enabled,
+            model_name_map_json: bundle
+                .route
+                .model_name_map_json
+                .clone()
+                .unwrap_or_else(|| "{}".to_string()),
+            cache_kmodels_json: runtime_config.kiro_cache_kmodels_json.clone(),
+            cache_policy_json,
+            prefix_cache_mode: runtime_config.kiro_prefix_cache_mode.clone(),
+            prefix_cache_max_tokens: runtime_config.kiro_prefix_cache_max_tokens.max(0) as u64,
+            prefix_cache_entry_ttl_seconds: runtime_config
+                .kiro_prefix_cache_entry_ttl_seconds
+                .max(0) as u64,
+            conversation_anchor_max_entries: runtime_config
+                .kiro_conversation_anchor_max_entries
+                .max(0) as u64,
+            conversation_anchor_ttl_seconds: runtime_config
+                .kiro_conversation_anchor_ttl_seconds
+                .max(0) as u64,
+            billable_model_multipliers_json: bundle
+                .route
+                .kiro_billable_model_multipliers_override_json
+                .clone()
+                .unwrap_or_else(|| runtime_config.kiro_billable_model_multipliers_json.clone()),
+            status_refresh_interval_seconds: runtime_config
+                .kiro_status_refresh_max_interval_seconds
+                .max(0) as u64,
+        }))
+    }
+
+    async fn load_codex_account_views_cached(
+        &self,
+        account_names: &[String],
+    ) -> anyhow::Result<BTreeMap<String, crate::request_cache::CachedCodexAccountView>> {
+        if account_names.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let Some(cache) = self.request_cache.as_ref() else {
+            let proxy_context = self
+                .load_provider_proxy_resolution_context(core_store::PROVIDER_CODEX)
+                .await?;
+            return self
+                .list_codex_route_candidate_rows_by_names(account_names)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    let settings = decode_codex_account_settings(&row.settings_json)?;
+                    let proxy = resolve_provider_proxy_config_from_context(
+                        &settings.proxy_mode,
+                        settings.proxy_config_id.as_deref(),
+                        &proxy_context,
+                    )?;
+                    Ok((row.account_name.clone(), crate::request_cache::CachedCodexAccountView {
+                        account_name: row.account_name,
+                        status: row.status,
+                        map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
+                        auth_refresh_enabled: settings.auth_refresh_enabled,
+                        route_weight_tier: settings.route_weight_tier,
+                        request_max_concurrency: settings.request_max_concurrency,
+                        request_min_start_interval_ms: settings.request_min_start_interval_ms,
+                        last_refresh_at_ms: row.last_refresh_at_ms,
+                        last_error: row.last_error,
+                        access_token: row.access_token,
+                        proxy: cached_proxy_from_option(proxy),
+                    }))
+                })
+                .collect();
+        };
+
+        let cache_keys = account_names
+            .iter()
+            .map(|name| cache.account_view_key(core_store::PROVIDER_CODEX, name))
+            .collect::<Vec<_>>();
+        let cached_values = match cache
+            .mget_json::<crate::request_cache::CachedCodexAccountView>(&cache_keys)
+            .await
+        {
+            Ok(values) => values,
+            Err(err) => {
+                tracing::warn!(error = %err, "request cache codex account view batch read failed");
+                vec![None; account_names.len()]
+            },
+        };
+        let mut views_by_name = BTreeMap::new();
+        let mut missing = Vec::new();
+        for (account_name, cached) in account_names.iter().cloned().zip(cached_values.into_iter()) {
+            if let Some(view) = cached {
+                views_by_name.insert(account_name, view);
+            } else {
+                missing.push(account_name);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(views_by_name);
+        }
+        let proxy_context = self
+            .load_provider_proxy_resolution_context(core_store::PROVIDER_CODEX)
+            .await?;
+        for row in self
+            .list_codex_route_candidate_rows_by_names(&missing)
+            .await?
+        {
+            let settings = decode_codex_account_settings(&row.settings_json)?;
+            let proxy = resolve_provider_proxy_config_from_context(
+                &settings.proxy_mode,
+                settings.proxy_config_id.as_deref(),
+                &proxy_context,
+            )?;
+            let view = crate::request_cache::CachedCodexAccountView {
+                account_name: row.account_name.clone(),
+                status: row.status,
+                map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
+                auth_refresh_enabled: settings.auth_refresh_enabled,
+                route_weight_tier: settings.route_weight_tier,
+                request_max_concurrency: settings.request_max_concurrency,
+                request_min_start_interval_ms: settings.request_min_start_interval_ms,
+                last_refresh_at_ms: row.last_refresh_at_ms,
+                last_error: row.last_error,
+                access_token: row.access_token,
+                proxy: cached_proxy_from_option(proxy),
+            };
+            let cache_key = cache.account_view_key(core_store::PROVIDER_CODEX, &row.account_name);
+            if let Err(err) = cache
+                .set_json(
+                    &cache_key,
+                    &view,
+                    cache.account_view_ttl(core_store::PROVIDER_CODEX, &row.account_name),
+                )
+                .await
+            {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache codex account view write failed"
+                );
+            }
+            views_by_name.insert(row.account_name, view);
+        }
+        Ok(views_by_name)
+    }
+
+    async fn load_kiro_account_views_cached(
+        &self,
+        account_names: &[String],
+    ) -> anyhow::Result<BTreeMap<String, crate::request_cache::CachedKiroAccountView>> {
+        if account_names.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        let Some(cache) = self.request_cache.as_ref() else {
+            let proxy_context = self
+                .load_provider_proxy_resolution_context(core_store::PROVIDER_KIRO)
+                .await?;
+            let status_by_account = self
+                .list_kiro_cached_status_parts_rows_by_names(account_names)
+                .await?;
+            return self
+                .list_kiro_route_candidate_rows_by_names(account_names)
+                .await?
+                .into_iter()
+                .map(|row| {
+                    build_cached_kiro_account_view(
+                        &row,
+                        status_by_account.get(&row.account_name).cloned(),
+                        &proxy_context,
+                    )
+                })
+                .map(|result| result.map(|view| (view.account_name.clone(), view)))
+                .collect();
+        };
+
+        let cache_keys = account_names
+            .iter()
+            .map(|name| cache.account_view_key(core_store::PROVIDER_KIRO, name))
+            .collect::<Vec<_>>();
+        let cached_values = match cache
+            .mget_json::<crate::request_cache::CachedKiroAccountView>(&cache_keys)
+            .await
+        {
+            Ok(values) => values,
+            Err(err) => {
+                tracing::warn!(error = %err, "request cache kiro account view batch read failed");
+                vec![None; account_names.len()]
+            },
+        };
+        let mut views_by_name = BTreeMap::new();
+        let mut missing = Vec::new();
+        for (account_name, cached) in account_names.iter().cloned().zip(cached_values.into_iter()) {
+            if let Some(view) = cached {
+                views_by_name.insert(account_name, view);
+            } else {
+                missing.push(account_name);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(views_by_name);
+        }
+        let proxy_context = self
+            .load_provider_proxy_resolution_context(core_store::PROVIDER_KIRO)
+            .await?;
+        let status_by_account = self
+            .list_kiro_cached_status_parts_rows_by_names(&missing)
+            .await?;
+        for row in self
+            .list_kiro_route_candidate_rows_by_names(&missing)
+            .await?
+        {
+            let view = build_cached_kiro_account_view(
+                &row,
+                status_by_account.get(&row.account_name).cloned(),
+                &proxy_context,
+            )?;
+            let cache_key = cache.account_view_key(core_store::PROVIDER_KIRO, &view.account_name);
+            if let Err(err) = cache
+                .set_json(
+                    &cache_key,
+                    &view,
+                    cache.account_view_ttl(core_store::PROVIDER_KIRO, &view.account_name),
+                )
+                .await
+            {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache kiro account view write failed"
+                );
+            }
+            views_by_name.insert(view.account_name.clone(), view);
+        }
+        Ok(views_by_name)
+    }
+
+    async fn load_codex_account_auth_cached(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<Option<crate::request_cache::CachedAccountAuth>> {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return Ok(self
+                .get_codex_account_row(account_name)
+                .await?
+                .map(|record| crate::request_cache::CachedAccountAuth {
+                    auth_json: record.auth_json,
+                }));
+        };
+        let cache_key = cache.account_auth_key(core_store::PROVIDER_CODEX, account_name);
+        match cache
+            .get_json::<crate::request_cache::CachedAccountAuth>(&cache_key)
+            .await
+        {
+            Ok(Some(value)) => return Ok(Some(value)),
+            Ok(None) => {},
+            Err(err) => {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache codex auth read failed; falling back to postgres"
+                );
+            },
+        }
+        let auth = self
+            .get_codex_account_row(account_name)
+            .await?
+            .map(|record| crate::request_cache::CachedAccountAuth {
+                auth_json: record.auth_json,
+            });
+        if let Some(auth_ref) = auth.as_ref() {
+            if let Err(err) = cache
+                .set_json(
+                    &cache_key,
+                    auth_ref,
+                    cache.account_auth_ttl(core_store::PROVIDER_CODEX, account_name),
+                )
+                .await
+            {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache codex auth write failed"
+                );
+            }
+        }
+        Ok(auth)
+    }
+
+    async fn load_kiro_account_auth_cached(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<Option<crate::request_cache::CachedAccountAuth>> {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return Ok(self
+                .get_kiro_account_row(account_name)
+                .await?
+                .map(|record| crate::request_cache::CachedAccountAuth {
+                    auth_json: record.auth_json,
+                }));
+        };
+        let cache_key = cache.account_auth_key(core_store::PROVIDER_KIRO, account_name);
+        match cache
+            .get_json::<crate::request_cache::CachedAccountAuth>(&cache_key)
+            .await
+        {
+            Ok(Some(value)) => return Ok(Some(value)),
+            Ok(None) => {},
+            Err(err) => {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache kiro auth read failed; falling back to postgres"
+                );
+            },
+        }
+        let auth = self
+            .get_kiro_account_row(account_name)
+            .await?
+            .map(|record| crate::request_cache::CachedAccountAuth {
+                auth_json: record.auth_json,
+            });
+        if let Some(auth_ref) = auth.as_ref() {
+            if let Err(err) = cache
+                .set_json(
+                    &cache_key,
+                    auth_ref,
+                    cache.account_auth_ttl(core_store::PROVIDER_KIRO, account_name),
+                )
+                .await
+            {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache kiro auth write failed"
+                );
+            }
+        }
+        Ok(auth)
+    }
+
     async fn load_codex_rate_limit_status_cached(
         &self,
     ) -> anyhow::Result<Option<CodexRateLimitStatus>> {
         if let Some(snapshot) = self.cached_codex_rate_limit_status().await {
             return Ok(Some(snapshot));
         }
+        if let Some(cache) = self.request_cache.as_ref() {
+            let cache_key = cache.codex_status_key();
+            match cache
+                .get_json::<crate::request_cache::CachedCodexStatusLookup>(&cache_key)
+                .await
+            {
+                Ok(Some(lookup)) => {
+                    self.store_cached_codex_rate_limit_status(lookup.snapshot.clone())
+                        .await;
+                    return Ok(lookup.snapshot);
+                },
+                Ok(None) => {},
+                Err(err) => {
+                    tracing::warn!(
+                        key = %cache_key,
+                        error = %err,
+                        "request cache codex status read failed; falling back to postgres"
+                    );
+                },
+            }
+        }
         let snapshot = self.load_codex_rate_limit_status_row().await?;
+        if let Some(cache) = self.request_cache.as_ref() {
+            let cache_key = cache.codex_status_key();
+            let lookup = crate::request_cache::CachedCodexStatusLookup {
+                snapshot: snapshot.clone(),
+            };
+            if let Err(err) = cache
+                .set_json(&cache_key, &lookup, cache.codex_status_ttl())
+                .await
+            {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache codex status write failed"
+                );
+            }
+        }
         self.store_cached_codex_rate_limit_status(snapshot.clone())
             .await;
         Ok(snapshot)
@@ -625,6 +1456,12 @@ impl PostgresControlRepository {
                 );
             }
         }
+        let key_ids = deltas
+            .iter()
+            .map(|(key_id, _)| (*key_id).to_string())
+            .collect::<Vec<_>>();
+        self.invalidate_authenticated_key_cache_by_ids(&key_ids)
+            .await;
         Ok(())
     }
 
@@ -1746,6 +2583,49 @@ impl PostgresControlRepository {
             .collect())
     }
 
+    async fn list_codex_route_candidate_rows_by_names(
+        &self,
+        account_names: &[String],
+    ) -> anyhow::Result<Vec<CodexRouteCandidateRow>> {
+        if account_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    account_name,
+                    status,
+                    settings_json::text,
+                    last_refresh_at_ms,
+                    last_error,
+                    COALESCE(
+                        auth_json #>> '{tokens,access_token}',
+                        auth_json #>> '{tokens,accessToken}',
+                        auth_json ->> 'access_token',
+                        auth_json ->> 'accessToken'
+                    )
+                 FROM llm_codex_accounts
+                 WHERE account_name = ANY($1)
+                 ORDER BY account_name",
+                &[&account_names.to_vec()],
+            )
+            .await
+            .context("list postgres codex route candidates by names")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| CodexRouteCandidateRow {
+                account_name: row.get(0),
+                status: row.get(1),
+                settings_json: row.get(2),
+                last_refresh_at_ms: row.get(3),
+                last_error: row.get(4),
+                access_token: row.get(5),
+            })
+            .collect())
+    }
+
     async fn list_kiro_accounts_rows(&self) -> anyhow::Result<Vec<KiroAccountRecord>> {
         self.ensure_connection_alive()?;
         let rows = self
@@ -2439,6 +3319,78 @@ impl PostgresControlRepository {
             .collect())
     }
 
+    async fn list_kiro_route_candidate_rows_by_names(
+        &self,
+        account_names: &[String],
+    ) -> anyhow::Result<Vec<KiroRouteCandidateRow>> {
+        if account_names.is_empty() {
+            return Ok(Vec::new());
+        }
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT
+                    account_name,
+                    profile_arn,
+                    user_id,
+                    status,
+                    max_concurrency,
+                    min_start_interval_ms,
+                    proxy_config_id,
+                    CASE
+                        WHEN jsonb_typeof(auth_json -> 'disabled') = 'boolean'
+                        THEN (auth_json ->> 'disabled')::boolean
+                        ELSE FALSE
+                    END,
+                    COALESCE(
+                        CASE
+                            WHEN jsonb_typeof(auth_json -> 'minimumRemainingCreditsBeforeBlock') = \
+                 'number'
+                            THEN (auth_json ->> 'minimumRemainingCreditsBeforeBlock')::double \
+                 precision
+                        END,
+                        CASE
+                            WHEN jsonb_typeof(auth_json -> \
+                 'minimum_remaining_credits_before_block') = 'number'
+                            THEN (auth_json ->> 'minimum_remaining_credits_before_block')::double \
+                 precision
+                        END,
+                        0.0
+                    ),
+                    NULLIF(COALESCE(auth_json ->> 'profileArn', auth_json ->> 'profile_arn'), ''),
+                    NULLIF(COALESCE(auth_json ->> 'apiRegion', auth_json ->> 'api_region', \
+                 auth_json ->> 'region'), ''),
+                    NULLIF(COALESCE(auth_json ->> 'proxyMode', auth_json ->> 'proxy_mode'), ''),
+                    NULLIF(COALESCE(auth_json ->> 'proxyConfigId', auth_json ->> \
+                 'proxy_config_id'), '')
+                 FROM llm_kiro_accounts
+                 WHERE account_name = ANY($1)
+                 ORDER BY account_name",
+                &[&account_names.to_vec()],
+            )
+            .await
+            .context("list postgres kiro route candidates by names")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| KiroRouteCandidateRow {
+                account_name: row.get(0),
+                profile_arn: row.get(1),
+                user_id: row.get(2),
+                status: row.get(3),
+                max_concurrency: row.get(4),
+                min_start_interval_ms: row.get(5),
+                proxy_config_id: row.get(6),
+                disabled: row.get(7),
+                minimum_remaining_credits_before_block: row.get::<_, f64>(8).max(0.0),
+                auth_profile_arn: row.get(9),
+                api_region: row.get(10),
+                proxy_mode: row.get(11),
+                auth_proxy_config_id: row.get(12),
+            })
+            .collect())
+    }
+
     async fn list_kiro_cached_status_parts_rows(
         &self,
     ) -> anyhow::Result<BTreeMap<String, KiroCachedStatusParts>> {
@@ -2452,6 +3404,38 @@ impl PostgresControlRepository {
             )
             .await
             .context("list kiro cached status")?;
+        let mut status_by_account = BTreeMap::new();
+        for row in rows {
+            let account_name: String = row.get(0);
+            let balance_json: String = row.get(1);
+            let cache_json: String = row.get(2);
+            let balance = serde_json::from_str::<Option<AdminKiroBalanceView>>(&balance_json)
+                .context("decode kiro cached balance")?;
+            let cache = serde_json::from_str::<AdminKiroCacheView>(&cache_json)
+                .context("decode kiro cached cache view")?;
+            status_by_account.insert(account_name, (balance, cache));
+        }
+        Ok(status_by_account)
+    }
+
+    async fn list_kiro_cached_status_parts_rows_by_names(
+        &self,
+        account_names: &[String],
+    ) -> anyhow::Result<BTreeMap<String, KiroCachedStatusParts>> {
+        if account_names.is_empty() {
+            return Ok(BTreeMap::new());
+        }
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT account_name, balance_json::text, cache_json::text
+                 FROM llm_kiro_status_cache
+                 WHERE account_name = ANY($1)",
+                &[&account_names.to_vec()],
+            )
+            .await
+            .context("list kiro cached status by names")?;
         let mut status_by_account = BTreeMap::new();
         for row in rows {
             let account_name: String = row.get(0);
@@ -2731,7 +3715,7 @@ impl PostgresControlRepository {
         &self,
     ) -> anyhow::Result<KiroAdminAccountViewContext> {
         let refresh_interval_seconds = self
-            .load_runtime_config_record()
+            .load_runtime_config_record_cached()
             .await?
             .map(|config| config.kiro_status_refresh_max_interval_seconds.max(0) as u64)
             .unwrap_or(core_store::DEFAULT_KIRO_STATUS_REFRESH_MAX_INTERVAL_SECONDS);
@@ -3288,6 +4272,11 @@ impl PostgresControlRepository {
             )
             .await
             .context("upsert postgres runtime config")?;
+        self.store_runtime_config_record_cached(Some(record)).await;
+        self.bump_dispatch_generation(core_store::PROVIDER_CODEX)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
+            .await;
         Ok(())
     }
 
@@ -3985,19 +4974,115 @@ fn non_negative_i64_to_u64(value: i64) -> Option<u64> {
     u64::try_from(value.max(0)).ok()
 }
 
+fn cached_authenticated_key_from_value(
+    key: &AuthenticatedKey,
+) -> crate::request_cache::CachedAuthenticatedKey {
+    crate::request_cache::CachedAuthenticatedKey {
+        key_id: key.key_id.clone(),
+        key_name: key.key_name.clone(),
+        provider_type: key.provider_type.clone(),
+        protocol_family: key.protocol_family.clone(),
+        status: key.status.clone(),
+        quota_billable_limit: key.quota_billable_limit,
+        billable_tokens_used: key.billable_tokens_used,
+    }
+}
+
+fn cached_authenticated_key_from_bundle(
+    bundle: &KeyBundle,
+) -> crate::request_cache::CachedAuthenticatedKey {
+    cached_authenticated_key_from_value(&AuthenticatedKey {
+        key_id: bundle.key.key_id.clone(),
+        key_name: bundle.key.name.clone(),
+        provider_type: bundle.key.provider_type.clone(),
+        protocol_family: bundle.key.protocol_family.clone(),
+        status: bundle.key.status.clone(),
+        quota_billable_limit: bundle.key.quota_billable_limit,
+        billable_tokens_used: bundle.rollup.billable_tokens,
+    })
+}
+
+fn authenticated_key_from_cached(
+    key: crate::request_cache::CachedAuthenticatedKey,
+) -> AuthenticatedKey {
+    AuthenticatedKey {
+        key_id: key.key_id,
+        key_name: key.key_name,
+        provider_type: key.provider_type,
+        protocol_family: key.protocol_family,
+        status: key.status,
+        quota_billable_limit: key.quota_billable_limit,
+        billable_tokens_used: key.billable_tokens_used,
+    }
+}
+
+fn cached_proxy_from_option(
+    proxy: Option<ProviderProxyConfig>,
+) -> Option<crate::request_cache::CachedProxyConfig> {
+    proxy.map(Into::into)
+}
+
+fn proxy_from_cached_option(
+    proxy: Option<crate::request_cache::CachedProxyConfig>,
+) -> Option<ProviderProxyConfig> {
+    proxy.map(Into::into)
+}
+
+fn build_cached_kiro_account_view(
+    row: &KiroRouteCandidateRow,
+    cached_status: Option<KiroCachedStatusParts>,
+    proxy_context: &ProviderProxyResolutionContext,
+) -> anyhow::Result<crate::request_cache::CachedKiroAccountView> {
+    let cached_balance = cached_status
+        .as_ref()
+        .and_then(|(balance, _)| balance.as_ref());
+    let routing_identity = cached_balance
+        .and_then(|balance| balance.user_id.clone())
+        .or_else(|| row.user_id.clone())
+        .unwrap_or_else(|| row.account_name.clone());
+    let proxy_mode = row.proxy_mode.clone().unwrap_or_else(|| {
+        if row.proxy_config_id.is_some() {
+            "fixed".to_string()
+        } else {
+            "inherit".to_string()
+        }
+    });
+    let proxy_config_id = row
+        .proxy_config_id
+        .clone()
+        .or_else(|| row.auth_proxy_config_id.clone());
+    let proxy = resolve_provider_proxy_config_from_context(
+        &proxy_mode,
+        proxy_config_id.as_deref(),
+        proxy_context,
+    )?;
+    Ok(crate::request_cache::CachedKiroAccountView {
+        account_name: row.account_name.clone(),
+        profile_arn: row.profile_arn.clone().or(row.auth_profile_arn.clone()),
+        user_id: row.user_id.clone(),
+        status: row.status.clone(),
+        request_max_concurrency: row.max_concurrency.and_then(non_negative_i64_to_u64),
+        request_min_start_interval_ms: row.min_start_interval_ms.and_then(non_negative_i64_to_u64),
+        disabled: row.disabled,
+        minimum_remaining_credits_before_block: row.minimum_remaining_credits_before_block,
+        api_region: row
+            .api_region
+            .clone()
+            .unwrap_or_else(|| "us-east-1".to_string()),
+        proxy: cached_proxy_from_option(proxy),
+        routing_identity,
+        cached_balance: cached_status
+            .as_ref()
+            .and_then(|(balance, _)| balance.clone()),
+        cached_cache: cached_status.as_ref().map(|(_, cache)| cache.clone()),
+    })
+}
+
 fn now_ms() -> i64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map(|duration| duration.as_millis().min(i64::MAX as u128) as i64)
         .unwrap_or(0)
-}
-
-fn route_strategy_from_config(route: &KeyRouteConfig) -> anyhow::Result<RouteStrategy> {
-    match route.route_strategy.as_deref().unwrap_or("auto") {
-        "auto" => Ok(RouteStrategy::Auto),
-        "fixed" => Ok(RouteStrategy::Fixed),
-        other => anyhow::bail!("unsupported route strategy `{other}`"),
-    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -4301,7 +5386,10 @@ fn decode_codex_account_settings(value: &str) -> anyhow::Result<CodexAccountSett
 #[async_trait]
 impl AdminConfigStore for PostgresControlRepository {
     async fn get_admin_runtime_config(&self) -> anyhow::Result<AdminRuntimeConfig> {
-        let record = self.load_runtime_config_record().await?.unwrap_or_default();
+        let record = self
+            .load_runtime_config_record_cached()
+            .await?
+            .unwrap_or_default();
         Ok(record.to_admin_runtime_config())
     }
 
@@ -4309,7 +5397,10 @@ impl AdminConfigStore for PostgresControlRepository {
         &self,
         config: AdminRuntimeConfig,
     ) -> anyhow::Result<AdminRuntimeConfig> {
-        let mut record = self.load_runtime_config_record().await?.unwrap_or_default();
+        let mut record = self
+            .load_runtime_config_record_cached()
+            .await?
+            .unwrap_or_default();
         record.apply_admin_runtime_config(&config);
         self.upsert_runtime_config_record(&record).await?;
         Ok(record.to_admin_runtime_config())
@@ -4511,6 +5602,7 @@ impl AdminKeyStore for PostgresControlRepository {
             updated_at_ms: key.created_at_ms,
         };
         Self::upsert_key_bundle_client(&self.client, &key_record, &route, &rollup).await?;
+        self.bump_dispatch_generation(&key.provider_type).await;
         self.load_key_bundle_by_id(&key.id)
             .await?
             .map(|bundle| admin_key_from_bundle(&bundle))
@@ -4588,6 +5680,12 @@ impl AdminKeyStore for PostgresControlRepository {
         bundle.rollup.updated_at_ms = bundle.rollup.updated_at_ms.max(patch.updated_at_ms);
         Self::upsert_key_bundle_client(&self.client, &bundle.key, &bundle.route, &bundle.rollup)
             .await?;
+        self.invalidate_authenticated_key_cache_by_ids(std::slice::from_ref(&bundle.key.key_id))
+            .await;
+        self.invalidate_request_snapshot_cache(&bundle.key.provider_type, &bundle.key.key_id)
+            .await;
+        self.bump_dispatch_generation(&bundle.key.provider_type)
+            .await;
         Ok(Some(admin_key_from_bundle(&bundle)))
     }
 
@@ -4600,6 +5698,12 @@ impl AdminKeyStore for PostgresControlRepository {
             .execute("DELETE FROM llm_keys WHERE key_id = $1", &[&key_id])
             .await
             .context("delete postgres admin key")?;
+        self.invalidate_authenticated_key_cache_by_ids(std::slice::from_ref(&bundle.key.key_id))
+            .await;
+        self.invalidate_request_snapshot_cache(&bundle.key.provider_type, &bundle.key.key_id)
+            .await;
+        self.bump_dispatch_generation(&bundle.key.provider_type)
+            .await;
         Ok(Some(admin_key_from_bundle(&bundle)))
     }
 }
@@ -4687,6 +5791,7 @@ impl AdminAccountGroupStore for PostgresControlRepository {
             )
             .await
             .context("create postgres account group")?;
+        self.bump_dispatch_generation(&group.provider_type).await;
         self.get_admin_account_group_row(&group.id)
             .await?
             .context("created postgres account group disappeared")
@@ -4719,6 +5824,7 @@ impl AdminAccountGroupStore for PostgresControlRepository {
             )
             .await
             .context("patch postgres account group")?;
+        self.bump_dispatch_generation(&group.provider_type).await;
         Ok(Some(group))
     }
 
@@ -4734,6 +5840,7 @@ impl AdminAccountGroupStore for PostgresControlRepository {
             .execute("DELETE FROM llm_account_groups WHERE group_id = $1", &[&group_id])
             .await
             .context("delete postgres account group")?;
+        self.bump_dispatch_generation(&group.provider_type).await;
         Ok(Some(group))
     }
 }
@@ -4775,6 +5882,10 @@ impl AdminProxyStore for PostgresControlRepository {
             )
             .await
             .context("create postgres proxy config")?;
+        self.bump_dispatch_generation(core_store::PROVIDER_CODEX)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
+            .await;
         self.get_admin_proxy_config_row(&proxy.id)
             .await?
             .context("created postgres proxy config disappeared")
@@ -4823,6 +5934,14 @@ impl AdminProxyStore for PostgresControlRepository {
             )
             .await
             .context("patch postgres proxy config")?;
+        self.invalidate_all_account_views_for_provider(core_store::PROVIDER_CODEX)
+            .await;
+        self.invalidate_all_account_views_for_provider(core_store::PROVIDER_KIRO)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_CODEX)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
+            .await;
         Ok(Some(proxy))
     }
 
@@ -4838,6 +5957,14 @@ impl AdminProxyStore for PostgresControlRepository {
             .execute("DELETE FROM llm_proxy_configs WHERE proxy_config_id = $1", &[&proxy_id])
             .await
             .context("delete postgres proxy config")?;
+        self.invalidate_all_account_views_for_provider(core_store::PROVIDER_CODEX)
+            .await;
+        self.invalidate_all_account_views_for_provider(core_store::PROVIDER_KIRO)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_CODEX)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
+            .await;
         Ok(Some(proxy))
     }
 
@@ -4879,6 +6006,9 @@ impl AdminProxyStore for PostgresControlRepository {
                     .context("delete postgres proxy binding")?;
             },
         }
+        self.invalidate_all_account_views_for_provider(provider_type)
+            .await;
+        self.bump_dispatch_generation(provider_type).await;
         self.load_admin_proxy_binding_row(provider_type).await
     }
 
@@ -4970,11 +6100,15 @@ impl AdminProxyStore for PostgresControlRepository {
                 account.updated_at_ms = now_ms();
                 account.auth_json = clear_legacy_kiro_proxy_json(&account.auth_json, &proxy.id)?;
                 self.upsert_kiro_account(&account).await?;
+                self.invalidate_account_cache(core_store::PROVIDER_KIRO, &account.account_name)
+                    .await;
                 migrated_account_names.push(account.account_name);
             }
         }
         migrated_account_names.sort();
         migrated_account_names.dedup();
+        self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
+            .await;
         Ok(AdminLegacyKiroProxyMigration {
             created_configs,
             reused_configs,
@@ -5099,6 +6233,10 @@ impl AdminCodexAccountStore for PostgresControlRepository {
             updated_at_ms: account.created_at_ms,
         };
         self.upsert_codex_account(&record).await?;
+        self.invalidate_account_cache(core_store::PROVIDER_CODEX, &account.name)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_CODEX)
+            .await;
         self.get_admin_codex_account(&account.name)
             .await?
             .context("created postgres codex account disappeared")
@@ -5141,6 +6279,10 @@ impl AdminCodexAccountStore for PostgresControlRepository {
             serde_json::to_string(&settings).context("serialize postgres codex settings")?;
         record.updated_at_ms = patch.updated_at_ms;
         self.upsert_codex_account(&record).await?;
+        self.invalidate_account_cache(core_store::PROVIDER_CODEX, &record.account_name)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_CODEX)
+            .await;
         Ok(Some(self.admin_codex_account_from_record(&record).await?))
     }
 
@@ -5157,6 +6299,10 @@ impl AdminCodexAccountStore for PostgresControlRepository {
             .execute("DELETE FROM llm_codex_accounts WHERE account_name = $1", &[&name])
             .await
             .context("delete postgres codex account")?;
+        self.invalidate_account_cache(core_store::PROVIDER_CODEX, &record.account_name)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_CODEX)
+            .await;
         Ok(Some(view))
     }
 
@@ -5172,6 +6318,8 @@ impl AdminCodexAccountStore for PostgresControlRepository {
         record.last_error = None;
         record.updated_at_ms = refreshed_at_ms;
         self.upsert_codex_account(&record).await?;
+        self.invalidate_account_cache(core_store::PROVIDER_CODEX, &record.account_name)
+            .await;
         Ok(Some(self.admin_codex_account_from_record(&record).await?))
     }
 
@@ -5539,7 +6687,7 @@ impl AdminKiroAccountStore for PostgresControlRepository {
     ) -> anyhow::Result<Vec<KiroStatusRefreshTarget>> {
         self.ensure_connection_alive()?;
         let refresh_interval_seconds = self
-            .load_runtime_config_record()
+            .load_runtime_config_record_cached()
             .await?
             .map(|config| config.kiro_status_refresh_max_interval_seconds.max(0) as u64)
             .unwrap_or(core_store::DEFAULT_KIRO_STATUS_REFRESH_MAX_INTERVAL_SECONDS);
@@ -5605,6 +6753,10 @@ impl AdminKiroAccountStore for PostgresControlRepository {
             updated_at_ms: account.created_at_ms,
         };
         self.upsert_kiro_account(&record).await?;
+        self.invalidate_account_cache(core_store::PROVIDER_KIRO, &account.name)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
+            .await;
         let Some(record) = self.get_kiro_account_row(&account.name).await? else {
             anyhow::bail!("created postgres kiro account disappeared");
         };
@@ -5660,6 +6812,10 @@ impl AdminKiroAccountStore for PostgresControlRepository {
             serde_json::to_string(&auth_value).context("serialize postgres kiro auth json")?;
         record.updated_at_ms = patch.updated_at_ms;
         self.upsert_kiro_account(&record).await?;
+        self.invalidate_account_cache(core_store::PROVIDER_KIRO, &record.account_name)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
+            .await;
         Ok(Some(self.admin_kiro_account_from_record(&record).await?))
     }
 
@@ -5676,6 +6832,10 @@ impl AdminKiroAccountStore for PostgresControlRepository {
             .execute("DELETE FROM llm_kiro_accounts WHERE account_name = $1", &[&name])
             .await
             .context("delete postgres kiro account")?;
+        self.invalidate_account_cache(core_store::PROVIDER_KIRO, &record.account_name)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
+            .await;
         Ok(Some(view))
     }
 
@@ -5699,7 +6859,10 @@ impl AdminKiroAccountStore for PostgresControlRepository {
         if record.status != core_store::KEY_STATUS_ACTIVE {
             return Ok(None);
         }
-        let runtime_config = self.load_runtime_config_record().await?.unwrap_or_default();
+        let runtime_config = self
+            .load_runtime_config_record_cached()
+            .await?
+            .unwrap_or_default();
         let auth_json = serde_json::from_str::<serde_json::Value>(&record.auth_json)
             .context("parse kiro account auth json")?;
         let profile_arn = record
@@ -5832,6 +6995,8 @@ impl AdminKiroAccountStore for PostgresControlRepository {
             )
             .await
             .context("upsert postgres kiro status cache")?;
+        self.invalidate_account_cache(core_store::PROVIDER_KIRO, &update.account_name)
+            .await;
         Ok(())
     }
 }
@@ -5853,32 +7018,17 @@ impl ProviderRouteStore for PostgresControlRepository {
         &self,
         key: &AuthenticatedKey,
     ) -> anyhow::Result<Vec<ProviderCodexRoute>> {
-        let Some(bundle) = self.load_key_bundle_by_id(&key.key_id).await? else {
+        let Some(snapshot) = self.load_codex_request_snapshot_cached(&key.key_id).await? else {
             return Ok(Vec::new());
         };
-        if bundle.key.provider_type != core_store::PROVIDER_CODEX {
+        if snapshot.key.provider_type != core_store::PROVIDER_CODEX {
             return Ok(Vec::new());
         }
-
-        let runtime_config = self.load_runtime_config_record().await?.unwrap_or_default();
-        let records = self.list_codex_route_candidate_rows().await?;
-        let account_names = self
-            .resolve_route_account_names(
-                core_store::PROVIDER_CODEX,
-                &bundle.route,
-                records
-                    .iter()
-                    .filter(|record| record.status == core_store::KEY_STATUS_ACTIVE)
-                    .map(|record| record.account_name.clone())
-                    .collect(),
-            )
-            .await?;
-        let route_strategy_at_event = route_strategy_from_config(&bundle.route)?;
-        let account_group_id_at_event = bundle.route.account_group_id.clone();
-        let records_by_name = records
-            .into_iter()
-            .map(|record| (record.account_name.clone(), record))
-            .collect::<BTreeMap<_, _>>();
+        let route_strategy_at_event = match snapshot.route_strategy.as_str() {
+            "fixed" => RouteStrategy::Fixed,
+            _ => RouteStrategy::Auto,
+        };
+        let account_group_id_at_event = snapshot.account_group_id_at_event.clone();
         let status_by_account = self
             .load_codex_rate_limit_status_cached()
             .await?
@@ -5890,62 +7040,54 @@ impl ProviderRouteStore for PostgresControlRepository {
                     .collect::<BTreeMap<_, _>>()
             })
             .unwrap_or_default();
-        let proxy_context = self
-            .load_provider_proxy_resolution_context(core_store::PROVIDER_CODEX)
+        let views_by_name = self
+            .load_codex_account_views_cached(&snapshot.selected_account_names)
             .await?;
-        let route_weight_tiers = records_by_name
+        let route_weight_tiers = views_by_name
             .iter()
-            .map(|(name, record)| {
-                let settings = decode_codex_account_settings(&record.settings_json)?;
-                Ok((name.clone(), settings.route_weight_tier))
-            })
-            .collect::<anyhow::Result<BTreeMap<_, _>>>()?;
+            .map(|(name, view)| (name.clone(), view.route_weight_tier.clone()))
+            .collect::<BTreeMap<_, _>>();
         let mut routes = Vec::new();
-        for account_name in account_names {
-            let Some(record) = records_by_name.get(&account_name).cloned() else {
+        for account_name in snapshot.selected_account_names {
+            let Some(view) = views_by_name.get(&account_name).cloned() else {
                 continue;
             };
-            if record.status != core_store::KEY_STATUS_ACTIVE {
+            if view.status != core_store::KEY_STATUS_ACTIVE {
                 continue;
             }
-            let settings = decode_codex_account_settings(&record.settings_json)?;
-            let proxy = resolve_provider_proxy_config_from_context(
-                &settings.proxy_mode,
-                settings.proxy_config_id.as_deref(),
-                &proxy_context,
-            )?;
             let minimal_auth_json =
-                minimal_codex_auth_json_for_access_token(record.access_token.as_deref());
+                minimal_codex_auth_json_for_access_token(view.access_token.as_deref());
             let cached_error_message = codex_cached_error_message(
                 &account_name,
-                record.last_error.as_deref(),
-                record.last_refresh_at_ms,
-                settings.auth_refresh_enabled,
+                view.last_error.as_deref(),
+                view.last_refresh_at_ms,
+                view.auth_refresh_enabled,
                 &minimal_auth_json,
                 &status_by_account,
             );
             routes.push(ProviderCodexRoute {
-                account_name: record.account_name,
+                account_name: view.account_name,
                 account_group_id_at_event: account_group_id_at_event.clone(),
                 route_strategy_at_event,
                 auth_json: String::new(),
-                map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
-                auth_refresh_enabled: settings.auth_refresh_enabled,
-                request_max_concurrency: bundle
-                    .route
-                    .request_max_concurrency
-                    .and_then(non_negative_i64_to_u64),
-                request_min_start_interval_ms: bundle
-                    .route
-                    .request_min_start_interval_ms
-                    .and_then(non_negative_i64_to_u64),
-                account_request_max_concurrency: settings.request_max_concurrency,
-                account_request_min_start_interval_ms: settings.request_min_start_interval_ms,
+                map_gpt53_codex_to_spark: view.map_gpt53_codex_to_spark,
+                auth_refresh_enabled: view.auth_refresh_enabled,
+                request_max_concurrency: snapshot.request_max_concurrency,
+                request_min_start_interval_ms: snapshot.request_min_start_interval_ms,
+                account_request_max_concurrency: view.request_max_concurrency,
+                account_request_min_start_interval_ms: view.request_min_start_interval_ms,
                 cached_error_message,
-                proxy,
+                proxy: proxy_from_cached_option(view.proxy),
             });
         }
         let codex_status = self.load_codex_rate_limit_status_cached().await?;
+        let runtime_config = RuntimeConfigRecord {
+            codex_weight_free: snapshot.codex_weight_free,
+            codex_weight_plus: snapshot.codex_weight_plus,
+            codex_weight_pro5x: snapshot.codex_weight_pro5x,
+            codex_weight_pro20x: snapshot.codex_weight_pro20x,
+            ..RuntimeConfigRecord::default()
+        };
         sort_codex_routes_by_cached_quota(
             &mut routes,
             codex_status.as_ref(),
@@ -5959,7 +7101,55 @@ impl ProviderRouteStore for PostgresControlRepository {
         &self,
         account_name: &str,
     ) -> anyhow::Result<Option<ProviderCodexRoute>> {
-        self.resolve_admin_codex_account_route(account_name).await
+        if self.request_cache.is_none() {
+            return self.resolve_admin_codex_account_route(account_name).await;
+        }
+        let Some(view) = self
+            .load_codex_account_views_cached(&[account_name.to_string()])
+            .await?
+            .remove(account_name)
+        else {
+            return Ok(None);
+        };
+        if view.status != core_store::KEY_STATUS_ACTIVE {
+            return Ok(None);
+        }
+        let Some(auth) = self.load_codex_account_auth_cached(account_name).await? else {
+            return Ok(None);
+        };
+        let status_by_account = self
+            .load_codex_rate_limit_status_cached()
+            .await?
+            .map(|status| {
+                status
+                    .accounts
+                    .into_iter()
+                    .map(|account| (account.name.clone(), account))
+                    .collect::<BTreeMap<_, _>>()
+            })
+            .unwrap_or_default();
+        let cached_error_message = codex_cached_error_message(
+            account_name,
+            view.last_error.as_deref(),
+            view.last_refresh_at_ms,
+            view.auth_refresh_enabled,
+            &auth.auth_json,
+            &status_by_account,
+        );
+        Ok(Some(ProviderCodexRoute {
+            account_name: view.account_name,
+            account_group_id_at_event: None,
+            route_strategy_at_event: RouteStrategy::Auto,
+            auth_json: auth.auth_json,
+            map_gpt53_codex_to_spark: view.map_gpt53_codex_to_spark,
+            auth_refresh_enabled: view.auth_refresh_enabled,
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+            account_request_max_concurrency: view.request_max_concurrency,
+            account_request_min_start_interval_ms: view.request_min_start_interval_ms,
+            cached_error_message,
+            proxy: proxy_from_cached_option(view.proxy),
+        }))
     }
 
     async fn resolve_kiro_route(
@@ -5977,161 +7167,77 @@ impl ProviderRouteStore for PostgresControlRepository {
         &self,
         key: &AuthenticatedKey,
     ) -> anyhow::Result<Vec<ProviderKiroRoute>> {
-        let Some(bundle) = self.load_key_bundle_by_id(&key.key_id).await? else {
+        let Some(snapshot) = self.load_kiro_request_snapshot_cached(&key.key_id).await? else {
             return Ok(Vec::new());
         };
-        if bundle.key.provider_type != core_store::PROVIDER_KIRO {
+        if snapshot.key.provider_type != core_store::PROVIDER_KIRO {
             return Ok(Vec::new());
         }
-
-        let runtime_config = self.load_runtime_config_record().await?.unwrap_or_default();
-        let records = self.list_kiro_route_candidate_rows().await?;
-        let account_names = self
-            .resolve_route_account_names(
-                core_store::PROVIDER_KIRO,
-                &bundle.route,
-                records
-                    .iter()
-                    .filter(|record| record.status == core_store::KEY_STATUS_ACTIVE)
-                    .map(|record| record.account_name.clone())
-                    .collect(),
-            )
-            .await?;
-        let route_strategy_at_event = route_strategy_from_config(&bundle.route)?;
-        let account_group_id_at_event = bundle.route.account_group_id.clone();
-        let cache_policy_json = effective_kiro_cache_policy_json(
-            &runtime_config.kiro_cache_policy_json,
-            bundle.route.kiro_cache_policy_override_json.as_deref(),
-        )?;
-        let records_by_name = records
-            .into_iter()
-            .map(|record| (record.account_name.clone(), record))
-            .collect::<BTreeMap<_, _>>();
-        let status_by_account = self.list_kiro_cached_status_parts_rows().await?;
-        let proxy_context = self
-            .load_provider_proxy_resolution_context(core_store::PROVIDER_KIRO)
+        let route_strategy_at_event = match snapshot.route_strategy.as_str() {
+            "fixed" => RouteStrategy::Fixed,
+            _ => RouteStrategy::Auto,
+        };
+        let account_group_id_at_event = snapshot.account_group_id_at_event.clone();
+        let views_by_name = self
+            .load_kiro_account_views_cached(&snapshot.selected_account_names)
             .await?;
         let mut routes = Vec::new();
-        for account_name in account_names {
-            let Some(record) = records_by_name.get(&account_name).cloned() else {
+        for account_name in snapshot.selected_account_names {
+            let Some(view) = views_by_name.get(&account_name).cloned() else {
                 continue;
             };
-            if record.status != core_store::KEY_STATUS_ACTIVE {
+            if view.status != core_store::KEY_STATUS_ACTIVE {
                 continue;
             }
-            if record.disabled {
+            if view.disabled {
                 continue;
             }
-            let minimum_remaining_credits_before_block =
-                record.minimum_remaining_credits_before_block;
-            let cached_status = status_by_account.get(&record.account_name).cloned();
-            if let Some((balance, cache)) = &cached_status {
-                if matches!(cache.status.as_str(), "disabled" | "quota_exhausted") {
-                    continue;
-                }
-                if balance.as_ref().is_some_and(|balance| {
-                    balance.remaining <= 0.0
-                        || balance.remaining <= minimum_remaining_credits_before_block
-                }) {
+            if let Some(cache_view) = &view.cached_cache {
+                if matches!(cache_view.status.as_str(), "disabled" | "quota_exhausted") {
                     continue;
                 }
             }
-            let cached_balance = cached_status
-                .as_ref()
-                .and_then(|(balance, _)| balance.as_ref());
-            let cached_balance_view = cached_balance.cloned();
-            let cached_cache_view = cached_status.as_ref().map(|(_, cache)| cache.clone());
-            let cached_status_label = cached_status
-                .as_ref()
-                .map(|(_, cache)| cache.status.clone());
-            let cached_remaining_credits = cached_balance.map(|balance| balance.remaining);
-            let routing_identity = cached_balance
-                .and_then(|balance| balance.user_id.clone())
-                .or_else(|| record.user_id.clone())
-                .unwrap_or_else(|| record.account_name.clone());
-            let profile_arn = record
-                .profile_arn
-                .clone()
-                .or_else(|| record.auth_profile_arn.clone());
-            let api_region = record
-                .api_region
-                .clone()
-                .unwrap_or_else(|| "us-east-1".to_string());
-            let billable_model_multipliers_json = bundle
-                .route
-                .kiro_billable_model_multipliers_override_json
-                .clone()
-                .unwrap_or_else(|| runtime_config.kiro_billable_model_multipliers_json.clone());
-            let proxy_mode = record.proxy_mode.clone().unwrap_or_else(|| {
-                if record.proxy_config_id.is_some() {
-                    "fixed".to_string()
-                } else {
-                    "inherit".to_string()
-                }
-            });
-            let proxy_config_id = record
-                .proxy_config_id
-                .clone()
-                .or_else(|| record.auth_proxy_config_id.clone());
-            let proxy = resolve_provider_proxy_config_from_context(
-                &proxy_mode,
-                proxy_config_id.as_deref(),
-                &proxy_context,
-            )?;
+            if view.cached_balance.as_ref().is_some_and(|balance| {
+                balance.remaining <= 0.0
+                    || balance.remaining <= view.minimum_remaining_credits_before_block
+            }) {
+                continue;
+            }
             routes.push(ProviderKiroRoute {
-                account_name: record.account_name,
+                account_name: view.account_name,
                 account_group_id_at_event: account_group_id_at_event.clone(),
                 route_strategy_at_event,
                 auth_json: String::new(),
-                profile_arn,
-                api_region,
-                request_validation_enabled: bundle.route.kiro_request_validation_enabled,
-                cache_estimation_enabled: bundle.route.kiro_cache_estimation_enabled,
-                zero_cache_debug_enabled: bundle.route.kiro_zero_cache_debug_enabled,
-                full_request_logging_enabled: bundle.route.kiro_full_request_logging_enabled,
-                model_name_map_json: bundle
-                    .route
-                    .model_name_map_json
-                    .clone()
-                    .unwrap_or_else(|| "{}".to_string()),
-                cache_kmodels_json: runtime_config.kiro_cache_kmodels_json.clone(),
-                cache_policy_json: cache_policy_json.clone(),
-                prefix_cache_mode: runtime_config.kiro_prefix_cache_mode.clone(),
-                prefix_cache_max_tokens: runtime_config.kiro_prefix_cache_max_tokens.max(0) as u64,
-                prefix_cache_entry_ttl_seconds: runtime_config
-                    .kiro_prefix_cache_entry_ttl_seconds
-                    .max(0) as u64,
-                conversation_anchor_max_entries: runtime_config
-                    .kiro_conversation_anchor_max_entries
-                    .max(0) as u64,
-                conversation_anchor_ttl_seconds: runtime_config
-                    .kiro_conversation_anchor_ttl_seconds
-                    .max(0) as u64,
-                billable_model_multipliers_json,
-                request_max_concurrency: bundle
-                    .route
-                    .request_max_concurrency
-                    .and_then(non_negative_i64_to_u64),
-                request_min_start_interval_ms: bundle
-                    .route
-                    .request_min_start_interval_ms
-                    .and_then(non_negative_i64_to_u64),
-                account_request_max_concurrency: record
-                    .max_concurrency
-                    .and_then(non_negative_i64_to_u64),
-                account_request_min_start_interval_ms: record
-                    .min_start_interval_ms
-                    .and_then(non_negative_i64_to_u64),
-                proxy,
-                routing_identity,
-                cached_status: cached_status_label,
-                cached_remaining_credits,
-                cached_balance: cached_balance_view,
-                cached_cache: cached_cache_view,
-                status_refresh_interval_seconds: runtime_config
-                    .kiro_status_refresh_max_interval_seconds
-                    .max(0) as u64,
-                minimum_remaining_credits_before_block,
+                profile_arn: view.profile_arn,
+                api_region: view.api_region,
+                request_validation_enabled: snapshot.request_validation_enabled,
+                cache_estimation_enabled: snapshot.cache_estimation_enabled,
+                zero_cache_debug_enabled: snapshot.zero_cache_debug_enabled,
+                full_request_logging_enabled: snapshot.full_request_logging_enabled,
+                model_name_map_json: snapshot.model_name_map_json.clone(),
+                cache_kmodels_json: snapshot.cache_kmodels_json.clone(),
+                cache_policy_json: snapshot.cache_policy_json.clone(),
+                prefix_cache_mode: snapshot.prefix_cache_mode.clone(),
+                prefix_cache_max_tokens: snapshot.prefix_cache_max_tokens,
+                prefix_cache_entry_ttl_seconds: snapshot.prefix_cache_entry_ttl_seconds,
+                conversation_anchor_max_entries: snapshot.conversation_anchor_max_entries,
+                conversation_anchor_ttl_seconds: snapshot.conversation_anchor_ttl_seconds,
+                billable_model_multipliers_json: snapshot.billable_model_multipliers_json.clone(),
+                request_max_concurrency: snapshot.request_max_concurrency,
+                request_min_start_interval_ms: snapshot.request_min_start_interval_ms,
+                account_request_max_concurrency: view.request_max_concurrency,
+                account_request_min_start_interval_ms: view.request_min_start_interval_ms,
+                proxy: proxy_from_cached_option(view.proxy),
+                routing_identity: view.routing_identity,
+                cached_status: view.cached_cache.as_ref().map(|cache| cache.status.clone()),
+                cached_remaining_credits: view
+                    .cached_balance
+                    .as_ref()
+                    .map(|balance| balance.remaining),
+                cached_balance: view.cached_balance,
+                cached_cache: view.cached_cache,
+                status_refresh_interval_seconds: snapshot.status_refresh_interval_seconds,
+                minimum_remaining_credits_before_block: view.minimum_remaining_credits_before_block,
             });
         }
         Ok(routes)
@@ -6141,7 +7247,70 @@ impl ProviderRouteStore for PostgresControlRepository {
         &self,
         account_name: &str,
     ) -> anyhow::Result<Option<ProviderKiroRoute>> {
-        self.resolve_admin_kiro_account_route(account_name).await
+        if self.request_cache.is_none() {
+            return self.resolve_admin_kiro_account_route(account_name).await;
+        }
+        let Some(view) = self
+            .load_kiro_account_views_cached(&[account_name.to_string()])
+            .await?
+            .remove(account_name)
+        else {
+            return Ok(None);
+        };
+        if view.status != core_store::KEY_STATUS_ACTIVE {
+            return Ok(None);
+        }
+        let Some(auth) = self.load_kiro_account_auth_cached(account_name).await? else {
+            return Ok(None);
+        };
+        let runtime_config = self
+            .load_runtime_config_record_cached()
+            .await?
+            .unwrap_or_default();
+        Ok(Some(ProviderKiroRoute {
+            account_name: view.account_name,
+            account_group_id_at_event: None,
+            route_strategy_at_event: RouteStrategy::Auto,
+            auth_json: auth.auth_json,
+            profile_arn: view.profile_arn,
+            api_region: view.api_region,
+            request_validation_enabled: true,
+            cache_estimation_enabled: true,
+            zero_cache_debug_enabled: false,
+            full_request_logging_enabled: false,
+            model_name_map_json: "{}".to_string(),
+            cache_kmodels_json: runtime_config.kiro_cache_kmodels_json,
+            cache_policy_json: runtime_config.kiro_cache_policy_json,
+            prefix_cache_mode: runtime_config.kiro_prefix_cache_mode,
+            prefix_cache_max_tokens: runtime_config.kiro_prefix_cache_max_tokens.max(0) as u64,
+            prefix_cache_entry_ttl_seconds: runtime_config
+                .kiro_prefix_cache_entry_ttl_seconds
+                .max(0) as u64,
+            conversation_anchor_max_entries: runtime_config
+                .kiro_conversation_anchor_max_entries
+                .max(0) as u64,
+            conversation_anchor_ttl_seconds: runtime_config
+                .kiro_conversation_anchor_ttl_seconds
+                .max(0) as u64,
+            billable_model_multipliers_json: runtime_config.kiro_billable_model_multipliers_json,
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+            account_request_max_concurrency: view.request_max_concurrency,
+            account_request_min_start_interval_ms: view.request_min_start_interval_ms,
+            proxy: proxy_from_cached_option(view.proxy),
+            routing_identity: view.routing_identity,
+            cached_status: view.cached_cache.as_ref().map(|cache| cache.status.clone()),
+            cached_remaining_credits: view
+                .cached_balance
+                .as_ref()
+                .map(|balance| balance.remaining),
+            cached_balance: view.cached_balance,
+            cached_cache: view.cached_cache,
+            status_refresh_interval_seconds: runtime_config
+                .kiro_status_refresh_max_interval_seconds
+                .max(0) as u64,
+            minimum_remaining_credits_before_block: view.minimum_remaining_credits_before_block,
+        }))
     }
 
     async fn save_kiro_auth_update(&self, _update: ProviderKiroAuthUpdate) -> anyhow::Result<()> {
@@ -6157,7 +7326,10 @@ impl ProviderRouteStore for PostgresControlRepository {
         record.last_refresh_at_ms = Some(_update.refreshed_at_ms);
         record.last_error = _update.last_error.clone();
         record.updated_at_ms = _update.refreshed_at_ms;
-        self.upsert_kiro_account(&record).await
+        self.upsert_kiro_account(&record).await?;
+        self.invalidate_account_cache(core_store::PROVIDER_KIRO, &record.account_name)
+            .await;
+        Ok(())
     }
 
     async fn save_codex_auth_update(&self, update: ProviderCodexAuthUpdate) -> anyhow::Result<()> {
@@ -6172,7 +7344,10 @@ impl ProviderRouteStore for PostgresControlRepository {
         record.last_refresh_at_ms = Some(update.refreshed_at_ms);
         record.last_error = update.last_error.clone();
         record.updated_at_ms = update.refreshed_at_ms;
-        self.upsert_codex_account(&record).await
+        self.upsert_codex_account(&record).await?;
+        self.invalidate_account_cache(core_store::PROVIDER_CODEX, &record.account_name)
+            .await;
+        Ok(())
     }
 
     async fn set_codex_account_auto_refresh_enabled(
@@ -6192,7 +7367,12 @@ impl ProviderRouteStore for PostgresControlRepository {
         record.settings_json =
             serde_json::to_string(&settings).context("serialize postgres codex settings")?;
         record.updated_at_ms = updated_at_ms;
-        self.upsert_codex_account(&record).await
+        self.upsert_codex_account(&record).await?;
+        self.invalidate_account_cache(core_store::PROVIDER_CODEX, &record.account_name)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_CODEX)
+            .await;
+        Ok(())
     }
 
     async fn mark_kiro_account_quota_exhausted(
@@ -6202,7 +7382,7 @@ impl ProviderRouteStore for PostgresControlRepository {
         checked_at_ms: i64,
     ) -> anyhow::Result<()> {
         let refresh_interval_seconds = self
-            .load_runtime_config_record()
+            .load_runtime_config_record_cached()
             .await?
             .unwrap_or_default()
             .kiro_status_refresh_max_interval_seconds
@@ -6239,7 +7419,7 @@ impl ControlStore for PostgresControlRepository {
         &self,
         secret: &str,
     ) -> anyhow::Result<Option<AuthenticatedKey>> {
-        self.load_authenticated_key_by_hash(&hash_bearer_secret(secret))
+        self.load_authenticated_key_cached(&hash_bearer_secret(secret))
             .await
     }
 
@@ -6429,7 +7609,7 @@ impl PublicSubmissionStore for PostgresControlRepository {
 impl PublicAccessStore for PostgresControlRepository {
     async fn auth_cache_ttl_seconds(&self) -> anyhow::Result<u64> {
         Ok(self
-            .load_runtime_config_record()
+            .load_runtime_config_record_cached()
             .await?
             .map_or(DEFAULT_AUTH_CACHE_TTL_SECONDS, |record| {
                 record.auth_cache_ttl_seconds.max(0) as u64
@@ -6989,7 +8169,7 @@ impl PublicStatusStore for PostgresControlRepository {
             return Ok(snapshot);
         }
         let refresh_interval_seconds = self
-            .load_runtime_config_record()
+            .load_runtime_config_record_cached()
             .await?
             .map(|record| record.codex_status_refresh_max_interval_seconds.max(0) as u64)
             .unwrap_or(DEFAULT_CODEX_STATUS_REFRESH_SECONDS);
@@ -7016,6 +8196,22 @@ impl PublicStatusStore for PostgresControlRepository {
             )
             .await
             .context("upsert postgres codex rate-limit status snapshot")?;
+        if let Some(cache) = self.request_cache.as_ref() {
+            let cache_key = cache.codex_status_key();
+            let lookup = crate::request_cache::CachedCodexStatusLookup {
+                snapshot: Some(snapshot.clone()),
+            };
+            if let Err(err) = cache
+                .set_json(&cache_key, &lookup, cache.codex_status_ttl())
+                .await
+            {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache codex status write-through failed"
+                );
+            }
+        }
         self.store_cached_codex_rate_limit_status(Some(snapshot))
             .await;
         Ok(())
@@ -7226,7 +8422,7 @@ mod tests {
         seed_test_key_bundle(&database_url)
             .await
             .expect("seed postgres test key bundle");
-        let repo = super::PostgresControlRepository::connect(&database_url)
+        let repo = super::PostgresControlRepository::connect(&database_url, None)
             .await
             .expect("connect postgres repository");
 
@@ -7245,6 +8441,30 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn postgres_repository_accepts_optional_request_cache_config() {
+        let Ok(database_url) = std::env::var("TEST_POSTGRES_URL") else {
+            eprintln!("skipping postgres integration test: TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let _guard = test_db_guard().await;
+        reset_test_db(&database_url)
+            .await
+            .expect("reset postgres test database");
+
+        let repo = super::PostgresControlRepository::connect(
+            &database_url,
+            Some(crate::request_cache::RequestCacheConfig {
+                url: "redis://127.0.0.1:6379/0".to_string(),
+                key_prefix: "llma:test".to_string(),
+            }),
+        )
+        .await
+        .expect("connect postgres repository with request cache");
+
+        assert!(repo.request_cache.is_some());
+    }
+
+    #[tokio::test]
     async fn postgres_repository_updates_key_usage_rollups() {
         let Ok(database_url) = std::env::var("TEST_POSTGRES_URL") else {
             eprintln!("skipping postgres integration test: TEST_POSTGRES_URL is not set");
@@ -7257,7 +8477,7 @@ mod tests {
         seed_test_key_bundle(&database_url)
             .await
             .expect("seed postgres test key bundle");
-        let repo = super::PostgresControlRepository::connect(&database_url)
+        let repo = super::PostgresControlRepository::connect(&database_url, None)
             .await
             .expect("connect postgres repository");
 
@@ -7325,7 +8545,7 @@ mod tests {
         reset_test_db(&database_url)
             .await
             .expect("reset postgres test database");
-        let repo = super::PostgresControlRepository::connect(&database_url)
+        let repo = super::PostgresControlRepository::connect(&database_url, None)
             .await
             .expect("connect postgres repository");
 
@@ -7462,7 +8682,7 @@ mod tests {
         seed_test_key_bundle(&database_url)
             .await
             .expect("seed postgres test key bundle");
-        let repo = super::PostgresControlRepository::connect(&database_url)
+        let repo = super::PostgresControlRepository::connect(&database_url, None)
             .await
             .expect("connect postgres repository");
 
@@ -7547,7 +8767,7 @@ mod tests {
         seed_test_kiro_key_page_fixture(&database_url)
             .await
             .expect("seed postgres kiro key page fixture");
-        let repo = super::PostgresControlRepository::connect(&database_url)
+        let repo = super::PostgresControlRepository::connect(&database_url, None)
             .await
             .expect("connect postgres repository");
 

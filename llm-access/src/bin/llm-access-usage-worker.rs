@@ -27,7 +27,7 @@ fn run() -> anyhow::Result<()> {
 
     use anyhow::Context;
     use llm_access::{
-        config::{CliCommand, ControlStoreConfig},
+        config::{resolve_request_cache_config, CliCommand, ControlStoreConfig},
         usage_worker::{router, UsageWorker},
     };
     use llm_access_core::store::AdminConfigStore;
@@ -63,8 +63,9 @@ fn run() -> anyhow::Result<()> {
                 let database_url = std::env::var(database_url_env).with_context(|| {
                     format!("missing control database env `{database_url_env}`")
                 })?;
+                let request_cache = resolve_request_cache_config(&storage)?;
                 Ok::<Arc<dyn AdminConfigStore>, anyhow::Error>(Arc::new(
-                    PostgresControlRepository::connect(&database_url).await?,
+                    PostgresControlRepository::connect(&database_url, request_cache).await?,
                 )
                     as Arc<dyn AdminConfigStore>)
             },

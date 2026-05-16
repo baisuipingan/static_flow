@@ -6,6 +6,8 @@ pub mod duckdb;
 pub mod postgres;
 /// Async repository adapters for runtime traits.
 pub mod repository;
+/// Valkey-backed request-path cache primitives.
+pub mod request_cache;
 /// SQLite control-plane repository.
 pub mod sqlite;
 

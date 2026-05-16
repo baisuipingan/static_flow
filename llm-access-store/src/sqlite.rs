@@ -150,7 +150,7 @@ pub struct KeyUsageRollup {
 }
 
 /// Runtime configuration row.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RuntimeConfigRecord {
     /// Singleton id.
     pub id: String,

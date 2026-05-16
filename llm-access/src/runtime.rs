@@ -38,7 +38,7 @@ use tokio::{
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use crate::usage_journal::JournalUsageEventSink;
 use crate::{
-    config::{ControlStoreConfig, StorageConfig},
+    config::{resolve_request_cache_config, ControlStoreConfig, StorageConfig},
     geoip::GeoIpResolver,
 };
 
@@ -257,7 +257,10 @@ impl LlmAccessRuntime {
                 let database_url = std::env::var(database_url_env).with_context(|| {
                     format!("missing control database env `{database_url_env}`")
                 })?;
-                let repository = Arc::new(PostgresControlRepository::connect(&database_url).await?);
+                let request_cache = resolve_request_cache_config(config)?;
+                let repository = Arc::new(
+                    PostgresControlRepository::connect(&database_url, request_cache).await?,
+                );
                 Self::from_open_repository(config, geoip, email_notifier, repository).await
             },
         }
@@ -1414,6 +1417,7 @@ mod tests {
             control_store: crate::config::ControlStoreConfig::Sqlite {
                 path: root.join("control/llm-access.sqlite3"),
             },
+            request_cache: None,
             duckdb: root.join("analytics/usage.duckdb"),
             usage_journal_dir: root.join("usage-journal"),
             duckdb_tiered: None,
