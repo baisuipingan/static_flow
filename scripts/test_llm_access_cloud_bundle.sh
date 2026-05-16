@@ -23,6 +23,7 @@ grep -F -- 'usage-journal-dir "$LLM_ACCESS_USAGE_JOURNAL_DIR"' "$OUT_DIR/llm-acc
 grep -F 'Environment=mimalloc_allow_thp=0' "$OUT_DIR/llm-access.service"
 grep -F 'Environment=mimalloc_disallow_arena_alloc=1' "$OUT_DIR/llm-access.service"
 grep -F 'Environment=mimalloc_purge_delay=0' "$OUT_DIR/llm-access.service"
+grep -F 'Environment=LLM_ACCESS_BACKGROUND_STATUS_REFRESH_ENABLED=0' "$OUT_DIR/llm-access.service"
 grep -F 'Environment=LLM_ACCESS_USAGE_JOURNAL_DIR=/var/lib/staticflow/llm-access/usage-journal' "$OUT_DIR/llm-access.service"
 ! grep -F -- '--sqlite-control' "$OUT_DIR/llm-access.service"
 ! grep -F -- '--duckdb-active-dir ${LLM_ACCESS_DUCKDB_ACTIVE_DIR}' "$OUT_DIR/llm-access.service"

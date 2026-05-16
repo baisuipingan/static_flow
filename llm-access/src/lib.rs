@@ -461,8 +461,15 @@ async fn provider_entry_handler(
 /// Run the HTTP server until interrupted.
 pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let service_runtime = runtime::LlmAccessRuntime::from_storage_config(&config.storage).await?;
-    codex_status::spawn_codex_status_refresher(&service_runtime);
-    kiro_status::spawn_kiro_status_refresher(&service_runtime);
+    if background_status_refresh_enabled() {
+        codex_status::spawn_codex_status_refresher(&service_runtime);
+        kiro_status::spawn_kiro_status_refresher(&service_runtime);
+    } else {
+        tracing::info!(
+            "background provider status refresh is disabled by \
+             LLM_ACCESS_BACKGROUND_STATUS_REFRESH_ENABLED"
+        );
+    }
     let shutdown_runtime = service_runtime.clone();
     let listener = tokio::net::TcpListener::bind(config.bind_addr)
         .await
@@ -476,6 +483,21 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     .context("llm-access server failed");
     shutdown_runtime.shutdown_usage_events().await;
     result
+}
+
+fn background_status_refresh_enabled() -> bool {
+    background_status_refresh_enabled_from_raw(
+        std::env::var("LLM_ACCESS_BACKGROUND_STATUS_REFRESH_ENABLED")
+            .ok()
+            .as_deref(),
+    )
+}
+
+fn background_status_refresh_enabled_from_raw(raw: Option<&str>) -> bool {
+    let Some(raw) = raw else {
+        return true;
+    };
+    !matches!(raw.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
 }
 
 async fn shutdown_signal() {
@@ -568,6 +590,20 @@ mod tests {
     fn test_router() -> axum::Router {
         let runtime = crate::runtime::LlmAccessRuntime::new(Arc::new(EmptyStore));
         super::router(runtime)
+    }
+
+    #[test]
+    fn background_status_refresh_env_defaults_to_enabled() {
+        assert!(super::background_status_refresh_enabled_from_raw(None));
+        assert!(super::background_status_refresh_enabled_from_raw(Some("1")));
+        assert!(super::background_status_refresh_enabled_from_raw(Some("true")));
+    }
+
+    #[test]
+    fn background_status_refresh_env_accepts_false_values() {
+        assert!(!super::background_status_refresh_enabled_from_raw(Some("0")));
+        assert!(!super::background_status_refresh_enabled_from_raw(Some("false")));
+        assert!(!super::background_status_refresh_enabled_from_raw(Some(" OFF ")));
     }
 
     #[tokio::test]
