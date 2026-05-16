@@ -26,6 +26,17 @@ use crate::{
 const LLM_GATEWAY_KEY_STATUS_ACTIVE: &str = "active";
 const LLM_GATEWAY_KEY_STATUS_DISABLED: &str = "disabled";
 const DEFAULT_PUBLIC_GPT_MODEL_ID: &str = "gpt-5.5";
+const NATIVE_RESPONSES_UPSTREAM_UNSUPPORTED_FIELDS: &[&str] = &[
+    "temperature",
+    "top_p",
+    "frequency_penalty",
+    "presence_penalty",
+    "user",
+    "metadata",
+    "prompt_cache_retention",
+    "safety_identifier",
+    "stream_options",
+];
 
 /// Normalize an incoming OpenAI-compatible request into the upstream Codex
 /// shape.
@@ -661,10 +672,17 @@ fn inject_default_instructions_when_missing(root: &mut Map<String, Value>) {
 fn normalize_native_responses_request(path: &str, root: &mut Map<String, Value>) {
     root.remove("max_output_tokens");
     if path == "/v1/responses" {
+        remove_native_responses_upstream_unsupported_fields(root);
         normalize_native_responses_input_for_upstream(root);
     }
     if path == "/v1/responses/compact" {
         retain_native_compact_fields(root);
+    }
+}
+
+fn remove_native_responses_upstream_unsupported_fields(root: &mut Map<String, Value>) {
+    for field in NATIVE_RESPONSES_UPSTREAM_UNSUPPORTED_FIELDS {
+        root.remove(*field);
     }
 }
 
@@ -2446,6 +2464,37 @@ mod tests {
         assert_eq!(upstream["max_completion_tokens"], json!(32));
         assert_eq!(upstream["max_tokens"], json!(16));
         assert_eq!(upstream["verbosity"], json!("high"));
+    }
+
+    #[tokio::test]
+    async fn prepare_gateway_request_responses_strips_temperature_before_upstream() {
+        let headers = axum::http::HeaderMap::new();
+        let body = Body::from(
+            r#"{
+                "model":"gpt-5.3-codex",
+                "input":"hello",
+                "stream":false,
+                "temperature":0.7
+            }"#,
+        );
+
+        let prepared = prepare_gateway_request(
+            "/v1/responses",
+            "",
+            axum::http::Method::POST,
+            &headers,
+            body,
+            1024 * 1024,
+        )
+        .await
+        .expect("responses request should pass through");
+
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&prepared.request_body).expect("upstream body json");
+
+        assert_eq!(prepared.force_upstream_stream, true);
+        assert_eq!(upstream["stream"], json!(true));
+        assert!(upstream.get("temperature").is_none());
     }
 
     #[tokio::test]
