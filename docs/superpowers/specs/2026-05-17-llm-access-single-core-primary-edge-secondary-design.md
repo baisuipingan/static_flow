@@ -273,9 +273,9 @@ cache entries.
 
 Recommended defaults:
 
-- node snapshot TTL: `20-30s`
-- primary snapshot TTL: `15s`
-- heartbeat update cadence: around `5s`
+- node snapshot TTL: `120s`
+- primary snapshot TTL: `60s`
+- heartbeat update cadence: around `15s`
 
 No read path should rely on these keys remaining available forever. If the keys
 are absent, an `edge` node falls back to local degraded logic.

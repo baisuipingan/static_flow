@@ -14,9 +14,9 @@ const NODE_REGION_ENV: &str = "LLM_ACCESS_NODE_REGION";
 const NODE_API_BASE_URL_ENV: &str = "LLM_ACCESS_NODE_API_BASE_URL";
 const NODE_WORKER_BASE_URL_ENV: &str = "LLM_ACCESS_NODE_WORKER_BASE_URL";
 
-const CLUSTER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(5);
-const CLUSTER_PRIMARY_TTL: Duration = Duration::from_secs(15);
-const CLUSTER_NODE_TTL: Duration = Duration::from_secs(30);
+const CLUSTER_HEARTBEAT_INTERVAL: Duration = Duration::from_secs(15);
+const CLUSTER_PRIMARY_TTL: Duration = Duration::from_secs(60);
+const CLUSTER_NODE_TTL: Duration = Duration::from_secs(120);
 
 /// Static node class configured at deploy time.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

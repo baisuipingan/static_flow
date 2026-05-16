@@ -240,6 +240,10 @@ private env files, not in tracked docs.
   These node-role features require the shared request-cache Valkey config to be
   present, because version one publishes primary and node snapshots in the
   existing `llma:*` namespace.
+- Current multi-node heartbeat defaults:
+  - heartbeat cadence: every `15s`
+  - primary snapshot TTL: `60s`
+  - node snapshot TTL: `120s`
 - Version one does not support multiple live `core` nodes. Do not deploy a
   second `core` node until the cluster-truth and failover design is upgraded.
 - The service-level background refresher is separate from the per-account
