@@ -5805,6 +5805,27 @@ pub fn admin_llm_gateway_page() -> Html {
                                 <p class={classes!("m-0", "break-all")}>
                                     { format!("usage_query_base_url: {}", status.usage_query_base_url) }
                                 </p>
+                                if let Some(cluster) = status.cluster.as_ref() {
+                                    <p class={classes!("m-0", "break-all")}>
+                                        { format!(
+                                            "cluster: node {} · class {} · role {} · usage {}",
+                                            cluster.node_id,
+                                            cluster.node_class,
+                                            cluster.runtime_role,
+                                            cluster.usage_query_mode,
+                                        ) }
+                                    </p>
+                                    if let Some(primary_node_id) = cluster.primary_node_id.as_deref() {
+                                        <p class={classes!("m-0", "break-all")}>
+                                            { format!("primary_node_id: {primary_node_id}") }
+                                        </p>
+                                    }
+                                    if let Some(primary_worker_base_url) = cluster.primary_worker_base_url.as_deref() {
+                                        <p class={classes!("m-0", "break-all")}>
+                                            { format!("primary_worker_base_url: {primary_worker_base_url}") }
+                                        </p>
+                                    }
+                                }
                                 if let Some(path) = status.worker.current_file_path.as_deref() {
                                     <p class={classes!("m-0", "break-all")}>
                                         { format!("current_file: {path}") }

@@ -45,6 +45,8 @@ impl ControlStoreConfig {
 pub struct StorageConfig {
     /// Root of the mounted persistent service state.
     pub state_root: PathBuf,
+    /// Optional cluster node identity for multi-node deployments.
+    pub node_identity: Option<crate::cluster::NodeIdentity>,
     /// Control-plane backing store configuration.
     pub control_store: ControlStoreConfig,
     /// Optional request-path cache configuration backed by Valkey.
@@ -330,6 +332,7 @@ where
         codex_auths_dir: state_root.join("auths/codex"),
         logs_dir: state_root.join("logs"),
         state_root,
+        node_identity: crate::cluster::load_node_identity_from_env()?,
         control_store,
         request_cache,
         duckdb,

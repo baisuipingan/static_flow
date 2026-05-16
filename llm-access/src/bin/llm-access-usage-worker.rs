@@ -28,7 +28,7 @@ fn run() -> anyhow::Result<()> {
     use anyhow::Context;
     use llm_access::{
         config::{resolve_request_cache_config, CliCommand, ControlStoreConfig},
-        usage_worker::{router, UsageWorker},
+        usage_worker::{router, ClusterUsageWorker, EdgeUsageWorker, UsageWorker},
     };
     use llm_access_core::store::AdminConfigStore;
     use llm_access_store::{
@@ -49,6 +49,8 @@ fn run() -> anyhow::Result<()> {
     };
     llm_access::bootstrap_usage_worker_storage(&storage)?;
     let runtime = tokio::runtime::Runtime::new().context("failed to create tokio runtime")?;
+    let cluster_state = runtime
+        .block_on(llm_access::cluster::ClusterRuntimeState::from_storage_config(&storage))?;
     let control: Arc<dyn AdminConfigStore> = runtime.block_on(async {
         match &storage.control_store {
             ControlStoreConfig::Sqlite {
@@ -80,33 +82,60 @@ fn run() -> anyhow::Result<()> {
             .parse()
             .unwrap_or(bind_addr)
     };
+    let role = match cluster_state.as_ref() {
+        Some(cluster_state) => runtime.block_on(cluster_state.runtime_role()),
+        None => llm_access::cluster::NodeRuntimeRole::Primary,
+    };
     let connection_config = Arc::new(RwLock::new(
         DuckDbUsageConnectionConfig::from_admin_runtime_config(&runtime_config),
     ));
-    let duckdb = if let Some(tiered) = storage.duckdb_tiered {
-        DuckDbUsageRepository::open_tiered_with_connection_config(
-            TieredDuckDbUsageConfig {
-                active_dir: tiered.active_dir,
-                archive_dir: tiered.archive_dir,
-                catalog_dir: tiered.catalog_dir,
-                rollover_bytes: tiered.rollover_bytes,
-                details_dir: tiered.details_dir,
-            },
-            Arc::clone(&connection_config),
-        )?
-    } else {
-        DuckDbUsageRepository::open_path_with_connection_config(
-            storage.duckdb,
-            Arc::clone(&connection_config),
-        )?
+    let worker = match role {
+        llm_access::cluster::NodeRuntimeRole::Primary => {
+            let duckdb = if let Some(tiered) = storage.duckdb_tiered.clone() {
+                DuckDbUsageRepository::open_tiered_with_connection_config(
+                    TieredDuckDbUsageConfig {
+                        active_dir: tiered.active_dir,
+                        archive_dir: tiered.archive_dir,
+                        catalog_dir: tiered.catalog_dir,
+                        rollover_bytes: tiered.rollover_bytes,
+                        details_dir: tiered.details_dir,
+                    },
+                    Arc::clone(&connection_config),
+                )?
+            } else {
+                DuckDbUsageRepository::open_path_with_connection_config(
+                    storage.duckdb.clone(),
+                    Arc::clone(&connection_config),
+                )?
+            };
+            ClusterUsageWorker::Primary(
+                UsageWorker::new_with_retention_days(
+                    storage.usage_journal_dir.clone(),
+                    Arc::new(duckdb),
+                    runtime_config.usage_journal_consumer_lease_ms,
+                    runtime_config.usage_analytics_retention_days,
+                )?
+                .with_cluster_state(cluster_state.clone()),
+            )
+        },
+        llm_access::cluster::NodeRuntimeRole::EdgeSecondary
+        | llm_access::cluster::NodeRuntimeRole::Degraded => {
+            let cluster_state = cluster_state
+                .clone()
+                .context("edge usage worker requires cluster state")?;
+            let source_node_id = storage
+                .node_identity
+                .as_ref()
+                .map(|identity| identity.node_id.clone())
+                .context("edge usage worker requires node identity")?;
+            ClusterUsageWorker::Edge(EdgeUsageWorker::new(
+                storage.usage_journal_dir.clone(),
+                cluster_state,
+                source_node_id,
+                runtime_config.usage_journal_consumer_lease_ms,
+            )?)
+        },
     };
-    let duckdb = Arc::new(duckdb);
-    let worker = UsageWorker::new_with_retention_days(
-        storage.usage_journal_dir,
-        duckdb,
-        runtime_config.usage_journal_consumer_lease_ms,
-        runtime_config.usage_analytics_retention_days,
-    )?;
     let app = router(&worker);
     std::thread::spawn(move || {
         let runtime = match tokio::runtime::Builder::new_current_thread()
@@ -134,7 +163,7 @@ fn run() -> anyhow::Result<()> {
 
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 async fn run_forever_with_runtime_config(
-    worker: llm_access::usage_worker::UsageWorker,
+    worker: llm_access::usage_worker::ClusterUsageWorker,
     control: std::sync::Arc<dyn llm_access_core::store::AdminConfigStore>,
     connection_config: std::sync::Arc<
         std::sync::RwLock<llm_access_store::duckdb::DuckDbUsageConnectionConfig>,
@@ -160,9 +189,12 @@ async fn run_forever_with_runtime_config(
                         *current =
                             DuckDbUsageConnectionConfig::from_admin_runtime_config(&runtime_config);
                     }
-                    worker.set_usage_analytics_retention_days(
-                        runtime_config.usage_analytics_retention_days,
-                    );
+                    if let llm_access::usage_worker::ClusterUsageWorker::Primary(primary) = &worker
+                    {
+                        primary.set_usage_analytics_retention_days(
+                            runtime_config.usage_analytics_retention_days,
+                        );
+                    }
                 },
                 Err(err) => tracing::warn!(
                     "failed to refresh llm access usage worker runtime config: {err:#}"
@@ -170,18 +202,20 @@ async fn run_forever_with_runtime_config(
             }
             last_config_refresh = Some(Instant::now());
         }
-        if let Err(err) = worker.run_one_import().await {
+        if let Err(err) = worker.run_one_cycle().await {
             worker.record_error(&err);
             return Err(err);
         }
-        if last_maintenance
-            .map(|last| last.elapsed() >= USAGE_ANALYTICS_MAINTENANCE_INTERVAL)
-            .unwrap_or(true)
-        {
-            if let Err(err) = worker.run_maintenance(now_ms()).await {
-                tracing::warn!("llm access usage analytics maintenance failed: {err:#}");
+        if let llm_access::usage_worker::ClusterUsageWorker::Primary(primary) = &worker {
+            if last_maintenance
+                .map(|last| last.elapsed() >= USAGE_ANALYTICS_MAINTENANCE_INTERVAL)
+                .unwrap_or(true)
+            {
+                if let Err(err) = primary.run_maintenance(now_ms()).await {
+                    tracing::warn!("llm access usage analytics maintenance failed: {err:#}");
+                }
+                last_maintenance = Some(Instant::now());
             }
-            last_maintenance = Some(Instant::now());
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }

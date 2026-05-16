@@ -67,6 +67,61 @@ impl JournalConsumerState {
         Ok(())
     }
 
+    /// Return true when a relayed file from one source node was already
+    /// imported with the same digest.
+    pub fn is_relay_consumed(
+        &self,
+        source_node_id: &str,
+        file_sequence: u64,
+        file_digest: &str,
+    ) -> Result<bool> {
+        let existing = self
+            .conn
+            .query_row(
+                "SELECT file_digest
+                 FROM relay_consumed_files
+                 WHERE source_node_id = ?1 AND file_sequence = ?2",
+                params![source_node_id, file_sequence as i64],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()
+            .context("check relayed consumed journal file")?;
+        match existing {
+            Some(existing_digest) if existing_digest == file_digest => Ok(true),
+            Some(existing_digest) => Err(anyhow::anyhow!(
+                "relayed journal digest mismatch for source `{source_node_id}` sequence \
+                 {file_sequence}: stored `{existing_digest}`, incoming `{file_digest}`"
+            )),
+            None => Ok(false),
+        }
+    }
+
+    /// Record a fully imported relayed journal file.
+    pub fn record_relay_consumed_file(
+        &self,
+        source_node_id: &str,
+        file_sequence: u64,
+        file_digest: &str,
+        event_count: u64,
+        imported_at_ms: i64,
+    ) -> Result<()> {
+        self.conn
+            .execute(
+                "INSERT OR REPLACE INTO relay_consumed_files (
+                    source_node_id, file_sequence, file_digest, event_count, imported_at_ms
+                 ) VALUES (?1, ?2, ?3, ?4, ?5)",
+                params![
+                    source_node_id,
+                    file_sequence as i64,
+                    file_digest,
+                    event_count as i64,
+                    imported_at_ms,
+                ],
+            )
+            .context("record relayed consumed journal file")?;
+        Ok(())
+    }
+
     /// Persist the current worker progress row.
     pub fn update_progress(
         &self,
@@ -170,6 +225,15 @@ fn initialize_consumer_state(conn: &Connection) -> Result<()> {
             last_error TEXT,
             last_error_at_ms INTEGER,
             updated_at_ms INTEGER NOT NULL
+        ) STRICT, WITHOUT ROWID;
+
+        CREATE TABLE IF NOT EXISTS relay_consumed_files (
+            source_node_id TEXT NOT NULL,
+            file_sequence INTEGER NOT NULL,
+            file_digest TEXT NOT NULL,
+            event_count INTEGER NOT NULL,
+            imported_at_ms INTEGER NOT NULL,
+            PRIMARY KEY (source_node_id, file_sequence)
         ) STRICT, WITHOUT ROWID;",
     )
     .context("initialize usage journal consumer state")?;
@@ -322,5 +386,35 @@ mod tests {
         let restored = state.progress_snapshot().expect("progress snapshot");
         assert_eq!(restored.last_successful_file_sequence, Some(11));
         assert_eq!(restored.last_successful_import_at_ms, Some(1_700_000_000_789));
+    }
+
+    #[test]
+    fn relay_consumed_state_is_idempotent_for_same_digest() {
+        let root = tempdir().expect("tempdir");
+        let state = JournalConsumerState::open(root.path()).expect("open state");
+
+        assert!(!state
+            .is_relay_consumed("edge-a", 7, "digest-a")
+            .expect("not consumed yet"));
+        state
+            .record_relay_consumed_file("edge-a", 7, "digest-a", 12, 1_700_000_000_111)
+            .expect("record relay file");
+        assert!(state
+            .is_relay_consumed("edge-a", 7, "digest-a")
+            .expect("same digest is consumed"));
+    }
+
+    #[test]
+    fn relay_consumed_state_rejects_digest_mismatch() {
+        let root = tempdir().expect("tempdir");
+        let state = JournalConsumerState::open(root.path()).expect("open state");
+
+        state
+            .record_relay_consumed_file("edge-a", 7, "digest-a", 12, 1_700_000_000_111)
+            .expect("record relay file");
+        let err = state
+            .is_relay_consumed("edge-a", 7, "digest-b")
+            .expect_err("digest mismatch");
+        assert!(format!("{err:#}").contains("digest mismatch"));
     }
 }

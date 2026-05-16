@@ -1,7 +1,7 @@
 # llm-access single-core primary and edge-secondary design
 
 Date: 2026-05-17
-Status: approved in brainstorming, pending implementation plan
+Status: first version implemented
 
 ## Summary
 
@@ -25,8 +25,11 @@ At runtime:
 - `edge` workers proxy usage/admin history queries to the current primary
   worker and relay sealed local journal files to that primary for ingestion.
 
-Node role truth lives in Postgres. Shared read-mostly machine metadata and the
-new proxy metadata cache live in the existing `llma:*` Valkey namespace.
+Version one keeps cluster discovery and machine metadata in the shared
+`llma:*` Valkey namespace. One configured `core` node advertises itself as the
+single primary, while `edge` nodes consume that primary snapshot and proxy
+usage responsibilities accordingly. Proxy metadata cache uses the same
+namespace.
 
 This design intentionally avoids multi-core automatic failover in version one.
 If the single `core` primary is unavailable, `edge` nodes continue serving API
@@ -96,7 +99,8 @@ The user explicitly wants:
   current primary worker;
 - make node role and usage-data source visible in admin/frontend responses;
 - move proxy metadata reads into the shared Valkey cache namespace;
-- keep Postgres as durable truth and Valkey as shared read view.
+- keep the first rollout simple: one configured `core` primary plus many
+  `edge` nodes, all coordinated through shared Valkey metadata.
 
 ## Non-goals
 
@@ -107,7 +111,6 @@ The user explicitly wants:
 - no shared journal root across machines;
 - no distributed worker-consumer lease across many writers targeting one shared
   journal directory;
-- no Redis-only primary election;
 - no attempt to preserve usage/history availability when the single primary is
   down;
 - no redesign of the request-path Valkey cache namespace beyond extending it.
@@ -181,10 +184,11 @@ reintroduces node-specific immutable usage namespaces and merged multi-node
 queries. The user has since narrowed the desired shape: secondary workers
 should forward to one primary worker.
 
-#### 3. Redis-only cluster truth
+#### 3. Multi-core automatic failover in version one
 
-Rejected because an incorrect or stale cache entry must not be able to produce
-split-brain primary identity. Postgres remains the only durable election truth.
+Rejected because the user explicitly narrowed the first rollout to one `core`
+primary only. Introducing lease promotion and standby failover now would add
+complexity without helping the immediate deployment target.
 
 ## 1. Node classes
 
@@ -205,7 +209,7 @@ scope.
 
 ## 2. Runtime roles
 
-Runtime role is discovered automatically from shared cluster state:
+Runtime role is discovered automatically from shared Valkey cluster state:
 
 - `primary`
 - `edge-secondary`
@@ -213,80 +217,31 @@ Runtime role is discovered automatically from shared cluster state:
 
 Rules:
 
-- a `core` node that sees no existing primary lease tries to acquire it and
-  becomes `primary`;
+- a configured `core` node always resolves to `primary` in version one;
 - an `edge` node never tries to acquire primary;
-- an `edge` node becomes `edge-secondary` when a valid primary is known;
-- an `edge` node becomes `degraded` when no valid primary is known or the
-  primary is unreachable.
+- an `edge` node becomes `edge-secondary` when a valid primary snapshot is
+  known;
+- an `edge` node becomes `degraded` when no valid primary snapshot is known.
 
 The user requirement "if no primary exists, the first node should default to
-primary" is therefore interpreted as:
+primary" is implemented as:
 
-- if no primary exists and the node is `core`, it becomes primary;
-- if no primary exists and the node is `edge`, it cannot self-promote and must
+- if the deployment has one configured `core` node, that node publishes itself
+  as primary;
+- if an `edge` node sees no primary snapshot, it cannot self-promote and must
   degrade explicitly.
 
-## 3. Postgres cluster truth
+## 3. Valkey cluster truth and read view
 
-Postgres remains the durable cluster truth source.
+Version one keeps cluster discovery in Valkey because there is only one
+supported `core` node. This avoids inventing a lease protocol before
+multi-core failover is actually needed.
 
-Version one uses Postgres for:
-
-- node registration rows;
-- primary identity lease;
-- durable control-plane data.
-
-### Node registry
-
-Add a table such as `llm_cluster_nodes` with one row per node:
-
-- `node_id` primary key
-- `node_class` (`core` or `edge`)
-- `display_name`
-- `hostname`
-- `region`
-- `api_base_url`
-- `worker_base_url`
-- `enabled`
-- `created_at_ms`
-- `updated_at_ms`
-
-Version one allows runtime self-upsert of the node row on startup. This keeps
-deployment simple and matches the user's request that nodes should identify
-their role automatically when joining the cluster.
-
-### Primary lease
-
-Use one Postgres-backed primary lease mechanism. Either of these is acceptable
-in implementation:
-
-- a dedicated advisory lock;
-- a tiny lease row updated by one owner.
-
-Version one should prefer Postgres advisory lock if it fits cleanly with the
-runtime model, because it naturally releases on connection loss and minimizes
-table churn.
-
-The primary lease records or implies:
-
-- `primary_node_id`
-- `lease_acquired_at_ms`
-- `last_renewed_at_ms`
-
-Only the `core` node may hold this lease.
-
-## 4. Valkey cluster read view
-
-Valkey stores the shared, fast-moving machine metadata view. This is explicitly
-not the source of truth for primary election.
-
-All new cluster metadata lives in the existing `llma:*` namespace.
+All cluster metadata lives in the existing `llma:*` namespace.
 
 Recommended keys:
 
 - `llma:cluster:primary`
-- `llma:cluster:nodes`
 - `llma:cluster:node:<node_id>`
 
 Suggested payloads:
@@ -294,11 +249,9 @@ Suggested payloads:
 ### `llma:cluster:primary`
 
 - `node_id`
-- `node_class`
-- `runtime_role`
 - `api_base_url`
 - `worker_base_url`
-- `updated_at_ms`
+- `published_at_ms`
 
 ### `llma:cluster:node:<node_id>`
 
@@ -306,17 +259,12 @@ Suggested payloads:
 - `node_class`
 - `runtime_role`
 - `display_name`
-- `hostname`
 - `region`
 - `api_base_url`
 - `worker_base_url`
 - `primary_node_id`
 - `usage_query_mode` (`local_primary` or `proxied_primary`)
-- `journal_backlog_files`
-- `journal_backlog_bytes`
-- `last_primary_contact_at_ms`
 - `last_heartbeat_at_ms`
-- `last_error_summary`
 
 ### TTL policy
 
@@ -330,10 +278,17 @@ Recommended defaults:
 - heartbeat update cadence: around `5s`
 
 No read path should rely on these keys remaining available forever. If the keys
-are absent, the node falls back to Postgres cluster truth and local degraded
-logic.
+are absent, an `edge` node falls back to local degraded logic.
 
-## 5. Primary responsibilities
+Operational constraints for version one:
+
+- exactly one `core` node may be deployed at a time;
+- that `core` node must mount JuiceFS;
+- `edge` nodes must not mount or write the shared usage namespace;
+- later Postgres-backed lease truth, standby core nodes, and failover are a
+  separate iteration.
+
+## 4. Primary responsibilities
 
 The primary node has all of these responsibilities:
 
@@ -390,7 +345,7 @@ The primary worker continues to:
 
 A secondary worker handles its own local sealed files differently:
 
-1. discover the current primary worker from Valkey, with Postgres fallback;
+1. discover the current primary worker from Valkey;
 2. claim the oldest local sealed file;
 3. send the sealed file to the primary worker's internal ingest endpoint;
 4. wait for primary ack;
@@ -473,9 +428,6 @@ At minimum, `/admin/llm-access` and the usage event pages should show:
 
 Show:
 
-- local journal backlog file count;
-- local journal backlog bytes;
-- last contact with primary;
 - current worker query mode.
 
 ### Response metadata
@@ -484,7 +436,6 @@ To minimize payload churn, version one should prefer response headers for
 transport metadata, for example:
 
 - `x-llm-access-node-id`
-- `x-llm-access-node-class`
 - `x-llm-access-worker-role`
 - `x-llm-access-primary-node-id`
 - `x-llm-access-usage-source`
@@ -539,8 +490,8 @@ Recommended env vars:
 - `LLM_ACCESS_NODE_CLASS` (`core` or `edge`)
 - `LLM_ACCESS_NODE_DISPLAY_NAME`
 - `LLM_ACCESS_NODE_REGION`
-- `LLM_ACCESS_API_BASE_URL`
-- `LLM_ACCESS_WORKER_BASE_URL`
+- `LLM_ACCESS_NODE_API_BASE_URL`
+- `LLM_ACCESS_NODE_WORKER_BASE_URL`
 
 ### Core node requirements
 
@@ -583,8 +534,7 @@ If the primary is unavailable long enough:
 
 If Valkey is unavailable:
 
-- node role truth still comes from Postgres;
-- primary query target still resolves from Postgres fallback;
+- an edge node cannot discover a primary and degrades;
 - request-path proxy metadata falls back to Postgres reads;
 - performance degrades, but correctness remains.
 
@@ -593,7 +543,6 @@ If Valkey is unavailable:
 If Postgres is unavailable:
 
 - control-plane truth is unavailable;
-- primary lease cannot be trusted;
 - services should fail closed for control-plane operations;
 - existing local journal buffering does not become a substitute control plane.
 
@@ -601,8 +550,8 @@ If Postgres is unavailable:
 
 Recommended rollout order:
 
-1. add cluster node-class config and cluster registry support;
-2. add primary lease and gate background refresh behind primary ownership;
+1. add cluster node-class config and Valkey-published primary snapshot;
+2. gate background refresh behind runtime role;
 3. add worker query proxy mode for edge nodes;
 4. add primary relay ingest endpoint and compound idempotency ledger;
 5. switch secondary workers to sealed-file relay mode;
@@ -614,7 +563,8 @@ Recommended rollout order:
 
 Implementation must prove all of these before rollout is considered complete:
 
-- one `core` node becomes primary automatically when no primary exists;
+- the configured `core` node publishes itself as primary automatically at
+  startup;
 - an `edge` node never self-promotes to primary;
 - only the primary runs background refresh;
 - edge API requests still succeed while edge worker proxies usage/history to the

@@ -8,10 +8,19 @@ use std::{
 };
 
 use anyhow::{anyhow, Context};
-use axum::{extract::State, response::IntoResponse, routing::get, Json, Router};
+use axum::{
+    body::{Body, Bytes},
+    extract::{OriginalUri, State},
+    http::{header, HeaderMap, Response as HttpResponse, StatusCode, Uri},
+    response::IntoResponse,
+    routing::{get, post},
+    Json, Router,
+};
 use llm_access_core::store::{UsageEventSink, DEFAULT_USAGE_ANALYTICS_RETENTION_DAYS};
 use llm_access_store::duckdb::DuckDbUsageRepository;
 use llm_usage_journal::{JournalConsumerState, JournalReader, WorkerProgressSnapshot};
+use sha2::{Digest, Sha256};
+use uuid::Uuid;
 
 use crate::{
     process_memory::{read_current_process_memory_stats, ProcessMemoryStats},
@@ -22,6 +31,30 @@ use crate::{
 };
 
 const WORKER_PROGRESS_UPDATE_INTERVAL_MS: i64 = 1_000;
+const RELAY_HEADER_SOURCE_NODE_ID: &str = "x-llm-access-source-node-id";
+const RELAY_HEADER_FILE_SEQUENCE: &str = "x-llm-access-file-sequence";
+const USAGE_SOURCE_HEADER: &str = "x-llm-access-usage-source";
+const WORKER_ROLE_HEADER: &str = "x-llm-access-worker-role";
+const PRIMARY_NODE_HEADER: &str = "x-llm-access-primary-node-id";
+const CURRENT_NODE_HEADER: &str = "x-llm-access-node-id";
+
+/// Clustered usage worker mode.
+pub enum ClusterUsageWorker {
+    /// Primary worker that owns local DuckDB/JuiceFS writes.
+    Primary(UsageWorker),
+    /// Edge worker that proxies usage queries and relays sealed journals.
+    Edge(EdgeUsageWorker),
+}
+
+/// Edge-secondary usage worker.
+pub struct EdgeUsageWorker {
+    journal_root: PathBuf,
+    state: JournalConsumerState,
+    consumer_lease_ms: u64,
+    cluster_state: Arc<crate::cluster::ClusterRuntimeState>,
+    source_node_id: String,
+    http_client: reqwest::Client,
+}
 
 /// Usage journal consumer.
 pub struct UsageWorker {
@@ -30,10 +63,57 @@ pub struct UsageWorker {
     duckdb_usage: Arc<DuckDbUsageRepository>,
     consumer_lease_ms: u64,
     usage_analytics_retention_days: Arc<RwLock<u64>>,
+    cluster_state: Option<Arc<crate::cluster::ClusterRuntimeState>>,
 }
 
 /// Build the usage worker HTTP router.
-pub fn router(worker: &UsageWorker) -> Router {
+pub fn router(worker: &ClusterUsageWorker) -> Router {
+    match worker {
+        ClusterUsageWorker::Primary(worker) => primary_worker_router(worker),
+        ClusterUsageWorker::Edge(worker) => edge_worker_router(worker),
+    }
+}
+
+#[derive(Clone)]
+struct PrimaryWorkerHttpState {
+    journal_root: PathBuf,
+    query: UsageQueryState,
+    duckdb_usage: Arc<DuckDbUsageRepository>,
+    cluster_state: Option<Arc<crate::cluster::ClusterRuntimeState>>,
+}
+
+#[derive(Clone)]
+struct EdgeWorkerHttpState {
+    journal_root: PathBuf,
+    cluster_state: Arc<crate::cluster::ClusterRuntimeState>,
+    http_client: reqwest::Client,
+}
+
+impl axum::extract::FromRef<PrimaryWorkerHttpState> for UsageQueryState {
+    fn from_ref(input: &PrimaryWorkerHttpState) -> Self {
+        input.query.clone()
+    }
+}
+
+#[derive(serde::Serialize)]
+struct WorkerStatusResponse {
+    #[serde(flatten)]
+    progress: WorkerProgressSnapshot,
+    process_memory: ProcessMemoryStats,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    cluster: Option<WorkerClusterStatusView>,
+}
+
+#[derive(Clone, serde::Serialize)]
+struct WorkerClusterStatusView {
+    node_id: String,
+    runtime_role: crate::cluster::NodeRuntimeRole,
+    usage_query_mode: crate::cluster::UsageQueryMode,
+    primary_node_id: Option<String>,
+    primary_worker_base_url: Option<String>,
+}
+
+fn primary_worker_router(worker: &UsageWorker) -> Router {
     let query_state = UsageQueryState {
         usage_analytics_store: worker.duckdb_usage.clone(),
         retention_days: worker.usage_analytics_retention_days.clone(),
@@ -44,32 +124,52 @@ pub fn router(worker: &UsageWorker) -> Router {
         .route("/admin/kiro-gateway/usage", get(list_kiro_usage_events))
         .route("/admin/kiro-gateway/usage/:event_id", get(get_kiro_usage_event))
         .route("/admin/llm-access/usage/chart", get(usage_chart_points))
-        .route("/admin/llm-access/usage-worker/status", get(worker_status))
-        .with_state(WorkerHttpState {
+        .route("/admin/llm-access/usage-worker/status", get(primary_worker_status))
+        .route("/internal/usage-journal/import", post(primary_import_relay_file))
+        .with_state(PrimaryWorkerHttpState {
             journal_root: worker.journal_root.clone(),
             query: query_state,
+            duckdb_usage: worker.duckdb_usage.clone(),
+            cluster_state: worker.cluster_state.clone(),
         })
 }
 
-#[derive(Clone)]
-struct WorkerHttpState {
-    journal_root: PathBuf,
-    query: UsageQueryState,
+fn edge_worker_router(worker: &EdgeUsageWorker) -> Router {
+    Router::new()
+        .route("/admin/llm-gateway/usage", get(edge_proxy_usage_query))
+        .route("/admin/llm-gateway/usage/:event_id", get(edge_proxy_usage_query))
+        .route("/admin/kiro-gateway/usage", get(edge_proxy_usage_query))
+        .route("/admin/kiro-gateway/usage/:event_id", get(edge_proxy_usage_query))
+        .route("/admin/llm-access/usage/chart", get(edge_proxy_usage_query))
+        .route("/admin/llm-access/usage-worker/status", get(edge_worker_status))
+        .route("/internal/usage-journal/import", post(edge_reject_import_relay_file))
+        .with_state(EdgeWorkerHttpState {
+            journal_root: worker.journal_root.clone(),
+            cluster_state: worker.cluster_state.clone(),
+            http_client: worker.http_client.clone(),
+        })
 }
 
-impl axum::extract::FromRef<WorkerHttpState> for UsageQueryState {
-    fn from_ref(input: &WorkerHttpState) -> Self {
-        input.query.clone()
-    }
+async fn primary_worker_status(State(state): State<PrimaryWorkerHttpState>) -> impl IntoResponse {
+    build_worker_status_response(&state.journal_root, state.cluster_state.as_ref()).await
 }
 
-async fn worker_status(State(state): State<WorkerHttpState>) -> impl IntoResponse {
-    match JournalConsumerState::open(&state.journal_root)
-        .and_then(|state| state.progress_snapshot())
-    {
+async fn edge_worker_status(State(state): State<EdgeWorkerHttpState>) -> impl IntoResponse {
+    build_worker_status_response(&state.journal_root, Some(&state.cluster_state)).await
+}
+
+async fn build_worker_status_response(
+    journal_root: &Path,
+    cluster_state: Option<&Arc<crate::cluster::ClusterRuntimeState>>,
+) -> HttpResponse<Body> {
+    match JournalConsumerState::open(journal_root).and_then(|state| state.progress_snapshot()) {
         Ok(progress) => Json(WorkerStatusResponse {
             progress,
             process_memory: read_current_process_memory_stats(),
+            cluster: match cluster_state {
+                Some(cluster_state) => Some(worker_cluster_status_view(cluster_state).await),
+                None => None,
+            },
         })
         .into_response(),
         Err(err) => (
@@ -80,11 +180,258 @@ async fn worker_status(State(state): State<WorkerHttpState>) -> impl IntoRespons
     }
 }
 
+async fn worker_cluster_status_view(
+    cluster_state: &Arc<crate::cluster::ClusterRuntimeState>,
+) -> WorkerClusterStatusView {
+    let snapshot = cluster_state.snapshot().await;
+    WorkerClusterStatusView {
+        node_id: snapshot.node.node_id,
+        runtime_role: snapshot.runtime_role,
+        usage_query_mode: snapshot.usage_query_mode,
+        primary_node_id: snapshot
+            .primary
+            .as_ref()
+            .map(|primary| primary.node_id.clone()),
+        primary_worker_base_url: snapshot
+            .primary
+            .as_ref()
+            .and_then(|primary| primary.worker_base_url.clone()),
+    }
+}
+
+async fn edge_proxy_usage_query(
+    State(state): State<EdgeWorkerHttpState>,
+    uri: OriginalUri,
+) -> HttpResponse<Body> {
+    proxy_worker_usage_query(&state.http_client, &state.cluster_state, &uri.0).await
+}
+
+async fn edge_reject_import_relay_file() -> HttpResponse<Body> {
+    (StatusCode::SERVICE_UNAVAILABLE, "edge usage worker cannot ingest relayed journals")
+        .into_response()
+}
+
+async fn proxy_worker_usage_query(
+    http_client: &reqwest::Client,
+    cluster_state: &Arc<crate::cluster::ClusterRuntimeState>,
+    uri: &Uri,
+) -> HttpResponse<Body> {
+    let snapshot = cluster_state.snapshot().await;
+    let Some(base_url) = snapshot
+        .primary
+        .as_ref()
+        .and_then(|primary| primary.worker_base_url.clone())
+    else {
+        return (StatusCode::SERVICE_UNAVAILABLE, "primary usage worker is unavailable")
+            .into_response();
+    };
+    let path_and_query = uri
+        .path_and_query()
+        .map(|value| value.as_str())
+        .unwrap_or(uri.path());
+    let url = format!("{}{}", base_url.trim_end_matches('/'), path_and_query);
+    let response = match http_client.get(&url).send().await {
+        Ok(response) => response,
+        Err(err) => {
+            tracing::warn!(url = %url, "edge usage worker proxy failed: {err:#}");
+            return (StatusCode::SERVICE_UNAVAILABLE, "primary usage worker request failed")
+                .into_response();
+        },
+    };
+    let status = StatusCode::from_u16(response.status().as_u16())
+        .unwrap_or(StatusCode::INTERNAL_SERVER_ERROR);
+    let content_type = response.headers().get(header::CONTENT_TYPE).cloned();
+    let bytes = match response.bytes().await {
+        Ok(bytes) => bytes,
+        Err(err) => {
+            tracing::warn!(url = %url, "failed to read proxied usage worker response: {err:#}");
+            return (StatusCode::BAD_GATEWAY, "failed to read primary usage worker response")
+                .into_response();
+        },
+    };
+    let mut builder = HttpResponse::builder().status(status);
+    if let Some(content_type) = content_type {
+        builder = builder.header(header::CONTENT_TYPE, content_type);
+    }
+    builder = builder
+        .header(USAGE_SOURCE_HEADER, "proxied_primary")
+        .header(WORKER_ROLE_HEADER, "edge_secondary")
+        .header(CURRENT_NODE_HEADER, snapshot.node.node_id.as_str());
+    if let Some(primary_node_id) = snapshot
+        .primary
+        .as_ref()
+        .map(|primary| primary.node_id.as_str())
+    {
+        builder = builder.header(PRIMARY_NODE_HEADER, primary_node_id);
+    }
+    builder.body(Body::from(bytes)).unwrap_or_else(|_| {
+        (StatusCode::INTERNAL_SERVER_ERROR, "failed to build proxied response").into_response()
+    })
+}
+
 #[derive(serde::Serialize)]
-struct WorkerStatusResponse {
-    #[serde(flatten)]
-    progress: WorkerProgressSnapshot,
-    process_memory: ProcessMemoryStats,
+struct RelayImportResponse {
+    imported: bool,
+    already_imported: bool,
+    source_node_id: String,
+    file_sequence: u64,
+    event_count: u64,
+}
+
+async fn primary_import_relay_file(
+    State(state): State<PrimaryWorkerHttpState>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> HttpResponse<Body> {
+    let Some(source_node_id) = headers
+        .get(RELAY_HEADER_SOURCE_NODE_ID)
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return (StatusCode::BAD_REQUEST, "missing source node id").into_response();
+    };
+    let Some(file_sequence) = headers
+        .get(RELAY_HEADER_FILE_SEQUENCE)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    else {
+        return (StatusCode::BAD_REQUEST, "missing file sequence").into_response();
+    };
+    match import_relayed_journal_bytes(
+        &state.journal_root,
+        Arc::clone(&state.duckdb_usage),
+        source_node_id,
+        file_sequence,
+        body,
+    )
+    .await
+    {
+        Ok(response) => Json(response).into_response(),
+        Err(err) => {
+            tracing::warn!(
+                source_node_id,
+                file_sequence,
+                "failed to import relayed journal file: {err:#}"
+            );
+            (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                format!("failed to import relayed journal: {err:#}"),
+            )
+                .into_response()
+        },
+    }
+}
+
+impl ClusterUsageWorker {
+    /// Run one cluster-aware worker cycle.
+    pub async fn run_one_cycle(&self) -> anyhow::Result<bool> {
+        match self {
+            Self::Primary(worker) => worker.run_one_import().await,
+            Self::Edge(worker) => worker.run_one_relay().await,
+        }
+    }
+
+    /// Persist a terminal worker error in the progress state.
+    pub fn record_error(&self, err: &anyhow::Error) {
+        match self {
+            Self::Primary(worker) => worker.record_error(err),
+            Self::Edge(worker) => worker.record_error(err),
+        }
+    }
+}
+
+impl EdgeUsageWorker {
+    /// Create an edge-secondary relay worker.
+    pub fn new(
+        journal_root: PathBuf,
+        cluster_state: Arc<crate::cluster::ClusterRuntimeState>,
+        source_node_id: String,
+        consumer_lease_ms: u64,
+    ) -> anyhow::Result<Self> {
+        for subdir in ["sealed", "consuming", "bad"] {
+            fs::create_dir_all(journal_root.join(subdir)).with_context(|| {
+                format!("failed to create journal dir `{}`", journal_root.join(subdir).display())
+            })?;
+        }
+        Ok(Self {
+            state: JournalConsumerState::open(&journal_root)?,
+            journal_root,
+            consumer_lease_ms: consumer_lease_ms.max(1),
+            cluster_state,
+            source_node_id,
+            http_client: reqwest::Client::builder()
+                .timeout(Duration::from_secs(15))
+                .build()
+                .context("build edge usage relay http client")?,
+        })
+    }
+
+    /// Return current relay worker progress.
+    pub fn progress_snapshot(&self) -> anyhow::Result<WorkerProgressSnapshot> {
+        self.state.progress_snapshot()
+    }
+
+    /// Persist a terminal worker error in the progress state.
+    pub fn record_error(&self, err: &anyhow::Error) {
+        let mut progress = self.progress_snapshot().unwrap_or_else(|_| idle_progress());
+        progress.state = "error".to_string();
+        progress.heartbeat_at_ms = Some(now_ms());
+        progress.last_error = Some(format!("{err:#}"));
+        progress.last_error_at_ms = Some(now_ms());
+        if let Err(update_err) = self.state.update_progress(&progress, now_ms()) {
+            tracing::error!("failed to persist edge usage worker error status: {update_err:#}");
+        }
+    }
+
+    /// Relay one sealed journal file if one is available.
+    pub async fn run_one_relay(&self) -> anyhow::Result<bool> {
+        recover_orphan_consuming_files(&self.journal_root, &self.state, self.consumer_lease_ms)?;
+        let Some(claim) = claim_oldest_sealed_file(&self.journal_root, &self.state)? else {
+            self.state.update_progress(&idle_progress(), now_ms())?;
+            return Ok(false);
+        };
+        self.state
+            .update_progress(&relaying_progress(&claim), now_ms())?;
+        let bytes = fs::read(&claim.path).with_context(|| {
+            format!("failed to read relayed journal `{}`", claim.path.display())
+        })?;
+        let snapshot = self.cluster_state.snapshot().await;
+        let Some(base_url) = snapshot
+            .primary
+            .as_ref()
+            .and_then(|primary| primary.worker_base_url.clone())
+        else {
+            restore_claimed_file(&self.journal_root, &claim)?;
+            anyhow::bail!("primary usage worker is unavailable")
+        };
+        let response = self
+            .http_client
+            .post(format!("{}/internal/usage-journal/import", base_url.trim_end_matches('/')))
+            .header(RELAY_HEADER_SOURCE_NODE_ID, self.source_node_id.as_str())
+            .header(RELAY_HEADER_FILE_SEQUENCE, claim.sequence.to_string())
+            .body(bytes)
+            .send()
+            .await
+            .context("send relayed journal file to primary usage worker")?;
+        if !response.status().is_success() {
+            let status = response.status();
+            let body = response.text().await.unwrap_or_default();
+            restore_claimed_file(&self.journal_root, &claim)?;
+            anyhow::bail!("primary usage worker rejected relay with {}: {}", status, body);
+        }
+        fs::remove_file(&claim.path).with_context(|| {
+            format!(
+                "failed to delete relayed journal after successful import `{}`",
+                claim.path.display()
+            )
+        })?;
+        let mut progress = idle_progress();
+        progress.last_successful_file_sequence = Some(claim.sequence);
+        progress.last_successful_import_at_ms = Some(now_ms());
+        self.state.update_progress(&progress, now_ms())?;
+        Ok(true)
+    }
 }
 
 impl UsageWorker {
@@ -123,7 +470,17 @@ impl UsageWorker {
             usage_analytics_retention_days: Arc::new(RwLock::new(
                 usage_analytics_retention_days.max(1),
             )),
+            cluster_state: None,
         })
+    }
+
+    /// Attach optional cluster state used by status surfaces.
+    pub fn with_cluster_state(
+        mut self,
+        cluster_state: Option<Arc<crate::cluster::ClusterRuntimeState>>,
+    ) -> Self {
+        self.cluster_state = cluster_state;
+        self
     }
 
     /// Update the retention horizon used by query responses and maintenance.
@@ -199,103 +556,14 @@ impl UsageWorker {
         max_blocks: Option<usize>,
         finalize_file: bool,
     ) -> anyhow::Result<bool> {
-        self.recover_orphan_consuming_files()?;
-        let Some(claim) = self.claim_oldest_sealed_file()? else {
+        recover_orphan_consuming_files(&self.journal_root, &self.state, self.consumer_lease_ms)?;
+        let Some(claim) = claim_oldest_sealed_file(&self.journal_root, &self.state)? else {
             self.state.update_progress(&idle_progress(), now_ms())?;
             return Ok(false);
         };
         self.import_claimed_file(claim, max_blocks, finalize_file)
             .await
             .map(|()| true)
-    }
-
-    fn claim_oldest_sealed_file(&self) -> anyhow::Result<Option<ClaimedJournalFile>> {
-        let sealed_dir = self.journal_root.join("sealed");
-        if !sealed_dir.exists() {
-            return Ok(None);
-        }
-        let mut candidates = Vec::new();
-        for entry in fs::read_dir(&sealed_dir).with_context(|| {
-            format!("failed to read sealed journal dir `{}`", sealed_dir.display())
-        })? {
-            let entry = entry?;
-            let path = entry.path();
-            if !path.is_file() {
-                continue;
-            }
-            let Some(sequence) = parse_journal_sequence(&path) else {
-                continue;
-            };
-            candidates.push((sequence, path));
-        }
-        candidates.sort_by_key(|(sequence, _path)| *sequence);
-        for (sequence, sealed_path) in candidates {
-            if self.state.is_consumed(sequence)? {
-                fs::remove_file(&sealed_path).with_context(|| {
-                    format!("failed to delete already consumed journal `{}`", sealed_path.display())
-                })?;
-                continue;
-            }
-            let consuming_path = self.journal_root.join("consuming").join(
-                sealed_path
-                    .file_name()
-                    .ok_or_else(|| anyhow!("journal file has no name"))?,
-            );
-            fs::rename(&sealed_path, &consuming_path).with_context(|| {
-                format!(
-                    "failed to claim journal `{}` as `{}`",
-                    sealed_path.display(),
-                    consuming_path.display()
-                )
-            })?;
-            return Ok(Some(ClaimedJournalFile {
-                sequence,
-                path: consuming_path,
-            }));
-        }
-        Ok(None)
-    }
-
-    fn recover_orphan_consuming_files(&self) -> anyhow::Result<()> {
-        let consuming_dir = self.journal_root.join("consuming");
-        if !consuming_dir.exists() {
-            return Ok(());
-        }
-        for entry in fs::read_dir(&consuming_dir).with_context(|| {
-            format!("failed to read consuming journal dir `{}`", consuming_dir.display())
-        })? {
-            let entry = entry?;
-            let path = entry.path();
-            let metadata = entry.metadata().with_context(|| {
-                format!("failed to stat consuming journal `{}`", path.display())
-            })?;
-            if !metadata.is_file() {
-                continue;
-            }
-            let Some(sequence) = parse_journal_sequence(&path) else {
-                continue;
-            };
-            if self.state.is_consumed(sequence)? {
-                fs::remove_file(&path).with_context(|| {
-                    format!("failed to delete orphan consuming journal `{}`", path.display())
-                })?;
-                continue;
-            }
-            if file_age_ms(&metadata) >= self.consumer_lease_ms as i64 {
-                let sealed_path = self.journal_root.join("sealed").join(
-                    path.file_name()
-                        .ok_or_else(|| anyhow!("consuming journal file has no name"))?,
-                );
-                fs::rename(&path, &sealed_path).with_context(|| {
-                    format!(
-                        "failed to recover stale consuming journal `{}` back to `{}`",
-                        path.display(),
-                        sealed_path.display()
-                    )
-                })?;
-            }
-        }
-        Ok(())
     }
 
     async fn import_claimed_file(
@@ -373,6 +641,119 @@ struct ClaimedJournalFile {
     path: PathBuf,
 }
 
+fn claim_oldest_sealed_file(
+    journal_root: &Path,
+    state: &JournalConsumerState,
+) -> anyhow::Result<Option<ClaimedJournalFile>> {
+    let sealed_dir = journal_root.join("sealed");
+    if !sealed_dir.exists() {
+        return Ok(None);
+    }
+    let mut candidates = Vec::new();
+    for entry in fs::read_dir(&sealed_dir)
+        .with_context(|| format!("failed to read sealed journal dir `{}`", sealed_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let Some(sequence) = parse_journal_sequence(&path) else {
+            continue;
+        };
+        candidates.push((sequence, path));
+    }
+    candidates.sort_by_key(|(sequence, _path)| *sequence);
+    for (sequence, sealed_path) in candidates {
+        if state.is_consumed(sequence)? {
+            fs::remove_file(&sealed_path).with_context(|| {
+                format!("failed to delete already consumed journal `{}`", sealed_path.display())
+            })?;
+            continue;
+        }
+        let consuming_path = journal_root.join("consuming").join(
+            sealed_path
+                .file_name()
+                .ok_or_else(|| anyhow!("journal file has no name"))?,
+        );
+        fs::rename(&sealed_path, &consuming_path).with_context(|| {
+            format!(
+                "failed to claim journal `{}` as `{}`",
+                sealed_path.display(),
+                consuming_path.display()
+            )
+        })?;
+        return Ok(Some(ClaimedJournalFile {
+            sequence,
+            path: consuming_path,
+        }));
+    }
+    Ok(None)
+}
+
+fn recover_orphan_consuming_files(
+    journal_root: &Path,
+    state: &JournalConsumerState,
+    consumer_lease_ms: u64,
+) -> anyhow::Result<()> {
+    let consuming_dir = journal_root.join("consuming");
+    if !consuming_dir.exists() {
+        return Ok(());
+    }
+    for entry in fs::read_dir(&consuming_dir).with_context(|| {
+        format!("failed to read consuming journal dir `{}`", consuming_dir.display())
+    })? {
+        let entry = entry?;
+        let path = entry.path();
+        let metadata = entry
+            .metadata()
+            .with_context(|| format!("failed to stat consuming journal `{}`", path.display()))?;
+        if !metadata.is_file() {
+            continue;
+        }
+        let Some(sequence) = parse_journal_sequence(&path) else {
+            continue;
+        };
+        if state.is_consumed(sequence)? {
+            fs::remove_file(&path).with_context(|| {
+                format!("failed to delete orphan consuming journal `{}`", path.display())
+            })?;
+            continue;
+        }
+        if file_age_ms(&metadata) >= consumer_lease_ms as i64 {
+            let sealed_path = journal_root.join("sealed").join(
+                path.file_name()
+                    .ok_or_else(|| anyhow!("consuming journal file has no name"))?,
+            );
+            fs::rename(&path, &sealed_path).with_context(|| {
+                format!(
+                    "failed to recover stale consuming journal `{}` back to `{}`",
+                    path.display(),
+                    sealed_path.display()
+                )
+            })?;
+        }
+    }
+    Ok(())
+}
+
+fn restore_claimed_file(journal_root: &Path, claim: &ClaimedJournalFile) -> anyhow::Result<()> {
+    let sealed_path = journal_root.join("sealed").join(
+        claim
+            .path
+            .file_name()
+            .ok_or_else(|| anyhow!("claimed journal file has no name"))?,
+    );
+    fs::rename(&claim.path, &sealed_path).with_context(|| {
+        format!(
+            "failed to restore claimed journal `{}` back to `{}`",
+            claim.path.display(),
+            sealed_path.display()
+        )
+    })?;
+    Ok(())
+}
+
 fn importing_progress(
     claim: &ClaimedJournalFile,
     processed_blocks: u64,
@@ -399,6 +780,96 @@ fn importing_progress(
         heartbeat_at_ms: Some(now_ms()),
         ..WorkerProgressSnapshot::default()
     }
+}
+
+fn relaying_progress(claim: &ClaimedJournalFile) -> WorkerProgressSnapshot {
+    WorkerProgressSnapshot {
+        state: "relaying".to_string(),
+        current_file_path: Some(claim.path.display().to_string()),
+        current_file_sequence: Some(claim.sequence),
+        heartbeat_at_ms: Some(now_ms()),
+        ..WorkerProgressSnapshot::default()
+    }
+}
+
+async fn import_relayed_journal_bytes(
+    journal_root: &Path,
+    duckdb_usage: Arc<DuckDbUsageRepository>,
+    source_node_id: &str,
+    file_sequence: u64,
+    body: Bytes,
+) -> anyhow::Result<RelayImportResponse> {
+    let digest = format!("{:x}", Sha256::digest(body.as_ref()));
+    if JournalConsumerState::open(journal_root)?.is_relay_consumed(
+        source_node_id,
+        file_sequence,
+        &digest,
+    )? {
+        return Ok(RelayImportResponse {
+            imported: false,
+            already_imported: true,
+            source_node_id: source_node_id.to_string(),
+            file_sequence,
+            event_count: 0,
+        });
+    }
+    let relay_tmp_dir = journal_root.join("relay-tmp");
+    fs::create_dir_all(&relay_tmp_dir).with_context(|| {
+        format!("failed to create relay temp dir `{}`", relay_tmp_dir.display())
+    })?;
+    let temp_path = relay_tmp_dir.join(format!(
+        "relay-{}-{file_sequence:010}-{}.journal",
+        sanitize_file_component(source_node_id),
+        Uuid::new_v4()
+    ));
+    fs::write(&temp_path, body.as_ref())
+        .with_context(|| format!("failed to write relay temp journal `{}`", temp_path.display()))?;
+    let import_result = async {
+        let reader = JournalReader::open(&temp_path)?;
+        let mut stream = reader.stream_batches()?;
+        let mut event_count = 0u64;
+        while let Some(batch) = stream.next_batch()? {
+            let events = batch
+                .events
+                .into_iter()
+                .map(|event| event.into_usage_event())
+                .collect::<Vec<_>>();
+            event_count = event_count.saturating_add(events.len() as u64);
+            duckdb_usage.append_usage_events_owned(events).await?;
+        }
+        let report = stream.finish()?;
+        JournalConsumerState::open(journal_root)?.record_relay_consumed_file(
+            source_node_id,
+            file_sequence,
+            &report.file_digest_hex,
+            report.footer.event_count,
+            now_ms(),
+        )?;
+        Ok::<RelayImportResponse, anyhow::Error>(RelayImportResponse {
+            imported: true,
+            already_imported: false,
+            source_node_id: source_node_id.to_string(),
+            file_sequence,
+            event_count,
+        })
+    }
+    .await;
+    let _ = fs::remove_file(&temp_path);
+    import_result
+}
+
+fn sanitize_file_component(raw: &str) -> String {
+    raw.chars()
+        .map(
+            |ch| {
+                if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | '.') {
+                    ch
+                } else {
+                    '-'
+                }
+            },
+        )
+        .collect()
 }
 
 fn idle_progress() -> WorkerProgressSnapshot {
@@ -451,23 +922,25 @@ fn file_age_ms(metadata: &fs::Metadata) -> i64 {
         .unwrap_or(i64::MAX)
 }
 
-/// Run the import loop until the process is stopped.
-pub async fn run_forever(worker: UsageWorker) -> anyhow::Result<()> {
+/// Run the import/relay loop until the process is stopped.
+pub async fn run_forever(worker: ClusterUsageWorker) -> anyhow::Result<()> {
     const USAGE_ANALYTICS_MAINTENANCE_INTERVAL: Duration = Duration::from_secs(60 * 60);
     let mut last_maintenance = None::<std::time::Instant>;
     loop {
-        if let Err(err) = worker.run_one_import().await {
+        if let Err(err) = worker.run_one_cycle().await {
             worker.record_error(&err);
             return Err(err);
         }
-        if last_maintenance
-            .map(|last| last.elapsed() >= USAGE_ANALYTICS_MAINTENANCE_INTERVAL)
-            .unwrap_or(true)
-        {
-            if let Err(err) = worker.run_maintenance(now_ms()).await {
-                tracing::warn!("llm access usage analytics maintenance failed: {err:#}");
+        if let ClusterUsageWorker::Primary(primary) = &worker {
+            if last_maintenance
+                .map(|last| last.elapsed() >= USAGE_ANALYTICS_MAINTENANCE_INTERVAL)
+                .unwrap_or(true)
+            {
+                if let Err(err) = primary.run_maintenance(now_ms()).await {
+                    tracing::warn!("llm access usage analytics maintenance failed: {err:#}");
+                }
+                last_maintenance = Some(std::time::Instant::now());
             }
-            last_maintenance = Some(std::time::Instant::now());
         }
         tokio::time::sleep(Duration::from_secs(1)).await;
     }
@@ -559,7 +1032,7 @@ mod tests {
         fixture.write_sealed_event("evt-worker-http");
         fixture.run_one_import().await.expect("import");
 
-        let app = super::router(fixture.worker.as_ref());
+        let app = super::primary_worker_router(fixture.worker.as_ref());
         let response = app
             .clone()
             .oneshot(
@@ -597,7 +1070,7 @@ mod tests {
         fixture.write_sealed_event("evt-worker-chart");
         fixture.run_one_import().await.expect("import");
 
-        let app = super::router(fixture.worker.as_ref());
+        let app = super::primary_worker_router(fixture.worker.as_ref());
         let response = app
             .oneshot(
                 Request::builder()
@@ -622,7 +1095,7 @@ mod tests {
     #[tokio::test]
     async fn usage_worker_status_includes_process_memory() {
         let fixture = UsageWorkerFixture::new();
-        let app = super::router(fixture.worker.as_ref());
+        let app = super::primary_worker_router(fixture.worker.as_ref());
 
         let response = app
             .oneshot(

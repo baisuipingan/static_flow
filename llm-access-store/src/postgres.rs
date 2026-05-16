@@ -562,6 +562,110 @@ impl PostgresControlRepository {
         }
     }
 
+    async fn load_admin_proxy_configs_cached(&self) -> anyhow::Result<Vec<AdminProxyConfig>> {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return self.list_admin_proxy_configs_rows().await;
+        };
+        let cache_key = cache.proxy_configs_key();
+        match cache
+            .get_json::<crate::request_cache::CachedProxyConfigsLookup>(&cache_key)
+            .await
+        {
+            Ok(Some(lookup)) => return Ok(lookup.configs),
+            Ok(None) => {},
+            Err(err) => {
+                tracing::warn!(
+                    key = %cache_key,
+                    error = %err,
+                    "request cache proxy-configs read failed; falling back to postgres"
+                );
+            },
+        }
+        let configs = self.list_admin_proxy_configs_rows().await?;
+        let lookup = crate::request_cache::CachedProxyConfigsLookup {
+            configs: configs.clone(),
+        };
+        if let Err(err) = cache
+            .set_json(&cache_key, &lookup, cache.proxy_configs_ttl())
+            .await
+        {
+            tracing::warn!(
+                key = %cache_key,
+                error = %err,
+                "request cache proxy-configs write failed"
+            );
+        }
+        Ok(configs)
+    }
+
+    async fn load_admin_proxy_binding_cached(
+        &self,
+        provider_type: &str,
+    ) -> anyhow::Result<AdminProxyBinding> {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return self.load_admin_proxy_binding_row(provider_type).await;
+        };
+        let cache_key = cache.proxy_binding_key(provider_type);
+        match cache
+            .get_json::<crate::request_cache::CachedProxyBindingLookup>(&cache_key)
+            .await
+        {
+            Ok(Some(lookup)) => return Ok(lookup.binding),
+            Ok(None) => {},
+            Err(err) => {
+                tracing::warn!(
+                    provider = provider_type,
+                    key = %cache_key,
+                    error = %err,
+                    "request cache proxy-binding read failed; falling back to postgres"
+                );
+            },
+        }
+        let proxy_configs_by_id = self
+            .load_admin_proxy_configs_cached()
+            .await?
+            .into_iter()
+            .map(|proxy| (proxy.id.clone(), proxy))
+            .collect::<BTreeMap<_, _>>();
+        let binding = self
+            .load_admin_proxy_binding_from_configs(provider_type, &proxy_configs_by_id)
+            .await?;
+        let lookup = crate::request_cache::CachedProxyBindingLookup {
+            binding: binding.clone(),
+        };
+        if let Err(err) = cache
+            .set_json(&cache_key, &lookup, cache.proxy_binding_ttl(provider_type))
+            .await
+        {
+            tracing::warn!(
+                provider = provider_type,
+                key = %cache_key,
+                error = %err,
+                "request cache proxy-binding write failed"
+            );
+        }
+        Ok(binding)
+    }
+
+    async fn invalidate_proxy_metadata_cache(&self) {
+        let Some(cache) = self.request_cache.as_ref() else {
+            return;
+        };
+        let configs_key = cache.proxy_configs_key();
+        let codex_binding_key = cache.proxy_binding_key(core_store::PROVIDER_CODEX);
+        let kiro_binding_key = cache.proxy_binding_key(core_store::PROVIDER_KIRO);
+        if let Err(err) = cache
+            .delete_many([
+                configs_key.as_str(),
+                codex_binding_key.as_str(),
+                kiro_binding_key.as_str(),
+            ])
+            .await
+        {
+            tracing::warn!(error = %err, "failed to invalidate proxy metadata cache");
+        }
+    }
+
     async fn load_authenticated_key_by_hash(
         &self,
         key_hash: &str,
@@ -3482,14 +3586,12 @@ impl PostgresControlRepository {
         provider_type: &str,
     ) -> anyhow::Result<ProviderProxyResolutionContext> {
         let proxy_configs_by_id = self
-            .list_admin_proxy_configs_rows()
+            .load_admin_proxy_configs_cached()
             .await?
             .into_iter()
             .map(|proxy| (proxy.id.clone(), proxy))
             .collect::<BTreeMap<_, _>>();
-        let binding = self
-            .load_admin_proxy_binding_from_configs(provider_type, &proxy_configs_by_id)
-            .await?;
+        let binding = self.load_admin_proxy_binding_cached(provider_type).await?;
         Ok(ProviderProxyResolutionContext {
             proxy_configs_by_id,
             binding,
@@ -5848,7 +5950,7 @@ impl AdminAccountGroupStore for PostgresControlRepository {
 #[async_trait]
 impl AdminProxyStore for PostgresControlRepository {
     async fn list_admin_proxy_configs(&self) -> anyhow::Result<Vec<AdminProxyConfig>> {
-        self.list_admin_proxy_configs_rows().await
+        self.load_admin_proxy_configs_cached().await
     }
 
     async fn get_admin_proxy_config(
@@ -5882,6 +5984,7 @@ impl AdminProxyStore for PostgresControlRepository {
             )
             .await
             .context("create postgres proxy config")?;
+        self.invalidate_proxy_metadata_cache().await;
         self.bump_dispatch_generation(core_store::PROVIDER_CODEX)
             .await;
         self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
@@ -5934,6 +6037,7 @@ impl AdminProxyStore for PostgresControlRepository {
             )
             .await
             .context("patch postgres proxy config")?;
+        self.invalidate_proxy_metadata_cache().await;
         self.invalidate_all_account_views_for_provider(core_store::PROVIDER_CODEX)
             .await;
         self.invalidate_all_account_views_for_provider(core_store::PROVIDER_KIRO)
@@ -5957,6 +6061,7 @@ impl AdminProxyStore for PostgresControlRepository {
             .execute("DELETE FROM llm_proxy_configs WHERE proxy_config_id = $1", &[&proxy_id])
             .await
             .context("delete postgres proxy config")?;
+        self.invalidate_proxy_metadata_cache().await;
         self.invalidate_all_account_views_for_provider(core_store::PROVIDER_CODEX)
             .await;
         self.invalidate_all_account_views_for_provider(core_store::PROVIDER_KIRO)
@@ -5971,7 +6076,7 @@ impl AdminProxyStore for PostgresControlRepository {
     async fn list_admin_proxy_bindings(&self) -> anyhow::Result<Vec<AdminProxyBinding>> {
         let mut bindings = Vec::new();
         for provider in [core_store::PROVIDER_CODEX, core_store::PROVIDER_KIRO] {
-            bindings.push(self.load_admin_proxy_binding_row(provider).await?);
+            bindings.push(self.load_admin_proxy_binding_cached(provider).await?);
         }
         Ok(bindings)
     }
@@ -6006,10 +6111,11 @@ impl AdminProxyStore for PostgresControlRepository {
                     .context("delete postgres proxy binding")?;
             },
         }
+        self.invalidate_proxy_metadata_cache().await;
         self.invalidate_all_account_views_for_provider(provider_type)
             .await;
         self.bump_dispatch_generation(provider_type).await;
-        self.load_admin_proxy_binding_row(provider_type).await
+        self.load_admin_proxy_binding_cached(provider_type).await
     }
 
     async fn import_legacy_kiro_proxy_configs(
@@ -6107,6 +6213,7 @@ impl AdminProxyStore for PostgresControlRepository {
         }
         migrated_account_names.sort();
         migrated_account_names.dedup();
+        self.invalidate_proxy_metadata_cache().await;
         self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
             .await;
         Ok(AdminLegacyKiroProxyMigration {

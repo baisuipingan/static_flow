@@ -2,7 +2,8 @@ use std::time::Duration;
 
 use anyhow::Context;
 use llm_access_core::store::{
-    AdminKiroBalanceView, AdminKiroCacheView, CodexRateLimitStatus, ProviderProxyConfig,
+    AdminKiroBalanceView, AdminKiroCacheView, AdminProxyBinding, AdminProxyConfig,
+    CodexRateLimitStatus, ProviderProxyConfig,
 };
 use redis::AsyncCommands;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
@@ -16,6 +17,7 @@ const REQUEST_SNAPSHOT_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const ACCOUNT_VIEW_TTL: Duration = Duration::from_secs(4 * 60 * 60);
 const ACCOUNT_AUTH_TTL: Duration = Duration::from_secs(4 * 60 * 60);
 const CODEX_STATUS_TTL: Duration = Duration::from_secs(4 * 60 * 60);
+const PROXY_METADATA_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const NEGATIVE_AUTH_TTL: Duration = Duration::from_secs(5 * 60);
 
 /// Shared Valkey configuration for the request-path cache layer.
@@ -57,6 +59,16 @@ pub(crate) struct CachedRuntimeConfigLookup {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CachedCodexStatusLookup {
     pub snapshot: Option<CodexRateLimitStatus>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CachedProxyConfigsLookup {
+    pub configs: Vec<AdminProxyConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CachedProxyBindingLookup {
+    pub binding: AdminProxyBinding,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -191,6 +203,14 @@ impl RequestCache {
         format!("{}:status:codex", self.key_prefix)
     }
 
+    pub(crate) fn proxy_configs_key(&self) -> String {
+        format!("{}:proxy:configs", self.key_prefix)
+    }
+
+    pub(crate) fn proxy_binding_key(&self, provider: &str) -> String {
+        format!("{}:proxy:binding:{provider}", self.key_prefix)
+    }
+
     pub(crate) fn account_view_key(&self, provider: &str, account_name: &str) -> String {
         format!("{}:acct:view:{provider}:{account_name}", self.key_prefix)
     }
@@ -226,6 +246,14 @@ impl RequestCache {
 
     pub(crate) fn codex_status_ttl(&self) -> Duration {
         deterministic_jitter_ttl(&self.codex_status_key(), CODEX_STATUS_TTL, 0.75, 1.25)
+    }
+
+    pub(crate) fn proxy_configs_ttl(&self) -> Duration {
+        deterministic_jitter_ttl(&self.proxy_configs_key(), PROXY_METADATA_TTL, 0.8, 1.2)
+    }
+
+    pub(crate) fn proxy_binding_ttl(&self, provider: &str) -> Duration {
+        deterministic_jitter_ttl(&self.proxy_binding_key(provider), PROXY_METADATA_TTL, 0.8, 1.2)
     }
 
     pub(crate) fn account_view_ttl(&self, provider: &str, account_name: &str) -> Duration {
@@ -440,6 +468,8 @@ mod tests {
         );
         assert_eq!(cache.runtime_config_key(), "llma:test:runtime:config".to_string());
         assert_eq!(cache.codex_status_key(), "llma:test:status:codex".to_string());
+        assert_eq!(cache.proxy_configs_key(), "llma:test:proxy:configs".to_string());
+        assert_eq!(cache.proxy_binding_key("codex"), "llma:test:proxy:binding:codex".to_string());
     }
 
     #[test]

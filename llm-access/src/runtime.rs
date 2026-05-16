@@ -49,6 +49,7 @@ const USAGE_EVENT_CHANNEL_CAPACITY: usize = 1_024;
 #[derive(Clone)]
 pub struct LlmAccessRuntime {
     control_store: Arc<dyn ControlStore>,
+    cluster_state: Option<Arc<crate::cluster::ClusterRuntimeState>>,
     geoip: GeoIpResolver,
     provider_route_store: Arc<dyn ProviderRouteStore>,
     admin_config_store: Arc<dyn AdminConfigStore>,
@@ -75,6 +76,7 @@ pub struct LlmAccessRuntime {
 /// standalone service grows.
 struct LlmAccessStores {
     control_store: Arc<dyn ControlStore>,
+    cluster_state: Option<Arc<crate::cluster::ClusterRuntimeState>>,
     geoip: GeoIpResolver,
     provider_route_store: Arc<dyn ProviderRouteStore>,
     admin_config_store: Arc<dyn AdminConfigStore>,
@@ -188,6 +190,7 @@ impl LlmAccessRuntime {
     pub fn new(control_store: Arc<dyn ControlStore>) -> Self {
         Self::with_stores(LlmAccessStores {
             control_store,
+            cluster_state: None,
             geoip: GeoIpResolver::disabled(),
             provider_route_store: Arc::new(EmptyProviderRouteStore),
             admin_config_store: Arc::new(EmptyAdminConfigStore),
@@ -215,6 +218,7 @@ impl LlmAccessRuntime {
     fn with_stores(stores: LlmAccessStores) -> Self {
         Self {
             control_store: stores.control_store,
+            cluster_state: stores.cluster_state,
             geoip: stores.geoip,
             provider_route_store: stores.provider_route_store,
             admin_config_store: stores.admin_config_store,
@@ -241,6 +245,8 @@ impl LlmAccessRuntime {
     /// Open runtime dependencies from configured persistent storage.
     pub async fn from_storage_config(config: &StorageConfig) -> anyhow::Result<Self> {
         validate_state_root(config)?;
+        let cluster_state =
+            crate::cluster::ClusterRuntimeState::from_storage_config(config).await?;
         let geoip = GeoIpResolver::from_env()?;
         geoip.warmup().await;
         let email_notifier = crate::email::EmailNotifier::from_env()?.map(Arc::new);
@@ -249,7 +255,14 @@ impl LlmAccessRuntime {
                 path,
             } => {
                 let repository = Arc::new(SqliteControlRepository::open_path(path)?);
-                Self::from_open_repository(config, geoip, email_notifier, repository).await
+                Self::from_open_repository(
+                    config,
+                    cluster_state.clone(),
+                    geoip,
+                    email_notifier,
+                    repository,
+                )
+                .await
             },
             ControlStoreConfig::Postgres {
                 database_url_env,
@@ -261,13 +274,15 @@ impl LlmAccessRuntime {
                 let repository = Arc::new(
                     PostgresControlRepository::connect(&database_url, request_cache).await?,
                 );
-                Self::from_open_repository(config, geoip, email_notifier, repository).await
+                Self::from_open_repository(config, cluster_state, geoip, email_notifier, repository)
+                    .await
             },
         }
     }
 
     async fn from_open_repository<R>(
         config: &StorageConfig,
+        cluster_state: Option<Arc<crate::cluster::ClusterRuntimeState>>,
         geoip: GeoIpResolver,
         email_notifier: Option<Arc<crate::email::EmailNotifier>>,
         repository: Arc<R>,
@@ -341,6 +356,7 @@ impl LlmAccessRuntime {
         let public_status_store: Arc<dyn PublicStatusStore> = repository;
         Ok(Self::with_stores(LlmAccessStores {
             control_store,
+            cluster_state,
             geoip,
             provider_route_store,
             admin_config_store,
@@ -367,6 +383,12 @@ impl LlmAccessRuntime {
     /// Shared control store used by request handlers.
     pub fn control_store(&self) -> Arc<dyn ControlStore> {
         Arc::clone(&self.control_store)
+    }
+
+    /// Shared cluster state when this deployment participates in multi-node
+    /// mode.
+    pub fn cluster_state(&self) -> Option<Arc<crate::cluster::ClusterRuntimeState>> {
+        self.cluster_state.clone()
     }
 
     pub(crate) fn geoip(&self) -> GeoIpResolver {
@@ -1414,6 +1436,7 @@ mod tests {
             std::env::temp_dir().join(format!("llm-access-{name}-{}-{unique}", std::process::id()));
         crate::config::StorageConfig {
             state_root: root.clone(),
+            node_identity: None,
             control_store: crate::config::ControlStoreConfig::Sqlite {
                 path: root.join("control/llm-access.sqlite3"),
             },

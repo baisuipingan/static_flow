@@ -4,6 +4,7 @@ mod activity;
 mod admin;
 /// Process allocator tuning.
 pub mod allocator;
+pub mod cluster;
 mod codex_refresh;
 mod codex_status;
 /// Command-line and environment configuration.
@@ -64,6 +65,7 @@ pub(crate) static KIRO_UPSTREAM_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mute
 #[derive(Clone)]
 struct HttpState {
     provider_state: provider::ProviderState,
+    cluster_state: Option<Arc<crate::cluster::ClusterRuntimeState>>,
     geoip: geoip::GeoIpResolver,
     request_activity: Arc<activity::RequestActivityTracker>,
     admin_config_store: Arc<dyn AdminConfigStore>,
@@ -184,6 +186,7 @@ pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
     );
     let state = HttpState {
         provider_state,
+        cluster_state: runtime.cluster_state(),
         geoip,
         request_activity,
         admin_config_store: runtime.admin_config_store(),
@@ -471,7 +474,14 @@ async fn provider_entry_handler(
 pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     let service_runtime = runtime::LlmAccessRuntime::from_storage_config(&config.storage).await?;
     allocator::collect_process_allocator();
-    if background_status_refresh_enabled() {
+    let cluster_role = match service_runtime.cluster_state() {
+        Some(cluster) => Some(cluster.runtime_role().await),
+        None => None,
+    };
+    if background_status_refresh_enabled_with_role(
+        config.storage.node_identity.as_ref(),
+        cluster_role,
+    ) {
         codex_status::spawn_codex_status_refresher(&service_runtime);
         kiro_status::spawn_kiro_status_refresher(&service_runtime);
     } else {
@@ -495,12 +505,32 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     result
 }
 
-fn background_status_refresh_enabled() -> bool {
-    background_status_refresh_enabled_from_raw(
+fn background_status_refresh_enabled_with_role(
+    node_identity: Option<&crate::cluster::NodeIdentity>,
+    runtime_role: Option<crate::cluster::NodeRuntimeRole>,
+) -> bool {
+    background_status_refresh_enabled_for_role(
+        runtime_role.or_else(|| node_identity.and_then(background_status_refresh_runtime_role)),
         std::env::var("LLM_ACCESS_BACKGROUND_STATUS_REFRESH_ENABLED")
             .ok()
             .as_deref(),
     )
+}
+
+fn background_status_refresh_enabled_for_role(
+    role: Option<crate::cluster::NodeRuntimeRole>,
+    raw: Option<&str>,
+) -> bool {
+    if matches!(
+        role,
+        Some(
+            crate::cluster::NodeRuntimeRole::EdgeSecondary
+                | crate::cluster::NodeRuntimeRole::Degraded
+        )
+    ) {
+        return false;
+    }
+    background_status_refresh_enabled_from_raw(raw)
 }
 
 fn background_status_refresh_enabled_from_raw(raw: Option<&str>) -> bool {
@@ -508,6 +538,15 @@ fn background_status_refresh_enabled_from_raw(raw: Option<&str>) -> bool {
         return true;
     };
     !matches!(raw.trim().to_ascii_lowercase().as_str(), "0" | "false" | "no" | "off")
+}
+
+fn background_status_refresh_runtime_role(
+    node_identity: &crate::cluster::NodeIdentity,
+) -> Option<crate::cluster::NodeRuntimeRole> {
+    match node_identity.node_class {
+        crate::cluster::NodeClass::Core => Some(crate::cluster::NodeRuntimeRole::Primary),
+        crate::cluster::NodeClass::Edge => Some(crate::cluster::NodeRuntimeRole::EdgeSecondary),
+    }
 }
 
 fn spawn_allocator_collector() {
@@ -614,16 +653,32 @@ mod tests {
 
     #[test]
     fn background_status_refresh_env_defaults_to_enabled() {
-        assert!(super::background_status_refresh_enabled_from_raw(None));
-        assert!(super::background_status_refresh_enabled_from_raw(Some("1")));
-        assert!(super::background_status_refresh_enabled_from_raw(Some("true")));
+        assert!(super::background_status_refresh_enabled_for_role(None, None));
+        assert!(super::background_status_refresh_enabled_for_role(None, Some("1")));
+        assert!(super::background_status_refresh_enabled_for_role(None, Some("true")));
     }
 
     #[test]
     fn background_status_refresh_env_accepts_false_values() {
-        assert!(!super::background_status_refresh_enabled_from_raw(Some("0")));
-        assert!(!super::background_status_refresh_enabled_from_raw(Some("false")));
-        assert!(!super::background_status_refresh_enabled_from_raw(Some(" OFF ")));
+        assert!(!super::background_status_refresh_enabled_for_role(None, Some("0")));
+        assert!(!super::background_status_refresh_enabled_for_role(None, Some("false")));
+        assert!(!super::background_status_refresh_enabled_for_role(None, Some(" OFF ")));
+    }
+
+    #[test]
+    fn background_status_refresh_requires_primary_runtime_role() {
+        assert!(super::background_status_refresh_enabled_for_role(
+            Some(crate::cluster::NodeRuntimeRole::Primary),
+            Some("1")
+        ));
+        assert!(!super::background_status_refresh_enabled_for_role(
+            Some(crate::cluster::NodeRuntimeRole::EdgeSecondary),
+            Some("1")
+        ));
+        assert!(!super::background_status_refresh_enabled_for_role(
+            Some(crate::cluster::NodeRuntimeRole::Degraded),
+            Some("1")
+        ));
     }
 
     #[tokio::test]
@@ -664,6 +719,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create state root");
         let config = crate::config::StorageConfig {
             state_root: root.clone(),
+            node_identity: None,
             control_store: crate::config::ControlStoreConfig::Sqlite {
                 path: root.join("control/llm-access.sqlite3"),
             },
@@ -1487,6 +1543,7 @@ mod tests {
         std::fs::create_dir_all(&root).expect("create state root");
         let config = crate::config::StorageConfig {
             state_root: root.clone(),
+            node_identity: None,
             control_store: crate::config::ControlStoreConfig::Sqlite {
                 path: root.join("control/llm-access.sqlite3"),
             },
@@ -1555,6 +1612,7 @@ mod tests {
 
         let config = crate::config::StorageConfig {
             state_root: root.clone(),
+            node_identity: None,
             control_store: crate::config::ControlStoreConfig::Sqlite {
                 path: control_root.join("control/llm-access.sqlite3"),
             },

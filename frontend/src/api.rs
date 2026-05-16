@@ -6318,7 +6318,19 @@ pub struct AdminUsageWorkerProgressView {
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(default)]
+pub struct AdminUsageJournalClusterView {
+    pub node_id: String,
+    pub node_class: String,
+    pub runtime_role: String,
+    pub primary_node_id: Option<String>,
+    pub usage_query_mode: String,
+    pub primary_worker_base_url: Option<String>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(default)]
 pub struct AdminUsageJournalStatusView {
+    pub cluster: Option<AdminUsageJournalClusterView>,
     pub journal_enabled: bool,
     pub journal_root: String,
     pub current_rpm: u32,

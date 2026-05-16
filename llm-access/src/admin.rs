@@ -260,6 +260,7 @@ struct AdminSponsorRequestsResponse {
 
 #[derive(Debug, Serialize)]
 struct AdminUsageJournalStatusResponse {
+    cluster: Option<AdminClusterNodeStatusView>,
     journal_enabled: bool,
     journal_root: String,
     current_rpm: u32,
@@ -283,6 +284,16 @@ struct AdminUsageJournalStatusResponse {
     bad_files: Vec<AdminUsageJournalFileView>,
     worker: AdminUsageWorkerProgressView,
     generated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AdminClusterNodeStatusView {
+    node_id: String,
+    node_class: crate::cluster::NodeClass,
+    runtime_role: crate::cluster::NodeRuntimeRole,
+    primary_node_id: Option<String>,
+    usage_query_mode: crate::cluster::UsageQueryMode,
+    primary_worker_base_url: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1292,7 +1303,28 @@ pub(crate) async fn get_usage_journal_status(
     };
     let worker = usage_worker_status(&config.usage_query_base_url, now).await;
     let partitioned = partition_usage_journal_files(&journal, &files, &worker);
+    let cluster = match state.cluster_state.as_ref() {
+        Some(cluster_state) => {
+            let snapshot = cluster_state.snapshot().await;
+            Some(AdminClusterNodeStatusView {
+                node_id: snapshot.node.node_id,
+                node_class: snapshot.node.node_class,
+                runtime_role: snapshot.runtime_role,
+                primary_node_id: snapshot
+                    .primary
+                    .as_ref()
+                    .map(|primary| primary.node_id.clone()),
+                usage_query_mode: snapshot.usage_query_mode,
+                primary_worker_base_url: snapshot
+                    .primary
+                    .as_ref()
+                    .and_then(|primary| primary.worker_base_url.clone()),
+            })
+        },
+        None => None,
+    };
     Json(AdminUsageJournalStatusResponse {
+        cluster,
         journal_enabled: journal.journal_enabled,
         journal_root: journal.journal_root,
         current_rpm: activity.rpm,

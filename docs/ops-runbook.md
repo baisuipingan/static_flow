@@ -222,6 +222,26 @@ private env files, not in tracked docs.
   `LLM_ACCESS_BACKGROUND_STATUS_REFRESH_ENABLED=0` in the service unit unless
   you are intentionally pausing periodic Codex/Kiro account-status refresh for
   incident mitigation.
+- Multi-node `llm-access` version one uses two deployment classes:
+  - `core`: exactly one node, mounts `/mnt/llm-access` and
+    `/mnt/llm-access-usage`, publishes itself as the primary through shared
+    Valkey metadata, runs background refresh, and owns DuckDB/JuiceFS usage
+    writes.
+  - `edge`: zero or more nodes, no JuiceFS mount, still serve API traffic and
+    write local journals, but their local usage worker only proxies usage
+    queries to the primary worker and relays sealed journal files to it.
+- Multi-node identity is configured through:
+  - `LLM_ACCESS_NODE_ID`
+  - `LLM_ACCESS_NODE_CLASS` (`core` or `edge`)
+  - optional `LLM_ACCESS_NODE_DISPLAY_NAME`
+  - optional `LLM_ACCESS_NODE_REGION`
+  - optional `LLM_ACCESS_NODE_API_BASE_URL`
+  - optional `LLM_ACCESS_NODE_WORKER_BASE_URL`
+  These node-role features require the shared request-cache Valkey config to be
+  present, because version one publishes primary and node snapshots in the
+  existing `llma:*` namespace.
+- Version one does not support multiple live `core` nodes. Do not deploy a
+  second `core` node until the cluster-truth and failover design is upgraded.
 - The service-level background refresher is separate from the per-account
   Codex "auto refresh" toggle in admin. The per-account toggle only controls
   whether that account may use its `refresh_token` to renew auth when needed;
