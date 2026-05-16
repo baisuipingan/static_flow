@@ -577,6 +577,55 @@ impl SqliteControlStore {
             .map(|bundle| bundle.map(|bundle| admin_key_from_bundle(&bundle)))
     }
 
+    fn admin_keys_summary(
+        &self,
+        provider_type: Option<&str>,
+    ) -> anyhow::Result<core_store::AdminKeysSummary> {
+        self.conn
+            .query_row(
+                "SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN k.public_visible THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN k.status = 'active' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN k.status = 'disabled' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(k.quota_billable_limit), 0),
+                    COALESCE(SUM(k.quota_billable_limit - u.billable_tokens), 0),
+                    COALESCE(SUM(u.input_uncached_tokens), 0),
+                    COALESCE(SUM(u.input_cached_tokens), 0),
+                    COALESCE(SUM(u.output_tokens), 0),
+                    COALESCE(SUM(u.billable_tokens), 0),
+                    COALESCE(SUM(CAST(u.credit_total AS REAL)), 0.0),
+                    COALESCE(SUM(u.credit_missing_events), 0)
+                 FROM llm_keys k
+                 JOIN llm_key_route_config r ON r.key_id = k.key_id
+                 JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 WHERE (?1 IS NULL OR k.provider_type = ?1)",
+                [provider_type],
+                |row| {
+                    let total = row.get::<_, i64>(0)?.max(0) as usize;
+                    Ok(core_store::AdminKeysSummary {
+                        total,
+                        public_visible_count: row.get::<_, i64>(1)?.max(0) as usize,
+                        active_count: row.get::<_, i64>(2)?.max(0) as usize,
+                        disabled_count: row.get::<_, i64>(3)?.max(0) as usize,
+                        quota_billable_limit_sum: non_negative_i64_to_u64(row.get(4)?).unwrap_or(0),
+                        remaining_billable_sum: row.get(5)?,
+                        usage_input_uncached_tokens_sum: non_negative_i64_to_u64(row.get(6)?)
+                            .unwrap_or(0),
+                        usage_input_cached_tokens_sum: non_negative_i64_to_u64(row.get(7)?)
+                            .unwrap_or(0),
+                        usage_output_tokens_sum: non_negative_i64_to_u64(row.get(8)?).unwrap_or(0),
+                        usage_billable_tokens_sum: non_negative_i64_to_u64(row.get(9)?)
+                            .unwrap_or(0),
+                        usage_credit_total: row.get(10)?,
+                        usage_credit_missing_events: non_negative_i64_to_u64(row.get(11)?)
+                            .unwrap_or(0),
+                    })
+                },
+            )
+            .context("summarize admin keys")
+    }
+
     /// List one admin key page with optional provider filtering.
     pub fn list_admin_keys_page(
         &self,
@@ -629,9 +678,11 @@ impl SqliteControlStore {
             .map(|row| row.map(|bundle| admin_key_from_bundle(&bundle)))
             .collect::<Result<Vec<_>, _>>()
             .context("collect admin key page")?;
+        let summary = self.admin_keys_summary(provider_type)?;
         Ok(AdminKeysPage {
             has_more: offset.saturating_add(keys.len()) < total,
             keys,
+            summary,
             total,
             limit,
             offset,
@@ -1729,6 +1780,28 @@ impl SqliteControlStore {
             .collect()
     }
 
+    fn admin_codex_accounts_summary(&self) -> anyhow::Result<core_store::AdminAccountsSummary> {
+        self.conn
+            .query_row(
+                "SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'disabled' THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'unavailable' THEN 1 ELSE 0 END), 0)
+                 FROM llm_codex_accounts",
+                [],
+                |row| {
+                    Ok(core_store::AdminAccountsSummary {
+                        total: row.get::<_, i64>(0)?.max(0) as usize,
+                        active_count: row.get::<_, i64>(1)?.max(0) as usize,
+                        disabled_count: row.get::<_, i64>(2)?.max(0) as usize,
+                        unavailable_count: row.get::<_, i64>(3)?.max(0) as usize,
+                    })
+                },
+            )
+            .context("summarize admin codex accounts")
+    }
+
     /// List one imported Codex account page for the admin UI.
     pub fn list_admin_codex_accounts_page(
         &self,
@@ -1761,9 +1834,11 @@ impl SqliteControlStore {
             .iter()
             .map(|record| self.admin_codex_account_from_record_with_context(record, &context))
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let summary = self.admin_codex_accounts_summary()?;
         Ok(AdminCodexAccountsPage {
             has_more: offset.saturating_add(accounts.len()) < total,
             accounts,
+            summary,
             total,
             limit,
             offset,
@@ -2418,6 +2493,34 @@ impl SqliteControlStore {
             .collect()
     }
 
+    fn admin_kiro_accounts_summary(&self) -> anyhow::Result<core_store::AdminAccountsSummary> {
+        self.conn
+            .query_row(
+                "SELECT
+                    COUNT(*),
+                    COALESCE(SUM(CASE
+                        WHEN status = 'active'
+                            AND json_type(auth_json, '$.disabled') != 'true'
+                        THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE
+                        WHEN status <> 'active'
+                            OR json_type(auth_json, '$.disabled') = 'true'
+                        THEN 1 ELSE 0 END), 0),
+                    COALESCE(SUM(CASE WHEN status = 'unavailable' THEN 1 ELSE 0 END), 0)
+                 FROM llm_kiro_accounts",
+                [],
+                |row| {
+                    Ok(core_store::AdminAccountsSummary {
+                        total: row.get::<_, i64>(0)?.max(0) as usize,
+                        active_count: row.get::<_, i64>(1)?.max(0) as usize,
+                        disabled_count: row.get::<_, i64>(2)?.max(0) as usize,
+                        unavailable_count: row.get::<_, i64>(3)?.max(0) as usize,
+                    })
+                },
+            )
+            .context("summarize admin kiro accounts")
+    }
+
     /// List one persisted Kiro account page for the admin UI.
     pub fn list_admin_kiro_accounts_page(
         &self,
@@ -2452,9 +2555,11 @@ impl SqliteControlStore {
             .iter()
             .map(|record| self.admin_kiro_account_from_record_with_context(record, &context))
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let summary = self.admin_kiro_accounts_summary()?;
         Ok(AdminKiroAccountsPage {
             has_more: offset.saturating_add(accounts.len()) < total,
             accounts,
+            summary,
             total,
             limit,
             offset,
@@ -5830,18 +5935,19 @@ mod tests {
             [(0, "codex", Some("codex-group")), (1, "codex", None), (2, "kiro", Some("kiro-group"))]
         {
             let key_id = format!("key-{index}");
+            let billable_tokens = ((index + 1) * 100) as i64;
             repo.upsert_key_bundle(
                 &super::KeyRecord {
                     key_id: key_id.clone(),
                     name: format!("key {index}"),
                     secret: format!("sk-{index}"),
                     key_hash: format!("hash-{index}"),
-                    status: "active".to_string(),
+                    status: if index == 1 { "disabled" } else { "active" }.to_string(),
                     provider_type: provider.to_string(),
                     protocol_family: if provider == "kiro" { "anthropic" } else { "openai" }
                         .to_string(),
-                    public_visible: false,
-                    quota_billable_limit: 1000,
+                    public_visible: index != 1,
+                    quota_billable_limit: 1000 + (index as i64 * 10),
                     created_at_ms: 10 + index,
                     updated_at_ms: 20 + index,
                 },
@@ -5863,12 +5969,12 @@ mod tests {
                 },
                 &super::KeyUsageRollup {
                     key_id,
-                    input_uncached_tokens: 0,
-                    input_cached_tokens: 0,
-                    output_tokens: 0,
-                    billable_tokens: 0,
-                    credit_total: 0.0,
-                    credit_missing_events: 0,
+                    input_uncached_tokens: index + 1,
+                    input_cached_tokens: index + 10,
+                    output_tokens: index + 20,
+                    billable_tokens,
+                    credit_total: 1.5 + index as f64,
+                    credit_missing_events: index,
                     last_used_at_ms: None,
                     updated_at_ms: 20 + index,
                 },
@@ -5884,11 +5990,28 @@ mod tests {
         assert_eq!(page.limit, 1);
         assert_eq!(page.offset, 1);
         assert!(page.has_more);
+        assert_eq!(page.summary.total, 3);
+        assert_eq!(page.summary.public_visible_count, 2);
+        assert_eq!(page.summary.active_count, 2);
+        assert_eq!(page.summary.quota_billable_limit_sum, 3030);
+        assert_eq!(page.summary.usage_billable_tokens_sum, 600);
+        assert_eq!(page.summary.remaining_billable_sum, 2430);
+        assert_eq!(page.summary.usage_input_uncached_tokens_sum, 6);
+        assert_eq!(page.summary.usage_input_cached_tokens_sum, 33);
+        assert_eq!(page.summary.usage_output_tokens_sum, 63);
+        assert_eq!(page.summary.usage_credit_total, 7.5);
+        assert_eq!(page.summary.usage_credit_missing_events, 3);
 
         let codex_page = repo
             .list_admin_keys_page(Some("codex"), 10, 0)
             .expect("page codex admin keys");
         assert_eq!(codex_page.total, 2);
+        assert_eq!(codex_page.summary.total, 2);
+        assert_eq!(codex_page.summary.public_visible_count, 1);
+        assert_eq!(codex_page.summary.active_count, 1);
+        assert_eq!(codex_page.summary.quota_billable_limit_sum, 2010);
+        assert_eq!(codex_page.summary.usage_billable_tokens_sum, 300);
+        assert_eq!(codex_page.summary.remaining_billable_sum, 1710);
         assert!(codex_page
             .keys
             .iter()

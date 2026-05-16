@@ -1508,12 +1508,15 @@ async fn adapt_codex_upstream_response(
         .and_then(|value| value.to_str().ok())
         .unwrap_or("application/json")
         .to_string();
-    let expects_sse = status.is_success()
-        && (content_type.contains("text/event-stream")
-            || prepared.wants_stream
-            || prepared.force_upstream_stream);
+    let has_event_stream_content_type =
+        status.is_success() && content_type.contains("text/event-stream");
+    let expects_stream_response =
+        status.is_success() && (has_event_stream_content_type || prepared.wants_stream);
 
-    if expects_sse && prepared.force_upstream_stream && !prepared.wants_stream {
+    if status.is_success()
+        && !prepared.wants_stream
+        && (has_event_stream_content_type || prepared.force_upstream_stream)
+    {
         let bytes = match response.bytes().await {
             Ok(bytes) => bytes,
             Err(_) => {
@@ -1521,6 +1524,25 @@ async fn adapt_codex_upstream_response(
                     .into_response()
             },
         };
+        if !has_event_stream_content_type && serde_json::from_slice::<Value>(&bytes).is_ok() {
+            return adapt_codex_upstream_response_from_parts(
+                CodexUpstreamResponseParts {
+                    status,
+                    upstream_headers,
+                    content_type,
+                    bytes,
+                },
+                CodexCompletedResponseContext {
+                    prepared,
+                    key,
+                    route,
+                    control_store,
+                    permits,
+                    usage_meta,
+                },
+            )
+            .await;
+        }
         usage_meta.mark_post_headers_body();
         usage_meta.mark_stream_finish();
         let completed = match completed_response_from_sse_bytes(&bytes) {
@@ -1602,7 +1624,7 @@ async fn adapt_codex_upstream_response(
             });
     }
 
-    if expects_sse {
+    if expects_stream_response {
         let prepared = strip_codex_stream_request_bodies(prepared);
         return stream_codex_upstream_response(
             response,
@@ -5875,9 +5897,18 @@ struct CompletedCodexSseAccumulator {
 }
 
 impl CompletedCodexSseAccumulator {
-    fn observe_payload(&mut self, data: &str) -> Result<(), &'static str> {
-        let value =
+    fn observe_payload(
+        &mut self,
+        event_type: Option<&str>,
+        data: &str,
+    ) -> Result<(), &'static str> {
+        let mut value =
             serde_json::from_str::<Value>(data).map_err(|_| "invalid codex upstream SSE JSON")?;
+        if let (Some(event_type), Some(object)) = (event_type, value.as_object_mut()) {
+            object
+                .entry("type")
+                .or_insert_with(|| Value::String(event_type.to_string()));
+        }
         if let Some(observed_usage) = extract_usage_from_bytes(data.as_bytes()) {
             self.usage = Some(observed_usage);
         }
@@ -6022,12 +6053,13 @@ fn completed_response_from_sse_bytes(
     bytes: &[u8],
 ) -> Result<CompletedCodexSse, CompletedCodexSseError> {
     let mut accumulator = CompletedCodexSseAccumulator::default();
-    for data in sse_data_payloads(bytes) {
+    for payload in sse_payloads(bytes) {
+        let data = payload.data;
         if data.trim() == "[DONE]" {
             continue;
         }
         accumulator
-            .observe_payload(&data)
+            .observe_payload(payload.event.as_deref(), &data)
             .map_err(|message| CompletedCodexSseError {
                 status: StatusCode::BAD_GATEWAY,
                 message: message.to_string(),
@@ -6036,10 +6068,21 @@ fn completed_response_from_sse_bytes(
     accumulator.finish()
 }
 
-fn sse_data_payloads(bytes: &[u8]) -> Vec<String> {
+struct SsePayload {
+    event: Option<String>,
+    data: String,
+}
+
+fn sse_payloads(bytes: &[u8]) -> Vec<SsePayload> {
     let text = String::from_utf8_lossy(bytes).replace("\r\n", "\n");
     text.split("\n\n")
         .filter_map(|event| {
+            let event_type = event.lines().find_map(|line| {
+                line.strip_prefix("event:")
+                    .map(|value| value.strip_prefix(' ').unwrap_or(value).trim())
+                    .filter(|value| !value.is_empty())
+                    .map(ToString::to_string)
+            });
             let data = event
                 .lines()
                 .filter_map(|line| line.strip_prefix("data:"))
@@ -6048,7 +6091,10 @@ fn sse_data_payloads(bytes: &[u8]) -> Vec<String> {
             if data.is_empty() {
                 None
             } else {
-                Some(data.join("\n"))
+                Some(SsePayload {
+                    event: event_type,
+                    data: data.join("\n"),
+                })
             }
         })
         .collect()
@@ -7778,6 +7824,24 @@ mod tests {
         headers: HeaderMap,
         request: Request<Body>,
     ) -> Response {
+        fake_codex_responses_with_content_type(captured, headers, request, "text/event-stream")
+            .await
+    }
+
+    async fn fake_codex_responses_json_content_type(
+        State(captured): State<Arc<CapturedCodexUpstream>>,
+        headers: HeaderMap,
+        request: Request<Body>,
+    ) -> Response {
+        fake_codex_responses_with_content_type(captured, headers, request, "application/json").await
+    }
+
+    async fn fake_codex_responses_with_content_type(
+        captured: Arc<CapturedCodexUpstream>,
+        headers: HeaderMap,
+        request: Request<Body>,
+        content_type: &'static str,
+    ) -> Response {
         let path = request.uri().path().to_string();
         let query = request.uri().query().map(ToString::to_string);
         let body = to_bytes(request.into_body(), usize::MAX)
@@ -7828,7 +7892,7 @@ mod tests {
 
         Response::builder()
             .status(StatusCode::OK)
-            .header(header::CONTENT_TYPE, "text/event-stream")
+            .header(header::CONTENT_TYPE, content_type)
             .body(Body::from(format!(
                 "event: response.output_text.delta\ndata: {}\n\nevent: \
                  response.output_text.delta\ndata: {}\n\nevent: response.completed\ndata: {}\n\n",
@@ -9363,6 +9427,79 @@ mod tests {
         assert_eq!(body["model"], "gpt-5.3-codex");
         assert_eq!(body["choices"][0]["message"]["content"], "hello back");
         assert_eq!(body["usage"]["output_tokens"], 3);
+    }
+
+    #[tokio::test]
+    async fn codex_dispatch_converts_native_non_streaming_responses_sse_to_json() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("codex upstream env lock");
+        let captured = Arc::new(CapturedCodexUpstream::default());
+        let app = Router::new()
+            .route("/v1/responses", post(fake_codex_responses_json_content_type))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake upstream");
+        });
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+
+        let store = Arc::new(RecordingControlStore::default());
+        let state = super::ProviderState::new(store.clone(), static_codex_route_store());
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/responses")
+                .header(header::AUTHORIZATION, "Bearer codex-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model": "gpt-5.3-codex",
+                        "input": "hello",
+                        "stream": false
+                    }"#,
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let headers = response.headers().clone();
+        assert_eq!(
+            headers
+                .get(header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok()),
+            Some("application/json")
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("response body");
+        let body = serde_json::from_slice::<serde_json::Value>(&body).expect("json response");
+        assert_eq!(body["id"], "resp_1");
+        assert_eq!(body["model"], "gpt-5.3-codex");
+        assert_eq!(body["output"][0]["content"][0]["text"], "hello back");
+        assert_eq!(body["usage"]["input_tokens"], 12);
+        assert_eq!(body["usage"]["output_tokens"], 3);
+
+        let requests = captured.requests.lock().expect("captured requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].accept.as_deref(), Some("text/event-stream"));
+        assert_eq!(requests[0].body["stream"], serde_json::json!(true));
+        assert_eq!(requests[0].body["input"][0]["type"], serde_json::json!("message"));
+
+        let events = store.usage_events.lock().expect("usage events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].input_uncached_tokens, 10);
+        assert_eq!(events[0].input_cached_tokens, 2);
+        assert_eq!(events[0].output_tokens, 3);
     }
 
     #[tokio::test]

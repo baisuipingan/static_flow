@@ -19,7 +19,8 @@ use crate::{
         fetch_admin_llm_gateway_proxy_configs, fetch_kiro_models, import_admin_kiro_account,
         patch_admin_kiro_account, patch_admin_kiro_account_group, patch_admin_kiro_key,
         refresh_admin_kiro_account_balance, update_admin_llm_gateway_config, AdminAccountGroupView,
-        AdminKiroCacheStatsResponse, AdminLlmGatewayKeyView, AdminLlmGatewayUsageEventDetailView,
+        AdminAccountsSummaryView, AdminKiroCacheStatsResponse, AdminLlmGatewayKeyView,
+        AdminLlmGatewayKeysSummaryView, AdminLlmGatewayUsageEventDetailView,
         AdminLlmGatewayUsageEventView, AdminLlmGatewayUsageEventsQuery,
         AdminUpstreamProxyBindingView, AdminUpstreamProxyConfigView, CreateAdminAccountGroupInput,
         CreateManualKiroAccountInput, KiroAccountView, KiroBalanceView, KiroModelView,
@@ -2825,6 +2826,8 @@ fn kiro_account_group_editor_card(props: &KiroAccountGroupEditorCardProps) -> Ht
 pub fn admin_kiro_gateway_page() -> Html {
     let accounts = use_state(Vec::<KiroAccountView>::new);
     let keys = use_state(Vec::<AdminLlmGatewayKeyView>::new);
+    let accounts_summary = use_state(AdminAccountsSummaryView::default);
+    let keys_summary = use_state(AdminLlmGatewayKeysSummaryView::default);
     let keys_search = use_state(String::new);
     let account_groups = use_state(Vec::<AdminAccountGroupView>::new);
     let account_groups_search = use_state(String::new);
@@ -3098,6 +3101,8 @@ pub fn admin_kiro_gateway_page() -> Html {
     {
         let accounts = accounts.clone();
         let keys = keys.clone();
+        let accounts_summary = accounts_summary.clone();
+        let keys_summary = keys_summary.clone();
         let account_groups = account_groups.clone();
         let kiro_models = kiro_models.clone();
         let active_tab = active_tab.clone();
@@ -3113,6 +3118,8 @@ pub fn admin_kiro_gateway_page() -> Html {
                 if should_fetch {
                     let accounts = accounts.clone();
                     let keys = keys.clone();
+                    let accounts_summary = accounts_summary.clone();
+                    let keys_summary = keys_summary.clone();
                     let account_groups = account_groups.clone();
                     let kiro_models = kiro_models.clone();
                     let inventory_loading = inventory_loading.clone();
@@ -3135,6 +3142,8 @@ pub fn admin_kiro_gateway_page() -> Html {
                                 Ok(account_groups_resp),
                                 Ok(models_resp),
                             ) => {
+                                accounts_summary.set(accounts_resp.summary);
+                                keys_summary.set(keys_resp.summary);
                                 accounts.set(accounts_resp.accounts);
                                 keys.set(keys_resp.keys);
                                 account_groups.set(account_groups_resp.groups);
@@ -3663,8 +3672,10 @@ pub fn admin_kiro_gateway_page() -> Html {
         })
     };
 
-    let disabled_account_count = accounts.iter().filter(|a| a.disabled).count();
-    let active_key_count = keys.iter().filter(|k| k.status == "active").count();
+    let account_summary = *accounts_summary;
+    let key_summary = *keys_summary;
+    let disabled_account_count = account_summary.disabled_count;
+    let active_key_count = key_summary.active_count;
 
     // Client-side filters for Kiro Keys and Account Groups tabs. Matches are
     // case-insensitive. `use_memo` avoids re-filtering on unrelated parent
@@ -3778,7 +3789,7 @@ pub fn admin_kiro_gateway_page() -> Html {
                 <div class={classes!("mt-4", "grid", "gap-3", "grid-cols-2", "xl:grid-cols-4")}>
                     <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "px-3", "py-3")}>
                         <div class={classes!("font-mono", "text-[11px]", "uppercase", "tracking-widest", "text-[var(--muted)]")}>{ "Accounts" }</div>
-                        <div class={classes!("mt-1", "font-mono", "text-2xl", "font-black")}>{ accounts.len() }</div>
+                        <div class={classes!("mt-1", "font-mono", "text-2xl", "font-black")}>{ account_summary.total }</div>
                     </div>
                     <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "px-3", "py-3")}>
                         <div class={classes!("font-mono", "text-[11px]", "uppercase", "tracking-widest", "text-[var(--muted)]")}>{ "Disabled" }</div>
@@ -3786,7 +3797,7 @@ pub fn admin_kiro_gateway_page() -> Html {
                     </div>
                     <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "px-3", "py-3")}>
                         <div class={classes!("font-mono", "text-[11px]", "uppercase", "tracking-widest", "text-[var(--muted)]")}>{ "Keys" }</div>
-                        <div class={classes!("mt-1", "font-mono", "text-2xl", "font-black")}>{ keys.len() }</div>
+                        <div class={classes!("mt-1", "font-mono", "text-2xl", "font-black")}>{ key_summary.total }</div>
                     </div>
                     <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "px-3", "py-3")}>
                         <div class={classes!("font-mono", "text-[11px]", "uppercase", "tracking-widest", "text-[var(--muted)]")}>{ "Active Keys" }</div>
@@ -4247,7 +4258,7 @@ pub fn admin_kiro_gateway_page() -> Html {
                 <div class={classes!("mt-4", "grid", "gap-4", "lg:grid-cols-3")}>
                     <article class={classes!("rounded-xl", "border", "border-[var(--border)]", "bg-[var(--surface)]", "p-5")}>
                         <div class={classes!("font-mono", "text-[11px]", "uppercase", "tracking-[0.16em]", "text-[var(--muted)]")}>{ "Imported Accounts" }</div>
-                        <div class={classes!("mt-2", "font-mono", "text-3xl", "font-black", "text-[var(--text)]")}>{ accounts.len() }</div>
+                        <div class={classes!("mt-2", "font-mono", "text-3xl", "font-black", "text-[var(--text)]")}>{ account_summary.total }</div>
                         <p class={classes!("mt-3", "mb-0", "text-sm", "text-[var(--muted)]")}>
                             { "账号越来越多之后，状态浏览和维护入口不能继续挤在同一块。" }
                         </p>
@@ -4354,7 +4365,7 @@ pub fn admin_kiro_gateway_page() -> Html {
                 </div>
                 if !keys_query_lower.is_empty() {
                     <p class={classes!("mt-2", "text-xs", "text-[var(--muted)]", "font-mono")}>
-                        { format!("匹配 {}/{}", filtered_keys.len(), keys.len()) }
+                        { format!("已加载匹配 {} / 全量 {}", filtered_keys.len(), key_summary.total) }
                     </p>
                 }
                 <div class={classes!("mt-4", "grid", "gap-4", "xl:grid-cols-2")}>

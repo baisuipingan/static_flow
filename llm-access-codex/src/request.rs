@@ -174,6 +174,10 @@ pub fn prepare_gateway_request_from_bytes(
             }
             inject_default_instructions_when_missing(root);
             normalize_native_responses_request(gateway_path, root);
+            if gateway_path == "/v1/responses" && !original_wants_stream {
+                root.insert("stream".to_string(), Value::Bool(true));
+                force_upstream_stream = true;
+            }
         }
     }
 
@@ -656,8 +660,35 @@ fn inject_default_instructions_when_missing(root: &mut Map<String, Value>) {
 
 fn normalize_native_responses_request(path: &str, root: &mut Map<String, Value>) {
     root.remove("max_output_tokens");
+    if path == "/v1/responses" {
+        normalize_native_responses_input_for_upstream(root);
+    }
     if path == "/v1/responses/compact" {
         retain_native_compact_fields(root);
+    }
+}
+
+fn normalize_native_responses_input_for_upstream(root: &mut Map<String, Value>) {
+    let Some(input) = root.get_mut("input") else {
+        return;
+    };
+    match input {
+        Value::String(text) => {
+            let mut content = Map::new();
+            content.insert("type".to_string(), Value::String("input_text".to_string()));
+            content.insert("text".to_string(), Value::String(text.clone()));
+
+            let mut message = Map::new();
+            message.insert("type".to_string(), Value::String("message".to_string()));
+            message.insert("role".to_string(), Value::String("user".to_string()));
+            message.insert("content".to_string(), Value::Array(vec![Value::Object(content)]));
+            *input = Value::Array(vec![Value::Object(message)]);
+        },
+        Value::Object(_) => {
+            let item = std::mem::take(input);
+            *input = Value::Array(vec![item]);
+        },
+        _ => {},
     }
 }
 
@@ -2339,9 +2370,12 @@ mod tests {
         assert!(prepared.client_request_body.is_none());
         assert_eq!(prepared.last_message_content.as_deref(), Some("hello"));
         assert_eq!(prepared.wants_stream, false);
-        assert_eq!(prepared.force_upstream_stream, false);
-        assert_eq!(upstream["input"], "hello");
-        assert!(upstream.get("stream").is_none());
+        assert_eq!(prepared.force_upstream_stream, true);
+        assert_eq!(upstream["input"][0]["type"], json!("message"));
+        assert_eq!(upstream["input"][0]["role"], json!("user"));
+        assert_eq!(upstream["input"][0]["content"][0]["type"], json!("input_text"));
+        assert_eq!(upstream["input"][0]["content"][0]["text"], json!("hello"));
+        assert_eq!(upstream["stream"], json!(true));
     }
 
     #[tokio::test]
@@ -2404,6 +2438,7 @@ mod tests {
         assert_eq!(upstream["tools"][0]["name"], json!("lookup"));
         assert_eq!(upstream["tool_choice"], json!({"type":"function","name":"lookup"}));
         assert_eq!(upstream["service_tier"], "flex");
+        assert_eq!(upstream["stream"], json!(true));
         assert_eq!(upstream["store"], json!(true));
         assert_eq!(upstream["client_metadata"], json!({"source":"test"}));
         assert_eq!(upstream["previous_response_id"], json!("resp_123"));
@@ -3366,8 +3401,9 @@ mod tests {
         let upstream: serde_json::Value =
             serde_json::from_slice(&prepared.request_body).expect("upstream body json");
 
-        assert_eq!(upstream["input"], "compressed hello");
-        assert!(upstream.get("stream").is_none());
+        assert_eq!(upstream["input"][0]["type"], json!("message"));
+        assert_eq!(upstream["input"][0]["content"][0]["text"], json!("compressed hello"));
+        assert_eq!(upstream["stream"], json!(true));
         assert!(prepared.client_request_body.is_none());
         assert_eq!(prepared.last_message_content.as_deref(), Some("compressed hello"));
     }

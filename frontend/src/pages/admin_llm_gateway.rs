@@ -34,20 +34,20 @@ use crate::{
         probe_admin_llm_gateway_account_models, refresh_admin_llm_gateway_account_auth,
         refresh_admin_llm_gateway_account_usage, update_admin_llm_gateway_config,
         update_admin_llm_gateway_proxy_binding, AccountSummaryView, AdminAccountGroupView,
-        AdminLlmGatewayAccountContributionRequestView,
+        AdminAccountsSummaryView, AdminLlmGatewayAccountContributionRequestView,
         AdminLlmGatewayAccountContributionRequestsQuery, AdminLlmGatewayKeyView,
-        AdminLlmGatewaySponsorRequestView, AdminLlmGatewaySponsorRequestsQuery,
-        AdminLlmGatewayTokenRequestView, AdminLlmGatewayTokenRequestsQuery,
-        AdminLlmGatewayUsageEventDetailView, AdminLlmGatewayUsageEventView,
-        AdminLlmGatewayUsageEventsQuery, AdminUpstreamProxyBindingView,
-        AdminUpstreamProxyCheckResponse, AdminUpstreamProxyCheckTargetView,
-        AdminUpstreamProxyConfigView, AdminUsageJournalFileView, AdminUsageJournalPreviewResponse,
-        AdminUsageJournalStatusView, CodexAccountImportJobDetailView,
-        CodexAccountImportJobSummaryView, CreateAdminAccountGroupInput,
-        CreateAdminUpstreamProxyConfigInput, LlmGatewayRuntimeConfig, PatchAdminAccountGroupInput,
-        PatchAdminLlmGatewayAccountInput, PatchAdminLlmGatewayKeyRequest,
-        PatchAdminUpstreamProxyConfigInput, ProcessMemoryRuntimeStats,
-        DEFAULT_LLM_GATEWAY_CODEX_CLIENT_VERSION,
+        AdminLlmGatewayKeysSummaryView, AdminLlmGatewaySponsorRequestView,
+        AdminLlmGatewaySponsorRequestsQuery, AdminLlmGatewayTokenRequestView,
+        AdminLlmGatewayTokenRequestsQuery, AdminLlmGatewayUsageEventDetailView,
+        AdminLlmGatewayUsageEventView, AdminLlmGatewayUsageEventsQuery,
+        AdminUpstreamProxyBindingView, AdminUpstreamProxyCheckResponse,
+        AdminUpstreamProxyCheckTargetView, AdminUpstreamProxyConfigView, AdminUsageJournalFileView,
+        AdminUsageJournalPreviewResponse, AdminUsageJournalStatusView,
+        CodexAccountImportJobDetailView, CodexAccountImportJobSummaryView,
+        CreateAdminAccountGroupInput, CreateAdminUpstreamProxyConfigInput, LlmGatewayRuntimeConfig,
+        PatchAdminAccountGroupInput, PatchAdminLlmGatewayAccountInput,
+        PatchAdminLlmGatewayKeyRequest, PatchAdminUpstreamProxyConfigInput,
+        ProcessMemoryRuntimeStats, DEFAULT_LLM_GATEWAY_CODEX_CLIENT_VERSION,
     },
     components::{pagination::Pagination, search_box::SearchBox, tab_bar::render_tab_bar},
     pages::llm_access_shared::{
@@ -2208,6 +2208,7 @@ fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
 pub fn admin_llm_gateway_page() -> Html {
     let config = use_state(|| None::<LlmGatewayRuntimeConfig>);
     let keys = use_state(Vec::<AdminLlmGatewayKeyView>::new);
+    let keys_summary = use_state(AdminLlmGatewayKeysSummaryView::default);
     let keys_search = use_state(String::new);
     let keys_sort_mode = use_state(|| KeySortMode::None);
     let keys_show_active_only = use_state(|| false);
@@ -2340,6 +2341,7 @@ pub fn admin_llm_gateway_page() -> Html {
         })
     };
     let accounts = use_state(Vec::<AccountSummaryView>::new);
+    let accounts_summary = use_state(AdminAccountsSummaryView::default);
     let import_name = use_state(String::new);
     let import_id_token = use_state(String::new);
     let import_access_token = use_state(String::new);
@@ -2601,6 +2603,7 @@ pub fn admin_llm_gateway_page() -> Html {
     let reload = {
         let config = config.clone();
         let keys = keys.clone();
+        let keys_summary = keys_summary.clone();
         let proxy_configs = proxy_configs.clone();
         let proxy_bindings = proxy_bindings.clone();
         let account_groups = account_groups.clone();
@@ -2632,6 +2635,7 @@ pub fn admin_llm_gateway_page() -> Html {
         let usage_page = usage_page.clone();
         let usage_key_filter = usage_key_filter.clone();
         let accounts = accounts.clone();
+        let accounts_summary = accounts_summary.clone();
         let recent_import_jobs = recent_import_jobs.clone();
         let account_proxy_inputs = account_proxy_inputs.clone();
         let account_route_weight_tier_inputs = account_route_weight_tier_inputs.clone();
@@ -2641,6 +2645,7 @@ pub fn admin_llm_gateway_page() -> Html {
         Callback::from(move |_| {
             let config = config.clone();
             let keys = keys.clone();
+            let keys_summary = keys_summary.clone();
             let proxy_configs = proxy_configs.clone();
             let proxy_bindings = proxy_bindings.clone();
             let account_groups = account_groups.clone();
@@ -2672,6 +2677,7 @@ pub fn admin_llm_gateway_page() -> Html {
             let usage_page = usage_page.clone();
             let usage_key_filter = usage_key_filter.clone();
             let accounts = accounts.clone();
+            let accounts_summary = accounts_summary.clone();
             let recent_import_jobs = recent_import_jobs.clone();
             let account_proxy_inputs = account_proxy_inputs.clone();
             let account_route_weight_tier_inputs = account_route_weight_tier_inputs.clone();
@@ -2722,6 +2728,7 @@ pub fn admin_llm_gateway_page() -> Html {
                     Ok::<_, String>((
                         cfg,
                         keys_resp.keys,
+                        keys_resp.summary,
                         account_groups_resp.groups,
                         proxy_configs_resp.proxy_configs,
                         proxy_bindings_resp.bindings,
@@ -2736,6 +2743,7 @@ pub fn admin_llm_gateway_page() -> Html {
                     Ok((
                         cfg,
                         key_items,
+                        key_summary,
                         account_group_items,
                         proxy_config_items,
                         proxy_binding_items,
@@ -2779,6 +2787,7 @@ pub fn admin_llm_gateway_page() -> Html {
                             .set(cfg.usage_analytics_retention_days.to_string());
                         config.set(Some(cfg));
                         keys.set(key_items);
+                        keys_summary.set(key_summary);
                         account_groups.set(account_group_items);
                         let codex_bound = proxy_binding_items
                             .iter()
@@ -2842,6 +2851,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                 )
                             })
                             .collect::<BTreeMap<_, _>>();
+                        accounts_summary.set(accounts_resp.summary);
                         accounts.set(accounts_resp.accounts);
                         recent_import_jobs.set(import_jobs);
                         account_proxy_inputs.set(next_proxy_inputs);
@@ -4654,24 +4664,20 @@ pub fn admin_llm_gateway_page() -> Html {
         })
     };
 
-    let total_remaining: i64 = keys.iter().map(|item| item.remaining_billable).sum();
-    let public_visible_count = keys.iter().filter(|item| item.public_visible).count();
-    let active_key_count = keys.iter().filter(|item| item.status == "active").count();
-    let total_quota: u64 = keys.iter().map(|k| k.quota_billable_limit).sum();
-    let total_used: u64 = keys
-        .iter()
-        .map(|k| {
-            k.usage_input_uncached_tokens + k.usage_input_cached_tokens + k.usage_output_tokens
-        })
-        .sum();
-    let credit_keys_present = keys
-        .iter()
-        .any(|item| item.usage_credit_total > 0.0 || item.usage_credit_missing_events > 0);
-    let total_credit_used: f64 = keys.iter().map(|item| item.usage_credit_total).sum();
-    let total_credit_missing_events: u64 = keys
-        .iter()
-        .map(|item| item.usage_credit_missing_events)
-        .sum();
+    let key_summary = *keys_summary;
+    let account_summary = *accounts_summary;
+    let total_remaining = key_summary.remaining_billable_sum;
+    let public_visible_count = key_summary.public_visible_count;
+    let active_key_count = key_summary.active_count;
+    let total_quota = key_summary.quota_billable_limit_sum;
+    let total_used = key_summary
+        .usage_input_uncached_tokens_sum
+        .saturating_add(key_summary.usage_input_cached_tokens_sum)
+        .saturating_add(key_summary.usage_output_tokens_sum);
+    let credit_keys_present =
+        key_summary.usage_credit_total > 0.0 || key_summary.usage_credit_missing_events > 0;
+    let total_credit_used = key_summary.usage_credit_total;
+    let total_credit_missing_events = key_summary.usage_credit_missing_events;
     // Derive usage percentage from quota and remaining (billable-token basis).
     let usage_percent = if total_quota > 0 {
         let used = total_quota as f64 - (total_remaining.max(0) as f64);
@@ -5503,7 +5509,7 @@ pub fn admin_llm_gateway_page() -> Html {
                     <div class={classes!("mt-4", "grid", "gap-3", "grid-cols-2", "xl:grid-cols-4")}>
                         <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "px-3", "py-3")}>
                             <div class={classes!("font-mono", "text-[11px]", "uppercase", "tracking-widest", "text-[var(--muted)]")}>{ "Key 总数" }</div>
-                            <div class={classes!("mt-1", "font-mono", "text-2xl", "font-black")}>{ keys.len() }</div>
+                            <div class={classes!("mt-1", "font-mono", "text-2xl", "font-black")}>{ key_summary.total }</div>
                         </div>
                         <div class={classes!("rounded-lg", "border", "border-[var(--border)]", "px-3", "py-3")}>
                             <div class={classes!("font-mono", "text-[11px]", "uppercase", "tracking-widest", "text-[var(--muted)]")}>{ "公开 / Active" }</div>
@@ -6822,7 +6828,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         </button>
                     </div>
                     <div class={classes!("mt-2", "flex", "items-center", "justify-between", "text-xs", "text-[var(--muted)]")}>
-                        <span>{ format!("共 {} 个 Key (匹配 {})", keys.len(), keys_filtered_refs.len()) }</span>
+                        <span>{ format!("共 {} 个 Key (已加载匹配 {})", key_summary.total, keys_filtered_refs.len()) }</span>
                         if keys_total_pages > 1 {
                             <span class={classes!("font-mono")}>{ format!("{}/{}", keys_current_page, keys_total_pages) }</span>
                         }
@@ -7035,7 +7041,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         <div>
                             <h2 class={classes!("m-0", "font-mono", "text-base", "font-bold", "text-[var(--text)]")}>{ "Codex Accounts" }</h2>
                             <p class={classes!("mt-1", "m-0", "text-xs", "text-[var(--muted)]")}>
-                                { format!("已导入 {} 个账号。这里会显示账号状态、usage 刷新健康度和账号级 proxy 配置。", accounts.len()) }
+                                { format!("已导入 {} 个账号。这里会显示账号状态、usage 刷新健康度和账号级 proxy 配置。", account_summary.total) }
                             </p>
                         </div>
                         <button
@@ -7577,7 +7583,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         </div>
                         // Summary line
                         <div class={classes!("flex", "items-center", "justify-between", "text-xs", "text-[var(--muted)]")}>
-                            <span>{ format!("共 {} 个账号 (匹配 {})", accounts.len(), account_filtered.len()) }</span>
+                            <span>{ format!("共 {} 个账号 (已加载匹配 {})", account_summary.total, account_filtered.len()) }</span>
                             if account_total_pages > 1 {
                                 <span>{ format!("第 {} / {} 页", account_current_page, account_total_pages) }</span>
                             }

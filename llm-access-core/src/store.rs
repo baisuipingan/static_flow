@@ -575,6 +575,8 @@ impl AdminPageRequest {
 pub struct AdminKeysPage {
     /// Page rows.
     pub keys: Vec<AdminKey>,
+    /// Full aggregate over all rows matching this page filter.
+    pub summary: AdminKeysSummary,
     /// Total rows matching the query before pagination.
     pub total: usize,
     /// Page limit.
@@ -583,6 +585,35 @@ pub struct AdminKeysPage {
     pub offset: usize,
     /// Whether another page is available.
     pub has_more: bool,
+}
+
+/// Full aggregate for admin-managed API keys.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq)]
+pub struct AdminKeysSummary {
+    /// Total rows matching the provider filter.
+    pub total: usize,
+    /// Public-visible key count.
+    pub public_visible_count: usize,
+    /// Active key count.
+    pub active_count: usize,
+    /// Disabled key count.
+    pub disabled_count: usize,
+    /// Sum of configured billable quotas.
+    pub quota_billable_limit_sum: u64,
+    /// Sum of remaining billable quotas.
+    pub remaining_billable_sum: i64,
+    /// Sum of uncached input tokens.
+    pub usage_input_uncached_tokens_sum: u64,
+    /// Sum of cached input tokens.
+    pub usage_input_cached_tokens_sum: u64,
+    /// Sum of output tokens.
+    pub usage_output_tokens_sum: u64,
+    /// Sum of billable tokens.
+    pub usage_billable_tokens_sum: u64,
+    /// Sum of recorded credit usage.
+    pub usage_credit_total: f64,
+    /// Sum of events missing credit usage.
+    pub usage_credit_missing_events: u64,
 }
 
 /// New admin key row after request validation and secret generation.
@@ -828,6 +859,8 @@ pub struct AdminCodexAccount {
 pub struct AdminCodexAccountsPage {
     /// Page rows.
     pub accounts: Vec<AdminCodexAccount>,
+    /// Full aggregate over all Codex accounts.
+    pub summary: AdminAccountsSummary,
     /// Total rows matching the query before pagination.
     pub total: usize,
     /// Page limit.
@@ -836,6 +869,19 @@ pub struct AdminCodexAccountsPage {
     pub offset: usize,
     /// Whether another page is available.
     pub has_more: bool,
+}
+
+/// Full aggregate for admin account inventories.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminAccountsSummary {
+    /// Total account rows.
+    pub total: usize,
+    /// Active account count.
+    pub active_count: usize,
+    /// Disabled account count.
+    pub disabled_count: usize,
+    /// Unavailable account count.
+    pub unavailable_count: usize,
 }
 
 /// Minimal Codex account projection used by background status refresh.
@@ -1129,6 +1175,8 @@ pub struct AdminKiroAccount {
 pub struct AdminKiroAccountsPage {
     /// Page rows.
     pub accounts: Vec<AdminKiroAccount>,
+    /// Full aggregate over all Kiro accounts.
+    pub summary: AdminAccountsSummary,
     /// Total rows matching the query before pagination.
     pub total: usize,
     /// Page limit.
@@ -2698,6 +2746,7 @@ impl AdminKeyStore for EmptyAdminKeyStore {
     ) -> anyhow::Result<AdminKeysPage> {
         Ok(AdminKeysPage {
             keys: Vec::new(),
+            summary: AdminKeysSummary::default(),
             total: 0,
             limit: page.limit,
             offset: page.offset,
@@ -2896,6 +2945,7 @@ impl AdminCodexAccountStore for EmptyAdminCodexAccountStore {
     ) -> anyhow::Result<AdminCodexAccountsPage> {
         Ok(AdminCodexAccountsPage {
             accounts: Vec::new(),
+            summary: AdminAccountsSummary::default(),
             total: 0,
             limit: page.limit,
             offset: page.offset,
@@ -3086,6 +3136,7 @@ impl AdminKiroAccountStore for EmptyAdminKiroAccountStore {
     ) -> anyhow::Result<AdminKiroAccountsPage> {
         Ok(AdminKiroAccountsPage {
             accounts: Vec::new(),
+            summary: AdminAccountsSummary::default(),
             total: 0,
             limit: page.limit,
             offset: page.offset,

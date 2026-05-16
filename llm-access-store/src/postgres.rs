@@ -604,6 +604,52 @@ impl PostgresControlRepository {
             .collect::<anyhow::Result<Vec<_>>>()
     }
 
+    async fn admin_keys_summary(
+        &self,
+        provider_type: Option<&str>,
+    ) -> anyhow::Result<core_store::AdminKeysSummary> {
+        self.ensure_connection_alive()?;
+        let provider = provider_type.map(str::to_string);
+        let row = self
+            .client
+            .query_one(
+                "SELECT
+                    COUNT(*)::BIGINT,
+                    COALESCE(SUM(CASE WHEN k.public_visible THEN 1 ELSE 0 END), 0)::BIGINT,
+                    COALESCE(SUM(CASE WHEN k.status = 'active' THEN 1 ELSE 0 END), 0)::BIGINT,
+                    COALESCE(SUM(CASE WHEN k.status = 'disabled' THEN 1 ELSE 0 END), 0)::BIGINT,
+                    COALESCE(SUM(k.quota_billable_limit), 0)::BIGINT,
+                    COALESCE(SUM(k.quota_billable_limit - u.billable_tokens), 0)::BIGINT,
+                    COALESCE(SUM(u.input_uncached_tokens), 0)::BIGINT,
+                    COALESCE(SUM(u.input_cached_tokens), 0)::BIGINT,
+                    COALESCE(SUM(u.output_tokens), 0)::BIGINT,
+                    COALESCE(SUM(u.billable_tokens), 0)::BIGINT,
+                    COALESCE(SUM((u.credit_total)::DOUBLE PRECISION), 0)::DOUBLE PRECISION,
+                    COALESCE(SUM(u.credit_missing_events), 0)::BIGINT
+                 FROM llm_keys k
+                 JOIN llm_key_route_config r ON r.key_id = k.key_id
+                 JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
+                 WHERE ($1::text IS NULL OR k.provider_type = $1)",
+                &[&provider],
+            )
+            .await
+            .context("summarize postgres key bundles")?;
+        Ok(core_store::AdminKeysSummary {
+            total: row.get::<_, i64>(0).max(0) as usize,
+            public_visible_count: row.get::<_, i64>(1).max(0) as usize,
+            active_count: row.get::<_, i64>(2).max(0) as usize,
+            disabled_count: row.get::<_, i64>(3).max(0) as usize,
+            quota_billable_limit_sum: row.get::<_, i64>(4).max(0) as u64,
+            remaining_billable_sum: row.get(5),
+            usage_input_uncached_tokens_sum: row.get::<_, i64>(6).max(0) as u64,
+            usage_input_cached_tokens_sum: row.get::<_, i64>(7).max(0) as u64,
+            usage_output_tokens_sum: row.get::<_, i64>(8).max(0) as u64,
+            usage_billable_tokens_sum: row.get::<_, i64>(9).max(0) as u64,
+            usage_credit_total: row.get(10),
+            usage_credit_missing_events: row.get::<_, i64>(11).max(0) as u64,
+        })
+    }
+
     async fn list_key_bundles_page(
         &self,
         provider_type: Option<&str>,
@@ -659,9 +705,11 @@ impl PostgresControlRepository {
             .map(decode_key_bundle_row)
             .map(|bundle| bundle.map(|bundle| admin_key_from_bundle(&bundle)))
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let summary = self.admin_keys_summary(provider_type).await?;
         Ok(AdminKeysPage {
             has_more: page.has_more(keys.len(), total),
             keys,
+            summary,
             total,
             limit,
             offset,
@@ -1138,6 +1186,31 @@ impl PostgresControlRepository {
         Ok(rows.into_iter().map(decode_codex_account_row).collect())
     }
 
+    async fn admin_codex_accounts_summary(
+        &self,
+    ) -> anyhow::Result<core_store::AdminAccountsSummary> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_one(
+                "SELECT
+                    COUNT(*)::BIGINT,
+                    COALESCE(SUM(CASE WHEN status = 'active' THEN 1 ELSE 0 END), 0)::BIGINT,
+                    COALESCE(SUM(CASE WHEN status = 'disabled' THEN 1 ELSE 0 END), 0)::BIGINT,
+                    COALESCE(SUM(CASE WHEN status = 'unavailable' THEN 1 ELSE 0 END), 0)::BIGINT
+                 FROM llm_codex_accounts",
+                &[],
+            )
+            .await
+            .context("summarize postgres codex accounts")?;
+        Ok(core_store::AdminAccountsSummary {
+            total: row.get::<_, i64>(0).max(0) as usize,
+            active_count: row.get::<_, i64>(1).max(0) as usize,
+            disabled_count: row.get::<_, i64>(2).max(0) as usize,
+            unavailable_count: row.get::<_, i64>(3).max(0) as usize,
+        })
+    }
+
     async fn list_codex_accounts_rows_page(
         &self,
         page: AdminPageRequest,
@@ -1238,6 +1311,45 @@ impl PostgresControlRepository {
             .await
             .context("list kiro accounts")?;
         Ok(rows.into_iter().map(decode_kiro_account_row).collect())
+    }
+
+    async fn admin_kiro_accounts_summary(
+        &self,
+    ) -> anyhow::Result<core_store::AdminAccountsSummary> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_one(
+                "SELECT
+                    COUNT(*)::BIGINT,
+                    COALESCE(SUM(CASE
+                        WHEN status = 'active'
+                            AND NOT CASE
+                                WHEN jsonb_typeof(auth_json -> 'disabled') = 'boolean'
+                                THEN (auth_json ->> 'disabled')::boolean
+                                ELSE false
+                            END
+                        THEN 1 ELSE 0 END), 0)::BIGINT,
+                    COALESCE(SUM(CASE
+                        WHEN status <> 'active'
+                            OR CASE
+                                WHEN jsonb_typeof(auth_json -> 'disabled') = 'boolean'
+                                THEN (auth_json ->> 'disabled')::boolean
+                                ELSE false
+                            END
+                        THEN 1 ELSE 0 END), 0)::BIGINT,
+                    COALESCE(SUM(CASE WHEN status = 'unavailable' THEN 1 ELSE 0 END), 0)::BIGINT
+                 FROM llm_kiro_accounts",
+                &[],
+            )
+            .await
+            .context("summarize postgres kiro accounts")?;
+        Ok(core_store::AdminAccountsSummary {
+            total: row.get::<_, i64>(0).max(0) as usize,
+            active_count: row.get::<_, i64>(1).max(0) as usize,
+            disabled_count: row.get::<_, i64>(2).max(0) as usize,
+            unavailable_count: row.get::<_, i64>(3).max(0) as usize,
+        })
     }
 
     async fn list_kiro_accounts_rows_page(
@@ -3531,9 +3643,11 @@ impl AdminCodexAccountStore for PostgresControlRepository {
             .iter()
             .map(|record| self.admin_codex_account_from_record_with_context(record, &context))
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let summary = self.admin_codex_accounts_summary().await?;
         Ok(AdminCodexAccountsPage {
             has_more: page.has_more(accounts.len(), total),
             accounts,
+            summary,
             total,
             limit: page.limit,
             offset: page.offset,
@@ -4033,9 +4147,11 @@ impl AdminKiroAccountStore for PostgresControlRepository {
             .iter()
             .map(|record| self.admin_kiro_account_from_record_with_context(record, &context))
             .collect::<anyhow::Result<Vec<_>>>()?;
+        let summary = self.admin_kiro_accounts_summary().await?;
         Ok(AdminKiroAccountsPage {
             has_more: page.has_more(accounts.len(), total),
             accounts,
+            summary,
             total,
             limit: page.limit,
             offset: page.offset,

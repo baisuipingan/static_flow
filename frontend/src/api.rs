@@ -6014,11 +6014,29 @@ pub struct AdminLlmGatewayKeyView {
     pub uses_global_kiro_billable_model_multipliers: bool,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Default)]
+#[serde(default)]
+pub struct AdminLlmGatewayKeysSummaryView {
+    pub total: usize,
+    pub public_visible_count: usize,
+    pub active_count: usize,
+    pub disabled_count: usize,
+    pub quota_billable_limit_sum: u64,
+    pub remaining_billable_sum: i64,
+    pub usage_input_uncached_tokens_sum: u64,
+    pub usage_input_cached_tokens_sum: u64,
+    pub usage_output_tokens_sum: u64,
+    pub usage_billable_tokens_sum: u64,
+    pub usage_credit_total: f64,
+    pub usage_credit_missing_events: u64,
+}
+
 /// Combined admin payload for the key inventory screen.
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(default)]
 pub struct AdminLlmGatewayKeysResponse {
     pub keys: Vec<AdminLlmGatewayKeyView>,
+    pub summary: AdminLlmGatewayKeysSummaryView,
     pub auth_cache_ttl_seconds: u64,
     pub total: usize,
     pub limit: usize,
@@ -7868,6 +7886,7 @@ pub async fn fetch_admin_llm_gateway_keys() -> Result<AdminLlmGatewayKeysRespons
     {
         Ok(AdminLlmGatewayKeysResponse {
             keys: vec![],
+            summary: AdminLlmGatewayKeysSummaryView::default(),
             auth_cache_ttl_seconds: 60,
             total: 0,
             limit: 0,
@@ -8898,11 +8917,21 @@ impl Default for AccountSummaryView {
 #[serde(default)]
 pub struct AccountListResponse {
     pub accounts: Vec<AccountSummaryView>,
+    pub summary: AdminAccountsSummaryView,
     pub total: usize,
     pub limit: usize,
     pub offset: usize,
     pub has_more: bool,
     pub generated_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct AdminAccountsSummaryView {
+    pub total: usize,
+    pub active_count: usize,
+    pub disabled_count: usize,
+    pub unavailable_count: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
@@ -8957,6 +8986,7 @@ pub async fn fetch_admin_llm_gateway_accounts() -> Result<AccountListResponse, S
     {
         Ok(AccountListResponse {
             accounts: vec![],
+            summary: AdminAccountsSummaryView::default(),
             total: 0,
             limit: 0,
             offset: 0,
@@ -9632,6 +9662,7 @@ pub struct PatchKiroAccountInput {
 #[serde(default)]
 pub struct AdminKiroAccountsResponse {
     pub accounts: Vec<KiroAccountView>,
+    pub summary: AdminAccountsSummaryView,
     pub total: usize,
     pub limit: usize,
     pub offset: usize,
@@ -9770,6 +9801,7 @@ pub async fn fetch_admin_kiro_keys() -> Result<AdminLlmGatewayKeysResponse, Stri
     {
         Ok(AdminLlmGatewayKeysResponse {
             keys: vec![],
+            summary: AdminLlmGatewayKeysSummaryView::default(),
             auth_cache_ttl_seconds: 60,
             total: 0,
             limit: 0,
@@ -10289,6 +10321,7 @@ pub async fn fetch_admin_kiro_accounts() -> Result<AdminKiroAccountsResponse, St
     {
         Ok(AdminKiroAccountsResponse {
             accounts: vec![],
+            summary: AdminAccountsSummaryView::default(),
             total: 0,
             limit: 0,
             offset: 0,

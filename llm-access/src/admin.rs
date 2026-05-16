@@ -108,6 +108,7 @@ struct ErrorResponse {
 #[derive(Debug, Serialize)]
 struct AdminKeysResponse {
     keys: Vec<core_store::AdminKey>,
+    summary: core_store::AdminKeysSummary,
     auth_cache_ttl_seconds: u64,
     total: usize,
     limit: usize,
@@ -143,6 +144,7 @@ struct AdminProxyBindingsResponse {
 #[derive(Debug, Serialize)]
 struct AdminAccountsResponse {
     accounts: Vec<core_store::AdminCodexAccount>,
+    summary: core_store::AdminAccountsSummary,
     total: usize,
     limit: usize,
     offset: usize,
@@ -166,6 +168,7 @@ struct AdminCodexImportJobsResponse {
 #[derive(Debug, Serialize)]
 struct AdminKiroAccountsResponse {
     accounts: Vec<core_store::AdminKiroAccount>,
+    summary: core_store::AdminAccountsSummary,
     total: usize,
     limit: usize,
     offset: usize,
@@ -723,6 +726,7 @@ pub(crate) async fn list_llm_gateway_keys(
     };
     Json(AdminKeysResponse {
         keys,
+        summary: page.summary,
         auth_cache_ttl_seconds: config.auth_cache_ttl_seconds,
         total: page.total,
         limit: page.limit,
@@ -1368,6 +1372,7 @@ pub(crate) async fn list_llm_gateway_accounts(
     };
     Json(AdminAccountsResponse {
         accounts: apply_cached_codex_status_to_admin_accounts(page.accounts, status),
+        summary: page.summary,
         total: page.total,
         limit: page.limit,
         offset: page.offset,
@@ -1920,6 +1925,7 @@ pub(crate) async fn list_admin_kiro_keys(
     };
     Json(AdminKeysResponse {
         keys,
+        summary: page.summary,
         auth_cache_ttl_seconds: config.auth_cache_ttl_seconds,
         total: page.total,
         limit: page.limit,
@@ -2097,6 +2103,7 @@ pub(crate) async fn list_admin_kiro_accounts(
     {
         Ok(page) => Json(AdminKiroAccountsResponse {
             accounts: page.accounts,
+            summary: page.summary,
             total: page.total,
             limit: page.limit,
             offset: page.offset,
