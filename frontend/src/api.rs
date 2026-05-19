@@ -6402,6 +6402,8 @@ pub struct AdminUsageJournalPreviewEventView {
     pub stream_completed_cleanly: Option<bool>,
     pub downstream_disconnect: Option<bool>,
     pub bytes_streamed: Option<i64>,
+    pub latency_ms: Option<i64>,
+    pub first_sse_write_ms: Option<i64>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]

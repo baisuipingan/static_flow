@@ -350,6 +350,8 @@ struct AdminUsageJournalPreviewEventView {
     stream_completed_cleanly: Option<bool>,
     downstream_disconnect: Option<bool>,
     bytes_streamed: Option<i64>,
+    latency_ms: Option<i64>,
+    first_sse_write_ms: Option<i64>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -4088,6 +4090,8 @@ fn admin_usage_journal_preview_view(
                 stream_completed_cleanly: event.stream.stream_completed_cleanly,
                 downstream_disconnect: event.stream.downstream_disconnect,
                 bytes_streamed: event.stream.bytes_streamed,
+                latency_ms: event.timing.latency_ms,
+                first_sse_write_ms: event.timing.first_sse_write_ms,
             })
             .collect(),
     }

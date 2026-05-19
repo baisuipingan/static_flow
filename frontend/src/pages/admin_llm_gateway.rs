@@ -1004,17 +1004,6 @@ fn usage_journal_preview_message(
         .unwrap_or_else(|| "-".to_string())
 }
 
-fn usage_journal_preview_message_table_preview(
-    preview: &crate::api::AdminUsageJournalPreviewEventView,
-) -> String {
-    let message = usage_journal_preview_message(preview);
-    if message == "-" {
-        return message;
-    }
-    let single_line = message.split_whitespace().collect::<Vec<_>>().join(" ");
-    preview_text(&single_line, 120)
-}
-
 fn usage_journal_preview_has_full_message(
     preview: &crate::api::AdminUsageJournalPreviewEventView,
 ) -> bool {
@@ -2251,6 +2240,10 @@ pub fn admin_llm_gateway_page() -> Html {
     let selected_usage_journal_message = use_state(|| None::<(String, String, String, String)>);
     let usage_journal_loading = use_state(|| false);
     let usage_journal_error = use_state(|| None::<String>);
+    let journal_filter_model = use_state(String::new);
+    let journal_filter_account = use_state(String::new);
+    let journal_filter_key = use_state(String::new);
+    let journal_filter_status = use_state(String::new);
     let token_requests = use_state(Vec::<AdminLlmGatewayTokenRequestView>::new);
     let token_request_total = use_state(|| 0_usize);
     let token_request_page = use_state(|| 1_usize);
@@ -6001,132 +5994,238 @@ pub fn admin_llm_gateway_page() -> Html {
                                         { format!("truncated_tail: {}", if preview.truncated_tail { "yes" } else { "no" }) }
                                     </p>
                                 </div>
-                                <div class={classes!("mt-4", "min-w-0") }>
+                                <div class={classes!("mt-4", "flex", "flex-wrap", "items-center", "gap-2")}>
+                                    <input
+                                        type="text"
+                                        class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-2.5", "py-1.5", "text-xs", "text-[var(--text)]", "placeholder:text-[var(--muted)]", "w-28")}
+                                        placeholder="model"
+                                        value={(*journal_filter_model).clone()}
+                                        oninput={{
+                                            let journal_filter_model = journal_filter_model.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+                                                journal_filter_model.set(input.value());
+                                            })
+                                        }}
+                                    />
+                                    <input
+                                        type="text"
+                                        class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-2.5", "py-1.5", "text-xs", "text-[var(--text)]", "placeholder:text-[var(--muted)]", "w-28")}
+                                        placeholder="account"
+                                        value={(*journal_filter_account).clone()}
+                                        oninput={{
+                                            let journal_filter_account = journal_filter_account.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+                                                journal_filter_account.set(input.value());
+                                            })
+                                        }}
+                                    />
+                                    <input
+                                        type="text"
+                                        class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-2.5", "py-1.5", "text-xs", "text-[var(--text)]", "placeholder:text-[var(--muted)]", "w-28")}
+                                        placeholder="key"
+                                        value={(*journal_filter_key).clone()}
+                                        oninput={{
+                                            let journal_filter_key = journal_filter_key.clone();
+                                            Callback::from(move |e: InputEvent| {
+                                                let input: web_sys::HtmlInputElement = e.target_unchecked_into();
+                                                journal_filter_key.set(input.value());
+                                            })
+                                        }}
+                                    />
+                                    <select
+                                        class={classes!("rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-2.5", "py-1.5", "text-xs", "text-[var(--text)]", "w-20")}
+                                        onchange={{
+                                            let journal_filter_status = journal_filter_status.clone();
+                                            Callback::from(move |e: Event| {
+                                                let select: web_sys::HtmlSelectElement = e.target_unchecked_into();
+                                                journal_filter_status.set(select.value());
+                                            })
+                                        }}
+                                    >
+                                        <option value="" selected={journal_filter_status.is_empty()}>{ "All" }</option>
+                                        <option value="2xx" selected={&**journal_filter_status == "2xx"}>{ "2xx" }</option>
+                                        <option value="4xx" selected={&**journal_filter_status == "4xx"}>{ "4xx" }</option>
+                                        <option value="5xx" selected={&**journal_filter_status == "5xx"}>{ "5xx" }</option>
+                                    </select>
+                                    {{
+                                        let total = preview.events.len();
+                                        let filtered_count = preview.events.iter().filter(|e| {
+                                            (journal_filter_model.is_empty() || e.model.as_deref().unwrap_or("").contains(&**journal_filter_model))
+                                            && (journal_filter_account.is_empty() || e.account_name.as_deref().unwrap_or("").contains(&**journal_filter_account))
+                                            && (journal_filter_key.is_empty() || e.key_name.contains(&**journal_filter_key))
+                                            && (journal_filter_status.is_empty() || match journal_filter_status.as_str() {
+                                                "2xx" => e.status_code >= 200 && e.status_code < 300,
+                                                "4xx" => e.status_code >= 400 && e.status_code < 500,
+                                                "5xx" => e.status_code >= 500,
+                                                _ => true,
+                                            })
+                                        }).count();
+                                        html! {
+                                            <span class={classes!("rounded-full", "border", "border-[var(--border)]", "px-2.5", "py-1", "text-[11px]", "font-semibold", "text-[var(--muted)]")}>
+                                                { format!("{}/{}", filtered_count, total) }
+                                            </span>
+                                        }
+                                    }}
+                                </div>
+                                <div class={classes!("mt-3", "min-w-0") }>
                                     <div class={classes!("overflow-x-auto", "max-w-full", "rounded-xl", "border", "border-[var(--border)]")}>
-                                    <table class={classes!("min-w-[96rem]", "w-full", "text-sm")}>
+                                    <table class={classes!("min-w-[64rem]", "w-full", "text-sm")}>
                                         <thead>
                                             <tr class={classes!("text-left", "text-[var(--muted)]")}>
-                                                <th class={classes!("py-2", "pr-3")}>{ "时间 / Event ID" }</th>
+                                                <th class={classes!("py-2", "pl-3", "pr-3")}>{ "时间" }</th>
                                                 <th class={classes!("py-2", "pr-3")}>{ "Key" }</th>
                                                 <th class={classes!("py-2", "pr-3")}>{ "号池" }</th>
-                                                <th class={classes!("py-2", "pr-3")}>{ "Route" }</th>
                                                 <th class={classes!("py-2", "pr-3")}>{ "Model" }</th>
                                                 <th class={classes!("py-2", "pr-3")}>{ "Status" }</th>
-                                                <th class={classes!("py-2", "pr-3")}>{ "Stream" }</th>
+                                                <th class={classes!("py-2", "pr-3")}>{ "Latency" }</th>
                                                 <th class={classes!("py-2", "pr-3")}>{ "Tokens" }</th>
-                                                <th class={classes!("py-2", "pr-3")}>{ "最后一条内容" }</th>
+                                                <th class={classes!("py-2", "pr-3")}>{ "" }</th>
                                             </tr>
                                         </thead>
                                         <tbody>
-                                            if preview.events.is_empty() {
-                                                <tr class={classes!("border-t", "border-[var(--border)]")}>
-                                                    <td colspan="9" class={classes!("py-8", "text-center", "text-[var(--muted)]")}>{ "当前 producer file 里还没有完整 block 可预览" }</td>
-                                                </tr>
-                                            } else {
-                                                { for preview.events.iter().map(|event| {
-                                                    let account_label = event.account_name.clone().unwrap_or_else(|| "not captured".to_string());
-                                                    let last_message_preview = usage_journal_preview_message_table_preview(event);
-                                                    let last_message_full = usage_journal_preview_message(event);
-                                                    let has_full_message = usage_journal_preview_has_full_message(event);
-                                                    let open_preview_message = {
-                                                        let selected_usage_journal_message = selected_usage_journal_message.clone();
-                                                        let event_id = event.event_id.clone();
-                                                        let created_at = format_ms(event.created_at_ms);
-                                                        let key_name = event.key_name.clone();
-                                                        let full_message = last_message_full.clone();
-                                                        Callback::from(move |_| {
-                                                            selected_usage_journal_message.set(Some((
-                                                                event_id.clone(),
-                                                                created_at.clone(),
-                                                                key_name.clone(),
-                                                                full_message.clone(),
-                                                            )))
-                                                        })
-                                                    };
+                                            {{
+                                                let filtered_events: Vec<_> = preview.events.iter().filter(|e| {
+                                                    (journal_filter_model.is_empty() || e.model.as_deref().unwrap_or("").contains(&**journal_filter_model))
+                                                    && (journal_filter_account.is_empty() || e.account_name.as_deref().unwrap_or("").contains(&**journal_filter_account))
+                                                    && (journal_filter_key.is_empty() || e.key_name.contains(&**journal_filter_key))
+                                                    && (journal_filter_status.is_empty() || match journal_filter_status.as_str() {
+                                                        "2xx" => e.status_code >= 200 && e.status_code < 300,
+                                                        "4xx" => e.status_code >= 400 && e.status_code < 500,
+                                                        "5xx" => e.status_code >= 500,
+                                                        _ => true,
+                                                    })
+                                                }).collect();
+                                                if filtered_events.is_empty() {
                                                     html! {
-                                                        <tr class={classes!("border-t", "border-[var(--border)]", "align-top")}>
-                                                            <td class={classes!("py-3", "pr-3", "min-w-[13rem]", "whitespace-nowrap")}>
-                                                                <div>{ format_ms(event.created_at_ms) }</div>
-                                                                <div class={classes!("mt-1", "font-mono", "text-[11px]", "text-[var(--muted)]")}>{ event.event_id.clone() }</div>
-                                                            </td>
-                                                            <td class={classes!("py-3", "pr-3", "min-w-[13rem]")}>
-                                                                <div class={classes!("font-semibold", "text-[var(--text)]")}>{ event.key_name.clone() }</div>
-                                                                <div class={classes!("mt-1", "font-mono", "text-xs", "text-[var(--muted)]")}>{ event.key_id.clone() }</div>
-                                                            </td>
-                                                            <td class={classes!("py-3", "pr-3", "min-w-[10rem]")}>
-                                                                <span class={classes!("inline-flex", "rounded-full", "border", "border-emerald-500/20", "bg-emerald-500/10", "px-2.5", "py-1", "text-xs", "font-semibold", "text-emerald-700", "dark:text-emerald-200")}>
-                                                                    { account_label }
-                                                                </span>
-                                                            </td>
-                                                            <td class={classes!("py-3", "pr-3", "min-w-[18rem]")}>
-                                                                <div class={classes!("flex", "items-start", "gap-2")}>
-                                                                    <span class={classes!("inline-flex", "rounded-full", "border", "border-sky-500/20", "bg-sky-500/10", "px-2", "py-1", "text-[11px]", "font-semibold", "uppercase", "tracking-[0.12em]", "text-sky-700", "dark:text-sky-200")}>
-                                                                        { event.request_method.clone() }
-                                                                    </span>
-                                                                    <div class={classes!("min-w-0", "flex-1")}>
-                                                                        <span class={classes!("truncate")} title={event.endpoint.clone()}>{ event.endpoint.clone() }</span>
-                                                                    </div>
-                                                                </div>
-                                                            </td>
-                                                            <td class={classes!("py-3", "pr-3", "min-w-[11rem]")}>
-                                                                <div>{ event.model.clone().unwrap_or_else(|| "-".to_string()) }</div>
-                                                                if event.usage_missing {
-                                                                    <div class={classes!("mt-2", "inline-flex", "rounded-full", "border", "border-amber-500/20", "bg-amber-500/10", "px-2", "py-1", "text-[11px]", "font-semibold", "uppercase", "tracking-[0.12em]", "text-amber-700", "dark:text-amber-200")}>
-                                                                        { token_usage_missing_label() }
-                                                                    </div>
-                                                                }
-                                                            </td>
-                                                            <td class={classes!("py-3", "pr-3", "whitespace-nowrap")}>{ event.status_code }</td>
-                                                            <td class={classes!("py-3", "pr-3", "min-w-[14rem]")}>
-                                                                <div class={classes!("flex", "items-center", "gap-2", "flex-wrap")}>
-                                                                    <span class={usage_stream_state_badge_classes(event.stream_completed_cleanly, event.downstream_disconnect)}>
-                                                                        { usage_stream_state_label(event.stream_completed_cleanly, event.downstream_disconnect) }
-                                                                    </span>
-                                                                    <span class={classes!("font-mono", "text-[11px]", "text-[var(--muted)]")}>
-                                                                        { format!("final {}", event.final_event_type.clone().unwrap_or_else(|| "-".to_string())) }
-                                                                    </span>
-                                                                </div>
-                                                            </td>
-                                                            <td class={classes!("py-3", "pr-3", "min-w-[12rem]")}>
-                                                                <div class={classes!("grid", "gap-1", "text-xs", "text-[var(--muted)]")}>
-                                                                    <span>{ format!("Uncached {}", format_number_u64(event.input_uncached_tokens)) }</span>
-                                                                    <span>{ format!("Cached {}", format_number_u64(event.input_cached_tokens)) }</span>
-                                                                    <span>{ format!("Out {}", format_number_u64(event.output_tokens)) }</span>
-                                                                    <span class={classes!("font-semibold", "text-[var(--text)]")}>{ format!("Billable {}", format_number_u64(event.billable_tokens)) }</span>
-                                                                </div>
-                                                            </td>
-                                                            <td class={classes!("py-3", "pr-3", "min-w-[18rem]")}>
-                                                                if has_full_message {
-                                                                    <button
-                                                                        type="button"
-                                                                        class={classes!(
-                                                                            "max-w-[18rem]",
-                                                                            "overflow-hidden",
-                                                                            "whitespace-normal",
-                                                                            "break-words",
-                                                                            "text-left",
-                                                                            "text-xs",
-                                                                            "leading-5",
-                                                                            "text-[var(--muted)]",
-                                                                            "underline",
-                                                                            "underline-offset-2",
-                                                                            "hover:text-[var(--text)]"
-                                                                        )}
-                                                                        onclick={open_preview_message}
-                                                                        title="点击查看完整内容"
-                                                                    >
-                                                                        { last_message_preview }
-                                                                    </button>
-                                                                } else {
-                                                                    <div class={classes!("max-w-[18rem]", "overflow-hidden", "whitespace-normal", "break-words", "text-xs", "leading-5", "text-[var(--muted)]")}>
-                                                                        { last_message_preview }
-                                                                    </div>
-                                                                }
-                                                            </td>
+                                                        <tr class={classes!("border-t", "border-[var(--border)]")}>
+                                                            <td colspan="8" class={classes!("py-8", "text-center", "text-[var(--muted)]")}>{ "当前 producer file 里还没有完整 block 可预览" }</td>
                                                         </tr>
                                                     }
-                                                }) }
-                                            }
+                                                } else {
+                                                    html! { { for filtered_events.into_iter().map(|event| {
+                                                        let account_label = event.account_name.clone().unwrap_or_else(|| "not captured".to_string());
+                                                        let last_message_full = usage_journal_preview_message(event);
+                                                        let has_full_message = usage_journal_preview_has_full_message(event);
+                                                        let open_preview_message = {
+                                                            let selected_usage_journal_message = selected_usage_journal_message.clone();
+                                                            let event_id = event.event_id.clone();
+                                                            let created_at = format_ms(event.created_at_ms);
+                                                            let key_name = event.key_name.clone();
+                                                            let full_message = last_message_full.clone();
+                                                            Callback::from(move |_| {
+                                                                selected_usage_journal_message.set(Some((
+                                                                    event_id.clone(),
+                                                                    created_at.clone(),
+                                                                    key_name.clone(),
+                                                                    full_message.clone(),
+                                                                )))
+                                                            })
+                                                        };
+                                                        let latency_ms_val = event.latency_ms.unwrap_or(0) as i32;
+                                                        let latency_color = if latency_ms_val < 3000 {
+                                                            ("border-emerald-500/20", "bg-emerald-500/10", "text-emerald-700", "dark:text-emerald-200")
+                                                        } else if latency_ms_val < 10000 {
+                                                            ("border-amber-500/20", "bg-amber-500/10", "text-amber-700", "dark:text-amber-200")
+                                                        } else {
+                                                            ("border-red-500/20", "bg-red-500/10", "text-red-700", "dark:text-red-200")
+                                                        };
+                                                        let status_ok = event.status_code >= 200 && event.status_code < 300;
+                                                        html! {
+                                                            <tr class={classes!("border-t", "border-[var(--border)]", "align-top")}>
+                                                                <td class={classes!("py-2.5", "pl-3", "pr-3", "whitespace-nowrap")}>
+                                                                    <div class={classes!("text-xs")}>{ format_ms(event.created_at_ms) }</div>
+                                                                    <div class={classes!("mt-0.5", "flex", "items-center", "gap-1")}>
+                                                                        <span class={classes!("max-w-[7rem]", "truncate", "font-mono", "text-[10px]", "text-[var(--muted)]")} title={event.event_id.clone()}>
+                                                                            { event.event_id.clone() }
+                                                                        </span>
+                                                                        { copy_icon_button(&event.event_id, &on_copy) }
+                                                                    </div>
+                                                                </td>
+                                                                <td class={classes!("py-2.5", "pr-3")}>
+                                                                    <div class={classes!("text-xs", "font-semibold", "text-[var(--text)]", "truncate", "max-w-[10rem]")} title={event.key_name.clone()}>{ event.key_name.clone() }</div>
+                                                                    <div class={classes!("font-mono", "text-[10px]", "text-[var(--muted)]")}>{ event.key_id.clone() }</div>
+                                                                </td>
+                                                                <td class={classes!("py-2.5", "pr-3")}>
+                                                                    <span class={classes!("inline-flex", "rounded-full", "border", "border-emerald-500/20", "bg-emerald-500/10", "px-2", "py-0.5", "text-[11px]", "font-semibold", "text-emerald-700", "dark:text-emerald-200")}>
+                                                                        { account_label }
+                                                                    </span>
+                                                                </td>
+                                                                <td class={classes!("py-2.5", "pr-3")}>
+                                                                    <div class={classes!("text-xs", "truncate", "max-w-[10rem]")} title={event.model.clone().unwrap_or_default()}>
+                                                                        { event.model.clone().unwrap_or_else(|| "-".to_string()) }
+                                                                    </div>
+                                                                    if event.usage_missing {
+                                                                        <span class={classes!("inline-flex", "rounded-full", "border", "border-amber-500/20", "bg-amber-500/10", "px-1.5", "py-0.5", "text-[10px]", "font-semibold", "text-amber-700", "dark:text-amber-200")}>
+                                                                            { token_usage_missing_label() }
+                                                                        </span>
+                                                                    }
+                                                                </td>
+                                                                <td class={classes!("py-2.5", "pr-3", "whitespace-nowrap")}>
+                                                                    <span class={classes!(
+                                                                        "inline-flex", "h-5", "w-5", "items-center", "justify-center", "rounded-full", "text-[10px]", "font-bold",
+                                                                        if status_ok { "bg-emerald-500/15" } else { "bg-red-500/15" },
+                                                                        if status_ok { "text-emerald-700" } else { "text-red-700" },
+                                                                        if status_ok { "dark:text-emerald-200" } else { "dark:text-red-200" },
+                                                                    )} title={format!("{}", event.status_code)}>
+                                                                        { if status_ok { "" } else { "!" } }
+                                                                    </span>
+                                                                    <span class={classes!("ml-1", "text-xs", "font-mono")}>{ event.status_code }</span>
+                                                                </td>
+                                                                <td class={classes!("py-2.5", "pr-3", "whitespace-nowrap")}>
+                                                                    if event.latency_ms.is_some() {
+                                                                        <span class={classes!("inline-flex", "rounded-full", "border", "px-2", "py-0.5", "text-[11px]", "font-semibold", latency_color.0, latency_color.1, latency_color.2, latency_color.3)}>
+                                                                            { format_latency_ms(latency_ms_val) }
+                                                                        </span>
+                                                                        <div class={classes!("mt-0.5", "text-[10px]", "text-[var(--muted)]")}>
+                                                                            { if let Some(first_ms) = event.first_sse_write_ms {
+                                                                                format!("首字 {}ms", first_ms.max(0))
+                                                                            } else {
+                                                                                "-".to_string()
+                                                                            }}
+                                                                        </div>
+                                                                    } else {
+                                                                        <span class={classes!("text-xs", "text-[var(--muted)]")}>{ "-" }</span>
+                                                                    }
+                                                                </td>
+                                                                <td class={classes!("py-2.5", "pr-3", "whitespace-nowrap", "font-mono", "text-[11px]")}>
+                                                                    <span class={classes!("text-[var(--muted)]")}>
+                                                                        { format!("{}/{}/{}", format_number_u64(event.input_uncached_tokens), format_number_u64(event.input_cached_tokens), format_number_u64(event.output_tokens)) }
+                                                                    </span>
+                                                                </td>
+                                                                <td class={classes!("py-2.5", "pr-3")}>
+                                                                    if has_full_message {
+                                                                        <button
+                                                                            type="button"
+                                                                            class={classes!(
+                                                                                "inline-flex",
+                                                                                "h-7",
+                                                                                "w-7",
+                                                                                "items-center",
+                                                                                "justify-center",
+                                                                                "rounded-lg",
+                                                                                "border",
+                                                                                "border-[var(--border)]",
+                                                                                "bg-[var(--surface)]",
+                                                                                "text-[var(--muted)]",
+                                                                                "transition-colors",
+                                                                                "hover:text-[var(--primary)]",
+                                                                                "hover:bg-[var(--surface-alt)]"
+                                                                            )}
+                                                                            title="查看最后一条内容"
+                                                                            aria-label="查看最后一条内容"
+                                                                            onclick={open_preview_message}
+                                                                        >
+                                                                            <i class={classes!("fas", "fa-bars-staggered", "text-xs")}></i>
+                                                                        </button>
+                                                                    }
+                                                                </td>
+                                                            </tr>
+                                                        }
+                                                    }) }}
+                                                }
+                                            }}
                                         </tbody>
                                     </table>
                                     </div>
@@ -9201,26 +9300,6 @@ mod tests {
         };
 
         assert_eq!(usage_journal_preview_message(&event), "hello");
-    }
-
-    #[test]
-    fn usage_journal_preview_message_table_preview_collapses_whitespace_and_truncates() {
-        let event = crate::api::AdminUsageJournalPreviewEventView {
-            last_message_content: Some(
-                "first line\n\nsecond   line with   extra spaces and a very long suffix that \
-                 should be truncated in the table preview because it keeps going with more and \
-                 more text until the shortened variant must end with ellipsis"
-                    .to_string(),
-            ),
-            ..crate::api::AdminUsageJournalPreviewEventView::default()
-        };
-
-        let preview = usage_journal_preview_message_table_preview(&event);
-
-        assert!(!preview.contains('\n'));
-        assert!(preview.contains("first line second line with extra spaces"));
-        assert!(preview.ends_with("..."));
-        assert!(preview.chars().count() <= 123);
     }
 
     #[test]
