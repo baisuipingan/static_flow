@@ -1259,7 +1259,30 @@ pub(crate) async fn check_llm_gateway_proxy_config(
         Err(_) => return internal_error("Failed to load llm gateway proxy config").into_response(),
     };
     match run_proxy_connectivity_check(&proxy, &provider_type).await {
-        Ok(result) => Json(result).into_response(),
+        Ok(result) => {
+            if let Some(update) = proxy_endpoint_check_update_from_response(&result) {
+                match state
+                    .admin_proxy_store
+                    .record_admin_proxy_endpoint_check(update)
+                    .await
+                {
+                    Ok(Some(_)) => {},
+                    Ok(None) => {
+                        return not_found("LLM gateway proxy config not found").into_response();
+                    },
+                    Err(err) => {
+                        tracing::warn!(
+                            proxy_config_id = %result.proxy_config_id,
+                            provider_type = %result.provider_type,
+                            "failed to persist upstream proxy check: {err:#}"
+                        );
+                        return internal_error("Failed to save upstream proxy check")
+                            .into_response();
+                    },
+                }
+            }
+            Json(result).into_response()
+        },
         Err(_) => internal_error("Failed to check upstream proxy config").into_response(),
     }
 }
@@ -4917,10 +4940,10 @@ async fn run_proxy_connectivity_check(
 ) -> anyhow::Result<AdminProxyCheckResponse> {
     let target_url = match provider_type {
         PROVIDER_CODEX => "https://chatgpt.com/backend-api/codex/models".to_string(),
-        PROVIDER_KIRO => {
-            "https://q.us-east-1.amazonaws.com/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST"
-                .to_string()
-        },
+        PROVIDER_KIRO => format!(
+            "{}/getUsageLimits?origin=AI_EDITOR&resourceType=AGENTIC_REQUEST",
+            crate::kiro_refresh::management_upstream_base_url("us-east-1")
+        ),
         _ => unreachable!("provider type must be validated before proxy check"),
     };
     let client = build_proxy_client(proxy)?;
@@ -4956,6 +4979,22 @@ async fn run_proxy_connectivity_check(
         ok: target.reachable,
         targets: vec![target],
         checked_at: now_ms(),
+    })
+}
+
+fn proxy_endpoint_check_update_from_response(
+    response: &AdminProxyCheckResponse,
+) -> Option<core_store::AdminProxyEndpointCheckUpdate> {
+    let target = response.targets.first()?;
+    Some(core_store::AdminProxyEndpointCheckUpdate {
+        proxy_config_id: response.proxy_config_id.clone(),
+        provider_type: response.provider_type.clone(),
+        target_url: target.url.clone(),
+        reachable: target.reachable,
+        status_code: target.status_code,
+        latency_ms: target.latency_ms.max(0),
+        error_message: target.error_message.clone(),
+        checked_at_ms: response.checked_at,
     })
 }
 

@@ -47,13 +47,13 @@ use crate::{
         AdminLlmGatewayUsageEventsQuery, AdminLlmGatewayUsageFilterOptionsResponse,
         AdminUpstreamProxyBindingView, AdminUpstreamProxyCheckResponse,
         AdminUpstreamProxyCheckTargetView, AdminUpstreamProxyConfigScopeView,
-        AdminUpstreamProxyConfigView, AdminUsageJournalFileView, AdminUsageJournalPreviewResponse,
-        AdminUsageJournalStatusView, AdminUsageTotalsView, CodexAccountImportJobDetailView,
-        CodexAccountImportJobSummaryView, CreateAdminAccountGroupInput,
-        CreateAdminUpstreamProxyConfigInput, LlmGatewayRuntimeConfig, PatchAdminAccountGroupInput,
-        PatchAdminLlmGatewayAccountInput, PatchAdminLlmGatewayKeyRequest,
-        PatchAdminUpstreamProxyConfigInput, ProcessMemoryRuntimeStats,
-        DEFAULT_LLM_GATEWAY_CODEX_CLIENT_VERSION,
+        AdminUpstreamProxyConfigView, AdminUpstreamProxyEndpointCheckView,
+        AdminUsageJournalFileView, AdminUsageJournalPreviewResponse, AdminUsageJournalStatusView,
+        AdminUsageTotalsView, CodexAccountImportJobDetailView, CodexAccountImportJobSummaryView,
+        CreateAdminAccountGroupInput, CreateAdminUpstreamProxyConfigInput, LlmGatewayRuntimeConfig,
+        PatchAdminAccountGroupInput, PatchAdminLlmGatewayAccountInput,
+        PatchAdminLlmGatewayKeyRequest, PatchAdminUpstreamProxyConfigInput,
+        ProcessMemoryRuntimeStats, DEFAULT_LLM_GATEWAY_CODEX_CLIENT_VERSION,
     },
     components::{
         date_range_picker::DateRangePicker, pagination::Pagination, search_box::SearchBox,
@@ -875,6 +875,41 @@ fn format_proxy_check_message(result: &AdminUpstreamProxyCheckResponse) -> Strin
     lines.push(format!("使用认证：{}", result.auth_label));
     lines.extend(result.targets.iter().map(format_proxy_check_target_line));
     lines.join("\n")
+}
+
+fn format_proxy_endpoint_check_summary(
+    provider_label: &str,
+    check: Option<&AdminUpstreamProxyEndpointCheckView>,
+) -> String {
+    let Some(check) = check else {
+        return format!("{provider_label}: 未检测");
+    };
+    let status = check
+        .status_code
+        .map(|status| format!("HTTP {status}"))
+        .unwrap_or_else(|| {
+            if check.reachable {
+                "reachable".to_string()
+            } else {
+                "failed".to_string()
+            }
+        });
+    format!(
+        "{provider_label}: {} ms · {} · {}",
+        check.latency_ms.max(0),
+        status,
+        format_ms(check.checked_at)
+    )
+}
+
+fn proxy_endpoint_check_tone(check: Option<&AdminUpstreamProxyEndpointCheckView>) -> &'static str {
+    match check {
+        Some(check) if !check.reachable => {
+            "border-red-500/30 bg-red-500/8 text-red-700 dark:text-red-200"
+        },
+        Some(_) => "border-emerald-500/30 bg-emerald-500/8 text-emerald-700 dark:text-emerald-200",
+        None => "border-[var(--border)] bg-[var(--surface-alt)] text-[var(--muted)]",
+    }
 }
 
 fn preview_text(text: &str, max_chars: usize) -> String {
@@ -2036,11 +2071,13 @@ fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
         let proxy_id = proxy_config.id.clone();
         let checking = checking.clone();
         let feedback = feedback.clone();
+        let on_changed = props.on_changed.clone();
         let on_flash = props.on_flash.clone();
         Callback::from(move |provider_type: String| {
             let proxy_id = proxy_id.clone();
             let checking = checking.clone();
             let feedback = feedback.clone();
+            let on_changed = on_changed.clone();
             let on_flash = on_flash.clone();
             wasm_bindgen_futures::spawn_local(async move {
                 if *checking {
@@ -2056,6 +2093,7 @@ fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
                             format!("{} 检查失败", provider_type.to_uppercase())
                         }));
                         on_flash.emit((message, !result.ok));
+                        on_changed.emit(());
                     },
                     Err(err) => {
                         feedback.set(Some(err.clone()));
@@ -2090,6 +2128,14 @@ fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
                     <p class={classes!("mt-2", "mb-0", "text-xs", "font-mono", "text-[var(--muted)]")}>
                         { format!("created {} · updated {}", format_ms(props.proxy_config.created_at), format_ms(props.proxy_config.updated_at)) }
                     </p>
+                    <div class={classes!("mt-3", "grid", "gap-2", "sm:grid-cols-2")}>
+                        <div class={classes!("rounded-lg", "border", "px-3", "py-2", "text-xs", proxy_endpoint_check_tone(props.proxy_config.latest_codex_check.as_ref()))}>
+                            { format_proxy_endpoint_check_summary("Codex", props.proxy_config.latest_codex_check.as_ref()) }
+                        </div>
+                        <div class={classes!("rounded-lg", "border", "px-3", "py-2", "text-xs", proxy_endpoint_check_tone(props.proxy_config.latest_kiro_check.as_ref()))}>
+                            { format_proxy_endpoint_check_summary("Kiro", props.proxy_config.latest_kiro_check.as_ref()) }
+                        </div>
+                    </div>
                 </div>
                 <div class={classes!("flex", "items-center", "gap-2")}>
                     { copy_icon_button(&props.proxy_config.proxy_url, &props.on_copy) }

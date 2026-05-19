@@ -22,18 +22,19 @@ use llm_access_core::{
         AdminKiroAccountStore, AdminKiroAccountsPage, AdminKiroBalanceView, AdminKiroCacheView,
         AdminKiroKeyCandidateCreditSummary, AdminKiroStatusCacheUpdate,
         AdminLegacyKiroProxyMigration, AdminPageRequest, AdminProxyBinding, AdminProxyConfig,
-        AdminProxyConfigPatch, AdminProxyStore, AdminReviewQueueAction, AdminReviewQueueQuery,
-        AdminReviewQueueStore, AdminRuntimeConfig, AdminSponsorRequest, AdminSponsorRequestsPage,
-        AdminTokenRequest, AdminTokenRequestsPage, AuthenticatedKey, CodexPublicAccountStatus,
-        CodexRateLimitStatus, CodexStatusRefreshTarget, ControlStore, KiroStatusRefreshTarget,
-        NewAdminAccountGroup, NewAdminCodexAccount, NewAdminCodexImportJob, NewAdminKey,
-        NewAdminKiroAccount, NewAdminProxyConfig, NewPublicAccountContributionRequest,
-        NewPublicSponsorRequest, NewPublicTokenRequest, ProviderCodexAuthUpdate,
-        ProviderCodexRoute, ProviderKiroAuthUpdate, ProviderKiroRoute, ProviderProxyConfig,
-        ProviderRouteStore, PublicAccessKey, PublicAccessStore, PublicAccountContribution,
-        PublicCommunityStore, PublicSponsor, PublicStatusStore, PublicSubmissionStore,
-        PublicUsageLookupKey, PublicUsageStore, UsageEventSink, DEFAULT_AUTH_CACHE_TTL_SECONDS,
-        DEFAULT_CODEX_STATUS_REFRESH_SECONDS, PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED,
+        AdminProxyConfigPatch, AdminProxyEndpointCheck, AdminProxyEndpointCheckUpdate,
+        AdminProxyStore, AdminReviewQueueAction, AdminReviewQueueQuery, AdminReviewQueueStore,
+        AdminRuntimeConfig, AdminSponsorRequest, AdminSponsorRequestsPage, AdminTokenRequest,
+        AdminTokenRequestsPage, AuthenticatedKey, CodexPublicAccountStatus, CodexRateLimitStatus,
+        CodexStatusRefreshTarget, ControlStore, KiroStatusRefreshTarget, NewAdminAccountGroup,
+        NewAdminCodexAccount, NewAdminCodexImportJob, NewAdminKey, NewAdminKiroAccount,
+        NewAdminProxyConfig, NewPublicAccountContributionRequest, NewPublicSponsorRequest,
+        NewPublicTokenRequest, ProviderCodexAuthUpdate, ProviderCodexRoute, ProviderKiroAuthUpdate,
+        ProviderKiroRoute, ProviderProxyConfig, ProviderRouteStore, PublicAccessKey,
+        PublicAccessStore, PublicAccountContribution, PublicCommunityStore, PublicSponsor,
+        PublicStatusStore, PublicSubmissionStore, PublicUsageLookupKey, PublicUsageStore,
+        UsageEventSink, DEFAULT_AUTH_CACHE_TTL_SECONDS, DEFAULT_CODEX_STATUS_REFRESH_SECONDS,
+        PUBLIC_ACCOUNT_CONTRIBUTION_STATUS_VALIDATED,
         PUBLIC_SPONSOR_REQUEST_STATUS_PAYMENT_EMAIL_SENT, PUBLIC_SPONSOR_REQUEST_STATUS_SUBMITTED,
         PUBLIC_TOKEN_REQUEST_STATUS_PENDING,
     },
@@ -390,6 +391,13 @@ struct ProxyConfigNodeOverride {
     status: String,
     created_at_ms: i64,
     updated_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ProxyEndpointCheckRow {
+    proxy_config_id: String,
+    provider_type: String,
+    check: AdminProxyEndpointCheck,
 }
 
 #[derive(Debug, Clone)]
@@ -2358,6 +2366,8 @@ impl PostgresControlRepository {
             for proxy in &mut proxies {
                 self.apply_proxy_scope_metadata(proxy, "core", false);
             }
+            self.apply_proxy_endpoint_checks_to_configs(&mut proxies)
+                .await?;
             return Ok(proxies);
         }
         let overrides = self.list_proxy_config_node_overrides().await?;
@@ -2369,6 +2379,8 @@ impl PostgresControlRepository {
                 self.apply_proxy_scope_metadata(proxy, "core", false);
             }
         }
+        self.apply_proxy_endpoint_checks_to_configs(&mut proxies)
+            .await?;
         Ok(proxies)
     }
 
@@ -2400,6 +2412,8 @@ impl PostgresControlRepository {
         };
         if self.proxy_scope.can_edit_slot_metadata() {
             self.apply_proxy_scope_metadata(&mut proxy, "core", false);
+            self.apply_proxy_endpoint_checks_to_config(&mut proxy)
+                .await?;
             return Ok(Some(proxy));
         }
         match self.get_proxy_config_node_override(proxy_id).await? {
@@ -2409,7 +2423,61 @@ impl PostgresControlRepository {
             },
             None => self.apply_proxy_scope_metadata(&mut proxy, "core", false),
         }
+        self.apply_proxy_endpoint_checks_to_config(&mut proxy)
+            .await?;
         Ok(Some(proxy))
+    }
+
+    async fn list_proxy_endpoint_check_rows(&self) -> anyhow::Result<Vec<ProxyEndpointCheckRow>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT proxy_config_id, provider_type, target_url, reachable, status_code,
+                    latency_ms, error_message, checked_at_ms
+                 FROM llm_proxy_config_endpoint_checks
+                 WHERE node_id = $1",
+                &[&self.proxy_scope.node_id],
+            )
+            .await
+            .context("list postgres proxy endpoint checks")?;
+        Ok(rows
+            .into_iter()
+            .map(decode_proxy_endpoint_check_row)
+            .collect())
+    }
+
+    async fn apply_proxy_endpoint_checks_to_configs(
+        &self,
+        proxies: &mut [AdminProxyConfig],
+    ) -> anyhow::Result<()> {
+        let mut by_proxy_id = BTreeMap::<String, Vec<ProxyEndpointCheckRow>>::new();
+        for row in self.list_proxy_endpoint_check_rows().await? {
+            by_proxy_id
+                .entry(row.proxy_config_id.clone())
+                .or_default()
+                .push(row);
+        }
+        for proxy in proxies {
+            if let Some(rows) = by_proxy_id.get(&proxy.id) {
+                apply_proxy_endpoint_checks(proxy, rows);
+            }
+        }
+        Ok(())
+    }
+
+    async fn apply_proxy_endpoint_checks_to_config(
+        &self,
+        proxy: &mut AdminProxyConfig,
+    ) -> anyhow::Result<()> {
+        let rows = self
+            .list_proxy_endpoint_check_rows()
+            .await?
+            .into_iter()
+            .filter(|row| row.proxy_config_id == proxy.id)
+            .collect::<Vec<_>>();
+        apply_proxy_endpoint_checks(proxy, &rows);
+        Ok(())
     }
 
     async fn list_proxy_config_node_overrides(
@@ -5031,6 +5099,26 @@ fn decode_admin_proxy_config_row(row: PgRow) -> AdminProxyConfig {
         effective_source: "core".to_string(),
         has_node_override: false,
         can_edit_slot_metadata: true,
+        latest_codex_check: None,
+        latest_kiro_check: None,
+    }
+}
+
+fn decode_proxy_endpoint_check_row(row: PgRow) -> ProxyEndpointCheckRow {
+    let status_code = row
+        .get::<_, Option<i32>>(4)
+        .and_then(|value| u16::try_from(value).ok());
+    ProxyEndpointCheckRow {
+        proxy_config_id: row.get(0),
+        provider_type: row.get(1),
+        check: AdminProxyEndpointCheck {
+            target_url: row.get(2),
+            reachable: row.get(3),
+            status_code,
+            latency_ms: row.get(5),
+            error_message: row.get(6),
+            checked_at: row.get(7),
+        },
     }
 }
 
@@ -5710,6 +5798,18 @@ fn apply_proxy_config_node_override(
     proxy.updated_at = override_row.updated_at_ms;
 }
 
+fn apply_proxy_endpoint_checks(proxy: &mut AdminProxyConfig, rows: &[ProxyEndpointCheckRow]) {
+    proxy.latest_codex_check = None;
+    proxy.latest_kiro_check = None;
+    for row in rows {
+        match row.provider_type.as_str() {
+            core_store::PROVIDER_CODEX => proxy.latest_codex_check = Some(row.check.clone()),
+            core_store::PROVIDER_KIRO => proxy.latest_kiro_check = Some(row.check.clone()),
+            _ => {},
+        }
+    }
+}
+
 fn legacy_proxy_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
     keys.iter()
         .filter_map(|key| value.get(*key))
@@ -6352,6 +6452,56 @@ impl AdminProxyStore for PostgresControlRepository {
         self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
             .await;
         self.get_admin_proxy_config_row(proxy_id).await
+    }
+
+    async fn record_admin_proxy_endpoint_check(
+        &self,
+        update: AdminProxyEndpointCheckUpdate,
+    ) -> anyhow::Result<Option<AdminProxyConfig>> {
+        if update.provider_type != core_store::PROVIDER_CODEX
+            && update.provider_type != core_store::PROVIDER_KIRO
+        {
+            anyhow::bail!("unsupported proxy endpoint check provider `{}`", update.provider_type);
+        }
+        if self
+            .get_admin_proxy_config_base_row(&update.proxy_config_id)
+            .await?
+            .is_none()
+        {
+            return Ok(None);
+        }
+        let status_code = update.status_code.map(i32::from);
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "INSERT INTO llm_proxy_config_endpoint_checks (
+                    proxy_config_id, node_id, provider_type, target_url, reachable,
+                    status_code, latency_ms, error_message, checked_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)
+                 ON CONFLICT (proxy_config_id, node_id, provider_type) DO UPDATE SET
+                    target_url = EXCLUDED.target_url,
+                    reachable = EXCLUDED.reachable,
+                    status_code = EXCLUDED.status_code,
+                    latency_ms = EXCLUDED.latency_ms,
+                    error_message = EXCLUDED.error_message,
+                    checked_at_ms = EXCLUDED.checked_at_ms",
+                &[
+                    &update.proxy_config_id,
+                    &self.proxy_scope.node_id,
+                    &update.provider_type,
+                    &update.target_url,
+                    &update.reachable,
+                    &status_code,
+                    &update.latency_ms,
+                    &update.error_message,
+                    &update.checked_at_ms,
+                ],
+            )
+            .await
+            .context("record postgres proxy endpoint check")?;
+        self.invalidate_proxy_metadata_cache().await;
+        self.get_admin_proxy_config_row(&update.proxy_config_id)
+            .await
     }
 
     async fn delete_admin_proxy_config(
@@ -8710,6 +8860,7 @@ mod tests {
                     llm_kiro_status_cache,
                     llm_kiro_accounts,
                     llm_codex_accounts,
+                    llm_proxy_config_endpoint_checks,
                     llm_proxy_config_node_overrides,
                     llm_proxy_bindings,
                     llm_proxy_configs,
@@ -9011,6 +9162,103 @@ mod tests {
         assert_eq!(reset.proxy_url, "http://core.proxy:1111");
         assert_eq!(reset.effective_source, "core");
         assert!(!reset.has_node_override);
+    }
+
+    #[tokio::test]
+    async fn postgres_repository_records_proxy_endpoint_checks_per_node_scope() {
+        let Ok(database_url) = std::env::var("TEST_POSTGRES_URL") else {
+            eprintln!("skipping postgres integration test: TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let _guard = test_db_guard().await;
+        reset_test_db(&database_url)
+            .await
+            .expect("reset postgres test database");
+        let core_repo = super::PostgresControlRepository::connect_with_proxy_scope(
+            &database_url,
+            None,
+            super::ProxyConfigScope::core(),
+        )
+        .await
+        .expect("connect core postgres repository");
+        let edge_repo = super::PostgresControlRepository::connect_with_proxy_scope(
+            &database_url,
+            None,
+            super::ProxyConfigScope::node("edge-a"),
+        )
+        .await
+        .expect("connect edge postgres repository");
+
+        core_repo
+            .create_admin_proxy_config(NewAdminProxyConfig {
+                id: "proxy-slot-1".to_string(),
+                name: "slot 1".to_string(),
+                proxy_url: "http://core.proxy:1111".to_string(),
+                proxy_username: None,
+                proxy_password: None,
+                created_at_ms: 100,
+            })
+            .await
+            .expect("create core proxy slot");
+
+        core_repo
+            .record_admin_proxy_endpoint_check(
+                llm_access_core::store::AdminProxyEndpointCheckUpdate {
+                    proxy_config_id: "proxy-slot-1".to_string(),
+                    provider_type: "codex".to_string(),
+                    target_url: "https://chatgpt.com/backend-api/codex/models".to_string(),
+                    reachable: true,
+                    status_code: Some(401),
+                    latency_ms: 1234,
+                    error_message: Some("unauthorized".to_string()),
+                    checked_at_ms: 200,
+                },
+            )
+            .await
+            .expect("record core codex check");
+        edge_repo
+            .record_admin_proxy_endpoint_check(
+                llm_access_core::store::AdminProxyEndpointCheckUpdate {
+                    proxy_config_id: "proxy-slot-1".to_string(),
+                    provider_type: "codex".to_string(),
+                    target_url: "https://chatgpt.com/backend-api/codex/models".to_string(),
+                    reachable: true,
+                    status_code: Some(200),
+                    latency_ms: 321,
+                    error_message: None,
+                    checked_at_ms: 250,
+                },
+            )
+            .await
+            .expect("record edge codex check");
+
+        let core_checked = core_repo
+            .get_admin_proxy_config("proxy-slot-1")
+            .await
+            .expect("load core checked proxy")
+            .expect("core proxy exists");
+        assert_eq!(
+            core_checked
+                .latest_codex_check
+                .as_ref()
+                .map(|check| check.latency_ms),
+            Some(1234)
+        );
+
+        let edge_checked = edge_repo
+            .get_admin_proxy_config("proxy-slot-1")
+            .await
+            .expect("load edge checked proxy")
+            .expect("edge proxy exists");
+        assert_eq!(
+            edge_checked
+                .latest_codex_check
+                .as_ref()
+                .map(|check| check.latency_ms),
+            Some(321)
+        );
+        assert_eq!(edge_checked.effective_source, "core");
+        assert!(!edge_checked.has_node_override);
     }
 
     #[tokio::test]

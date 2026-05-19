@@ -6808,6 +6808,19 @@ pub struct AdminUpstreamProxyConfigView {
     pub effective_source: String,
     pub has_node_override: bool,
     pub can_edit_slot_metadata: bool,
+    pub latest_codex_check: Option<AdminUpstreamProxyEndpointCheckView>,
+    pub latest_kiro_check: Option<AdminUpstreamProxyEndpointCheckView>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct AdminUpstreamProxyEndpointCheckView {
+    pub target_url: String,
+    pub reachable: bool,
+    pub status_code: Option<u16>,
+    pub latency_ms: i64,
+    pub error_message: Option<String>,
+    pub checked_at: i64,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -7914,7 +7927,7 @@ pub async fn check_admin_llm_gateway_proxy_config(
             targets: vec![AdminUpstreamProxyCheckTargetView {
                 target: provider_type.to_string(),
                 url: if provider_type == "kiro" {
-                    "https://q.us-east-1.amazonaws.com/getUsageLimits".to_string()
+                    "https://management.us-east-1.kiro.dev/getUsageLimits".to_string()
                 } else {
                     "https://chatgpt.com/backend-api/codex/v1/models".to_string()
                 },

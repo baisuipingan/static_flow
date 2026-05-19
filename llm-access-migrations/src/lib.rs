@@ -98,6 +98,11 @@ const POSTGRES_MIGRATIONS: &[SqlMigration] = &[
         name: "proxy_config_node_overrides",
         sql: include_str!("../migrations/postgres/0011_proxy_config_node_overrides.sql"),
     },
+    SqlMigration {
+        version: 12,
+        name: "proxy_config_endpoint_checks",
+        sql: include_str!("../migrations/postgres/0012_proxy_config_endpoint_checks.sql"),
+    },
 ];
 
 /// Return target SQLite migrations in execution order.

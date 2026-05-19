@@ -918,6 +918,50 @@ pub struct AdminProxyConfig {
     /// Whether this caller may edit slot metadata such as name/create/delete.
     #[serde(default)]
     pub can_edit_slot_metadata: bool,
+    /// Latest Codex endpoint check observed from this node scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_codex_check: Option<AdminProxyEndpointCheck>,
+    /// Latest Kiro endpoint check observed from this node scope.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub latest_kiro_check: Option<AdminProxyEndpointCheck>,
+}
+
+/// Latest connectivity probe result for one proxy/provider endpoint.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct AdminProxyEndpointCheck {
+    /// Probed upstream URL.
+    pub target_url: String,
+    /// Whether the proxy reached the target at transport level.
+    pub reachable: bool,
+    /// HTTP status observed from the target, when available.
+    pub status_code: Option<u16>,
+    /// Measured elapsed time in milliseconds.
+    pub latency_ms: i64,
+    /// Short error or non-success response summary.
+    pub error_message: Option<String>,
+    /// Probe timestamp.
+    pub checked_at: i64,
+}
+
+/// Probe result to persist for one proxy/provider endpoint.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct AdminProxyEndpointCheckUpdate {
+    /// Proxy config id.
+    pub proxy_config_id: String,
+    /// Provider type.
+    pub provider_type: String,
+    /// Probed upstream URL.
+    pub target_url: String,
+    /// Whether the proxy reached the target at transport level.
+    pub reachable: bool,
+    /// HTTP status observed from the target, when available.
+    pub status_code: Option<u16>,
+    /// Measured elapsed time in milliseconds.
+    pub latency_ms: i64,
+    /// Short error or non-success response summary.
+    pub error_message: Option<String>,
+    /// Probe timestamp.
+    pub checked_at_ms: i64,
 }
 
 /// New reusable proxy config row.
@@ -2555,6 +2599,14 @@ pub trait AdminProxyStore: Send + Sync {
         patch: AdminProxyConfigPatch,
     ) -> anyhow::Result<Option<AdminProxyConfig>>;
 
+    /// Persist the latest endpoint connectivity check for this node scope.
+    async fn record_admin_proxy_endpoint_check(
+        &self,
+        _update: AdminProxyEndpointCheckUpdate,
+    ) -> anyhow::Result<Option<AdminProxyConfig>> {
+        anyhow::bail!("proxy endpoint checks are not supported by this store")
+    }
+
     /// Delete one proxy config by id and return the removed row.
     async fn delete_admin_proxy_config(
         &self,
@@ -3235,6 +3287,8 @@ impl AdminProxyStore for EmptyAdminProxyStore {
             effective_source: "core".to_string(),
             has_node_override: false,
             can_edit_slot_metadata: true,
+            latest_codex_check: None,
+            latest_kiro_check: None,
         })
     }
 
