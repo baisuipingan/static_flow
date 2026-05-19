@@ -1915,7 +1915,6 @@ fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
         let feedback = feedback.clone();
         let on_changed = props.on_changed.clone();
         let on_flash = props.on_flash.clone();
-        let can_edit_slot_metadata = can_edit_slot_metadata;
         Callback::from(move |_| {
             let proxy_id = proxy_id.clone();
             let current = (*form).clone();
