@@ -63,11 +63,15 @@ pub(crate) struct CachedCodexStatusLookup {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct CachedProxyConfigsLookup {
+    #[serde(default)]
+    pub generation: i64,
     pub configs: Vec<AdminProxyConfig>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct CachedProxyBindingLookup {
+    #[serde(default)]
+    pub generation: i64,
     pub binding: AdminProxyBinding,
 }
 
@@ -142,6 +146,8 @@ impl From<CachedProxyConfig> for ProviderProxyConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub(crate) struct CachedCodexAccountView {
+    #[serde(default)]
+    pub generation: i64,
     pub account_name: String,
     pub status: String,
     pub map_gpt53_codex_to_spark: bool,
@@ -157,6 +163,8 @@ pub(crate) struct CachedCodexAccountView {
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 pub(crate) struct CachedKiroAccountView {
+    #[serde(default)]
+    pub generation: i64,
     pub account_name: String,
     pub profile_arn: Option<String>,
     pub user_id: Option<String>,
@@ -203,16 +211,21 @@ impl RequestCache {
         format!("{}:status:codex", self.key_prefix)
     }
 
-    pub(crate) fn proxy_configs_key(&self) -> String {
-        format!("{}:proxy:configs", self.key_prefix)
+    pub(crate) fn proxy_configs_key(&self, scope: &str) -> String {
+        format!("{}:proxy:scope:{scope}:configs", self.key_prefix)
     }
 
-    pub(crate) fn proxy_binding_key(&self, provider: &str) -> String {
-        format!("{}:proxy:binding:{provider}", self.key_prefix)
+    pub(crate) fn proxy_binding_key(&self, provider: &str, scope: &str) -> String {
+        format!("{}:proxy:scope:{scope}:binding:{provider}", self.key_prefix)
     }
 
-    pub(crate) fn account_view_key(&self, provider: &str, account_name: &str) -> String {
-        format!("{}:acct:view:{provider}:{account_name}", self.key_prefix)
+    pub(crate) fn account_view_key(
+        &self,
+        provider: &str,
+        account_name: &str,
+        scope: &str,
+    ) -> String {
+        format!("{}:acct:view:scope:{scope}:{provider}:{account_name}", self.key_prefix)
     }
 
     pub(crate) fn account_auth_key(&self, provider: &str, account_name: &str) -> String {
@@ -248,17 +261,27 @@ impl RequestCache {
         deterministic_jitter_ttl(&self.codex_status_key(), CODEX_STATUS_TTL, 0.75, 1.25)
     }
 
-    pub(crate) fn proxy_configs_ttl(&self) -> Duration {
-        deterministic_jitter_ttl(&self.proxy_configs_key(), PROXY_METADATA_TTL, 0.8, 1.2)
+    pub(crate) fn proxy_configs_ttl(&self, scope: &str) -> Duration {
+        deterministic_jitter_ttl(&self.proxy_configs_key(scope), PROXY_METADATA_TTL, 0.8, 1.2)
     }
 
-    pub(crate) fn proxy_binding_ttl(&self, provider: &str) -> Duration {
-        deterministic_jitter_ttl(&self.proxy_binding_key(provider), PROXY_METADATA_TTL, 0.8, 1.2)
-    }
-
-    pub(crate) fn account_view_ttl(&self, provider: &str, account_name: &str) -> Duration {
+    pub(crate) fn proxy_binding_ttl(&self, provider: &str, scope: &str) -> Duration {
         deterministic_jitter_ttl(
-            &self.account_view_key(provider, account_name),
+            &self.proxy_binding_key(provider, scope),
+            PROXY_METADATA_TTL,
+            0.8,
+            1.2,
+        )
+    }
+
+    pub(crate) fn account_view_ttl(
+        &self,
+        provider: &str,
+        account_name: &str,
+        scope: &str,
+    ) -> Duration {
+        deterministic_jitter_ttl(
+            &self.account_view_key(provider, account_name, scope),
             ACCOUNT_VIEW_TTL,
             0.75,
             1.25,
@@ -455,12 +478,24 @@ mod tests {
             "llma:test:req:codex:key-1".to_string()
         );
         assert_eq!(
-            cache.account_view_key("kiro", "acct-1"),
-            "llma:test:acct:view:kiro:acct-1".to_string()
+            cache.account_view_key("kiro", "acct-1", "core"),
+            "llma:test:acct:view:scope:core:kiro:acct-1".to_string()
         );
         assert_eq!(
             cache.account_auth_key("codex", "acct-1"),
             "llma:test:acct:auth:codex:acct-1".to_string()
+        );
+        assert_eq!(
+            cache.proxy_configs_key("edge-a"),
+            "llma:test:proxy:scope:edge-a:configs".to_string()
+        );
+        assert_eq!(
+            cache.proxy_binding_key("kiro", "edge-a"),
+            "llma:test:proxy:scope:edge-a:binding:kiro".to_string()
+        );
+        assert_eq!(
+            cache.account_view_key("kiro", "acct-1", "edge-a"),
+            "llma:test:acct:view:scope:edge-a:kiro:acct-1".to_string()
         );
         assert_eq!(
             cache.dispatch_generation_key("kiro"),
@@ -468,8 +503,6 @@ mod tests {
         );
         assert_eq!(cache.runtime_config_key(), "llma:test:runtime:config".to_string());
         assert_eq!(cache.codex_status_key(), "llma:test:status:codex".to_string());
-        assert_eq!(cache.proxy_configs_key(), "llma:test:proxy:configs".to_string());
-        assert_eq!(cache.proxy_binding_key("codex"), "llma:test:proxy:binding:codex".to_string());
     }
 
     #[test]

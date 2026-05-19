@@ -141,8 +141,16 @@ struct AdminAccountGroupOptionsResponse {
 
 #[derive(Debug, Serialize)]
 struct AdminProxyConfigsResponse {
+    proxy_config_scope: AdminProxyConfigScopeView,
     proxy_configs: Vec<core_store::AdminProxyConfig>,
     generated_at: i64,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AdminProxyConfigScopeView {
+    node_id: String,
+    is_core: bool,
+    can_edit_slot_metadata: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -1024,8 +1032,10 @@ pub(crate) async fn list_llm_gateway_proxy_configs(
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
     }
+    let proxy_config_scope = admin_proxy_config_scope_view(&state).await;
     match state.admin_proxy_store.list_admin_proxy_configs().await {
         Ok(proxy_configs) => Json(AdminProxyConfigsResponse {
+            proxy_config_scope,
             proxy_configs,
             generated_at: now_ms(),
         })
@@ -1041,6 +1051,12 @@ pub(crate) async fn create_llm_gateway_proxy_config(
 ) -> Response {
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
+    }
+    if !admin_proxy_config_scope_view(&state)
+        .await
+        .can_edit_slot_metadata
+    {
+        return bad_request("proxy slots can only be created on the core node").into_response();
     }
     let name = match normalize_name(&request.name) {
         Ok(name) => name,
@@ -1077,6 +1093,14 @@ pub(crate) async fn patch_llm_gateway_proxy_config(
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
     }
+    if request.name.is_some()
+        && !admin_proxy_config_scope_view(&state)
+            .await
+            .can_edit_slot_metadata
+    {
+        return bad_request("proxy slot names can only be changed on the core node")
+            .into_response();
+    }
     let patch = match normalize_proxy_config_patch(request) {
         Ok(patch) => patch,
         Err(response) => return response.into_response(),
@@ -1099,6 +1123,12 @@ pub(crate) async fn delete_llm_gateway_proxy_config(
 ) -> Response {
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
+    }
+    if !admin_proxy_config_scope_view(&state)
+        .await
+        .can_edit_slot_metadata
+    {
+        return bad_request("proxy slots can only be deleted on the core node").into_response();
     }
     let bindings = match state.admin_proxy_store.list_admin_proxy_bindings().await {
         Ok(bindings) => bindings,
@@ -1128,6 +1158,27 @@ pub(crate) async fn delete_llm_gateway_proxy_config(
         .into_response(),
         Ok(None) => not_found("LLM gateway proxy config not found").into_response(),
         Err(_) => internal_error("Failed to delete llm gateway proxy config").into_response(),
+    }
+}
+
+pub(crate) async fn reset_llm_gateway_proxy_config_override(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    Path(proxy_id): Path<String>,
+) -> Response {
+    if let Err(response) = ensure_admin_access(&headers) {
+        return response.into_response();
+    }
+    match state
+        .admin_proxy_store
+        .reset_admin_proxy_config_override(&proxy_id)
+        .await
+    {
+        Ok(Some(proxy)) => Json(proxy).into_response(),
+        Ok(None) => not_found("LLM gateway proxy config not found").into_response(),
+        Err(_) => {
+            internal_error("Failed to reset llm gateway proxy config override").into_response()
+        },
     }
 }
 
@@ -6101,6 +6152,25 @@ fn is_local_host_header(headers: &HeaderMap) -> bool {
         .parse::<IpAddr>()
         .map(is_private_or_loopback_ip)
         .unwrap_or(false)
+}
+
+async fn admin_proxy_config_scope_view(state: &HttpState) -> AdminProxyConfigScopeView {
+    match state.cluster_state.as_ref() {
+        Some(cluster_state) => {
+            let snapshot = cluster_state.snapshot().await;
+            let is_core = snapshot.node.node_class == crate::cluster::NodeClass::Core;
+            AdminProxyConfigScopeView {
+                node_id: snapshot.node.node_id,
+                is_core,
+                can_edit_slot_metadata: is_core,
+            }
+        },
+        None => AdminProxyConfigScopeView {
+            node_id: "core".to_string(),
+            is_core: true,
+            can_edit_slot_metadata: true,
+        },
+    }
 }
 
 fn bad_request(message: &str) -> AdminHttpError {

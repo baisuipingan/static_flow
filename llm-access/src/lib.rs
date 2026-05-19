@@ -43,7 +43,7 @@ use axum::{
     http::{HeaderValue, Request},
     middleware,
     response::Response,
-    routing::{any, get, post},
+    routing::{any, delete, get, post},
     Json, Router,
 };
 use config::{CliCommand, ControlStoreConfig, ServeConfig, StorageConfig};
@@ -250,6 +250,10 @@ pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
         .route(
             "/admin/llm-gateway/proxy-configs/:proxy_id/check/:provider_type",
             post(admin::check_llm_gateway_proxy_config),
+        )
+        .route(
+            "/admin/llm-gateway/proxy-configs/:proxy_id/override",
+            delete(admin::reset_llm_gateway_proxy_config_override),
         )
         .route(
             "/admin/llm-gateway/proxy-configs/import-legacy-kiro",

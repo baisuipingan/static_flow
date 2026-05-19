@@ -35,10 +35,10 @@ use crate::{
         patch_admin_llm_gateway_account, patch_admin_llm_gateway_account_group,
         patch_admin_llm_gateway_key, patch_admin_llm_gateway_proxy_config,
         probe_admin_llm_gateway_account_models, refresh_admin_llm_gateway_account_auth,
-        refresh_admin_llm_gateway_account_usage, update_admin_llm_gateway_config,
-        update_admin_llm_gateway_proxy_binding, AccountSummaryView, AdminAccountGroupOptionView,
-        AdminAccountGroupView, AdminAccountsSummaryView,
-        AdminLlmGatewayAccountContributionRequestView,
+        refresh_admin_llm_gateway_account_usage, reset_admin_llm_gateway_proxy_config_override,
+        update_admin_llm_gateway_config, update_admin_llm_gateway_proxy_binding,
+        AccountSummaryView, AdminAccountGroupOptionView, AdminAccountGroupView,
+        AdminAccountsSummaryView, AdminLlmGatewayAccountContributionRequestView,
         AdminLlmGatewayAccountContributionRequestsQuery, AdminLlmGatewayAccountPageQuery,
         AdminLlmGatewayKeyPageQuery, AdminLlmGatewayKeyView, AdminLlmGatewayKeysSummaryView,
         AdminLlmGatewaySponsorRequestView, AdminLlmGatewaySponsorRequestsQuery,
@@ -46,13 +46,14 @@ use crate::{
         AdminLlmGatewayUsageEventDetailView, AdminLlmGatewayUsageEventView,
         AdminLlmGatewayUsageEventsQuery, AdminLlmGatewayUsageFilterOptionsResponse,
         AdminUpstreamProxyBindingView, AdminUpstreamProxyCheckResponse,
-        AdminUpstreamProxyCheckTargetView, AdminUpstreamProxyConfigView, AdminUsageJournalFileView,
-        AdminUsageJournalPreviewResponse, AdminUsageJournalStatusView, AdminUsageTotalsView,
-        CodexAccountImportJobDetailView, CodexAccountImportJobSummaryView,
-        CreateAdminAccountGroupInput, CreateAdminUpstreamProxyConfigInput, LlmGatewayRuntimeConfig,
-        PatchAdminAccountGroupInput, PatchAdminLlmGatewayAccountInput,
-        PatchAdminLlmGatewayKeyRequest, PatchAdminUpstreamProxyConfigInput,
-        ProcessMemoryRuntimeStats, DEFAULT_LLM_GATEWAY_CODEX_CLIENT_VERSION,
+        AdminUpstreamProxyCheckTargetView, AdminUpstreamProxyConfigScopeView,
+        AdminUpstreamProxyConfigView, AdminUsageJournalFileView, AdminUsageJournalPreviewResponse,
+        AdminUsageJournalStatusView, AdminUsageTotalsView, CodexAccountImportJobDetailView,
+        CodexAccountImportJobSummaryView, CreateAdminAccountGroupInput,
+        CreateAdminUpstreamProxyConfigInput, LlmGatewayRuntimeConfig, PatchAdminAccountGroupInput,
+        PatchAdminLlmGatewayAccountInput, PatchAdminLlmGatewayKeyRequest,
+        PatchAdminUpstreamProxyConfigInput, ProcessMemoryRuntimeStats,
+        DEFAULT_LLM_GATEWAY_CODEX_CLIENT_VERSION,
     },
     components::{
         date_range_picker::DateRangePicker, pagination::Pagination, search_box::SearchBox,
@@ -1884,6 +1885,16 @@ impl Default for CreateKeyForm {
 #[function_component(ProxyConfigEditorCard)]
 fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
     let proxy_config = props.proxy_config.clone();
+    let can_edit_slot_metadata = proxy_config.can_edit_slot_metadata;
+    let scope_node_label = proxy_config
+        .scope_node_id
+        .clone()
+        .unwrap_or_else(|| "core".to_string());
+    let effective_source_label = match proxy_config.effective_source.as_str() {
+        "node_override" => "本机覆盖",
+        "core" => "继承 core",
+        other => other,
+    };
     let form = use_state(|| ProxyForm::from_config(&proxy_config));
     let saving = use_state(|| false);
     let checking = use_state(|| false);
@@ -1904,11 +1915,16 @@ fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
         let feedback = feedback.clone();
         let on_changed = props.on_changed.clone();
         let on_flash = props.on_flash.clone();
+        let can_edit_slot_metadata = can_edit_slot_metadata;
         Callback::from(move |_| {
             let proxy_id = proxy_id.clone();
             let current = (*form).clone();
             let input = PatchAdminUpstreamProxyConfigInput {
-                name: Some(current.name.trim().to_string()),
+                name: if can_edit_slot_metadata {
+                    Some(current.name.trim().to_string())
+                } else {
+                    None
+                },
                 proxy_url: Some(current.proxy_url.trim().to_string()),
                 proxy_username: {
                     let value = current.proxy_username.trim().to_string();
@@ -1983,6 +1999,40 @@ fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
         })
     };
 
+    let on_reset_override = {
+        let proxy_id = proxy_config.id.clone();
+        let saving = saving.clone();
+        let feedback = feedback.clone();
+        let on_changed = props.on_changed.clone();
+        let on_flash = props.on_flash.clone();
+        Callback::from(move |_| {
+            if !confirm_destructive("确认移除这个节点上的代理覆盖？移除后会继承 core 配置。")
+            {
+                return;
+            }
+            let proxy_id = proxy_id.clone();
+            let saving = saving.clone();
+            let feedback = feedback.clone();
+            let on_changed = on_changed.clone();
+            let on_flash = on_flash.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                saving.set(true);
+                match reset_admin_llm_gateway_proxy_config_override(&proxy_id).await {
+                    Ok(_) => {
+                        feedback.set(Some("Override reset.".to_string()));
+                        on_flash.emit(("已移除本机代理覆盖".to_string(), false));
+                        on_changed.emit(());
+                    },
+                    Err(err) => {
+                        feedback.set(Some(err.clone()));
+                        on_flash.emit((format!("移除本机代理覆盖失败\n{err}"), true));
+                    },
+                }
+                saving.set(false);
+            });
+        })
+    };
+
     let on_check_provider = {
         let proxy_id = proxy_config.id.clone();
         let checking = checking.clone();
@@ -2031,6 +2081,12 @@ fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
                             if props.proxy_config.status == "active" { "bg-emerald-500/12 text-emerald-700 dark:text-emerald-200" } else { "bg-slate-500/12 text-slate-700 dark:text-slate-200" })}>
                             { props.proxy_config.status.clone() }
                         </span>
+                        <span class={classes!("inline-flex", "items-center", "rounded-full", "bg-cyan-500/12", "px-2.5", "py-1", "text-[11px]", "font-semibold", "text-cyan-700", "dark:text-cyan-200")}>
+                            { effective_source_label }
+                        </span>
+                        <span class={classes!("inline-flex", "items-center", "rounded-full", "bg-[var(--surface-alt)]", "px-2.5", "py-1", "text-[11px]", "font-semibold", "text-[var(--muted)]")}>
+                            { format!("scope: {}", scope_node_label) }
+                        </span>
                     </div>
                     <p class={classes!("mt-2", "mb-0", "text-xs", "font-mono", "text-[var(--muted)]")}>
                         { format!("created {} · updated {}", format_ms(props.proxy_config.created_at), format_ms(props.proxy_config.updated_at)) }
@@ -2048,6 +2104,7 @@ fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
                         type="text"
                         class={classes!("mt-1", "w-full", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface-alt)]", "px-3", "py-2")}
                         value={form.name.clone()}
+                        disabled={!can_edit_slot_metadata}
                         oninput={{
                             let form = form.clone();
                             Callback::from(move |event: InputEvent| {
@@ -2186,9 +2243,16 @@ fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
                 <button class={classes!("btn-terminal", "btn-terminal-primary")} onclick={on_save.clone()} disabled={*saving}>
                     { if *saving { "保存中..." } else { "保存" } }
                 </button>
-                <button class={classes!("btn-terminal", "text-red-600", "dark:text-red-400")} onclick={on_delete} disabled={*saving}>
-                    { "删除" }
-                </button>
+                if props.proxy_config.has_node_override {
+                    <button class={classes!("btn-terminal")} onclick={on_reset_override} disabled={*saving}>
+                        { "移除本机覆盖" }
+                    </button>
+                }
+                if can_edit_slot_metadata {
+                    <button class={classes!("btn-terminal", "text-red-600", "dark:text-red-400")} onclick={on_delete} disabled={*saving}>
+                        { "删除" }
+                    </button>
+                }
             </div>
 
             if let Some(feedback) = (*feedback).clone() {
@@ -2289,6 +2353,7 @@ pub fn admin_llm_gateway_page() -> Html {
     let duckdb_usage_checkpoint_threshold_mib_input = use_state(|| "16".to_string());
     let usage_analytics_retention_days_input = use_state(|| "7".to_string());
     let proxy_configs = use_state(Vec::<AdminUpstreamProxyConfigView>::new);
+    let proxy_config_scope = use_state(AdminUpstreamProxyConfigScopeView::default);
     let proxy_bindings = use_state(Vec::<AdminUpstreamProxyBindingView>::new);
     let create_proxy_name = use_state(|| "shared-upstream".to_string());
     let create_proxy_url = use_state(|| "http://127.0.0.1:11111".to_string());
@@ -2656,6 +2721,7 @@ pub fn admin_llm_gateway_page() -> Html {
         let keys_page_limit = keys_page_limit.clone();
         let account_group_options = account_group_options.clone();
         let proxy_configs = proxy_configs.clone();
+        let proxy_config_scope = proxy_config_scope.clone();
         let proxy_bindings = proxy_bindings.clone();
         let account_groups_page_items = account_groups_page_items.clone();
         let account_groups_total = account_groups_total.clone();
@@ -2716,6 +2782,7 @@ pub fn admin_llm_gateway_page() -> Html {
             let keys_page_limit = keys_page_limit.clone();
             let account_group_options = account_group_options.clone();
             let proxy_configs = proxy_configs.clone();
+            let proxy_config_scope = proxy_config_scope.clone();
             let proxy_bindings = proxy_bindings.clone();
             let account_groups_page_items = account_groups_page_items.clone();
             let account_groups_total = account_groups_total.clone();
@@ -2897,6 +2964,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         cfg,
                         key_summary_resp,
                         account_summary_resp,
+                        proxy_configs_resp.proxy_config_scope,
                         proxy_configs_resp.proxy_configs,
                         proxy_bindings_resp.bindings,
                         keys_resp,
@@ -2914,6 +2982,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         cfg,
                         key_summary_resp,
                         account_summary_resp,
+                        proxy_config_scope_resp,
                         proxy_config_items,
                         proxy_binding_items,
                         keys_resp,
@@ -2960,6 +3029,7 @@ pub fn admin_llm_gateway_page() -> Html {
                         config.set(Some(cfg));
                         keys_summary.set(key_summary_resp.summary);
                         accounts_summary.set(account_summary_resp.summary);
+                        proxy_config_scope.set(proxy_config_scope_resp);
                         let codex_bound = proxy_binding_items
                             .iter()
                             .find(|item| item.provider_type == "codex")
@@ -3478,10 +3548,15 @@ pub fn admin_llm_gateway_page() -> Html {
         let create_proxy_username = create_proxy_username.clone();
         let create_proxy_password = create_proxy_password.clone();
         let creating_proxy = creating_proxy.clone();
+        let proxy_config_scope = proxy_config_scope.clone();
         let load_error = load_error.clone();
         let flash = flash.clone();
         let reload = reload.clone();
         Callback::from(move |_| {
+            if !proxy_config_scope.can_edit_slot_metadata {
+                flash.emit(("只有 core 节点可以创建代理槽位".to_string(), true));
+                return;
+            }
             let input = CreateAdminUpstreamProxyConfigInput {
                 name: (*create_proxy_name).trim().to_string(),
                 proxy_url: (*create_proxy_url).trim().to_string(),
@@ -5662,6 +5737,19 @@ pub fn admin_llm_gateway_page() -> Html {
             proxy_config_active_query.set(String::new());
         })
     };
+    let proxy_scope_view = (*proxy_config_scope).clone();
+    let can_create_proxy_config = proxy_scope_view.can_edit_slot_metadata;
+    let proxy_scope_summary = if proxy_scope_view.is_core {
+        format!(
+            "当前节点 {} 使用 core 代理槽位，可创建、删除和重命名槽位。",
+            proxy_scope_view.node_id
+        )
+    } else {
+        format!(
+            "当前节点 {} 继承 core 代理槽位，只能修改本机代理地址、凭据和状态。",
+            proxy_scope_view.node_id
+        )
+    };
 
     html! {
         <main class={classes!(
@@ -6919,6 +7007,9 @@ pub fn admin_llm_gateway_page() -> Html {
 
                     <section class={classes!("rounded-xl", "border", "border-[var(--border)]", "bg-[var(--surface)]", "p-5")}>
                         <h2 class={classes!("m-0", "font-mono", "text-base", "font-bold", "text-[var(--text)]")}>{ "Proxy Config Inventory" }</h2>
+                        <p class={classes!("mt-2", "mb-0", "text-xs", "text-[var(--muted)]")}>
+                            { proxy_scope_summary }
+                        </p>
                         <div class={classes!("mt-3", "grid", "gap-3", "md:grid-cols-2")}>
                             <label class={classes!("text-sm")}>
                                 <span class={classes!("text-[var(--muted)]")}>{ "Name" }</span>
@@ -6926,6 +7017,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                     type="text"
                                     class={classes!("mt-1", "w-full", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2")}
                                     value={(*create_proxy_name).clone()}
+                                    disabled={!can_create_proxy_config}
                                     oninput={{
                                         let create_proxy_name = create_proxy_name.clone();
                                         Callback::from(move |event: InputEvent| {
@@ -6942,6 +7034,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                     type="text"
                                     class={classes!("mt-1", "w-full", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2", "font-mono")}
                                     value={(*create_proxy_url).clone()}
+                                    disabled={!can_create_proxy_config}
                                     oninput={{
                                         let create_proxy_url = create_proxy_url.clone();
                                         Callback::from(move |event: InputEvent| {
@@ -6958,6 +7051,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                     type="text"
                                     class={classes!("mt-1", "w-full", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2")}
                                     value={(*create_proxy_username).clone()}
+                                    disabled={!can_create_proxy_config}
                                     oninput={{
                                         let create_proxy_username = create_proxy_username.clone();
                                         Callback::from(move |event: InputEvent| {
@@ -6974,6 +7068,7 @@ pub fn admin_llm_gateway_page() -> Html {
                                     type="text"
                                     class={classes!("mt-1", "w-full", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface)]", "px-3", "py-2")}
                                     value={(*create_proxy_password).clone()}
+                                    disabled={!can_create_proxy_config}
                                     oninput={{
                                         let create_proxy_password = create_proxy_password.clone();
                                         Callback::from(move |event: InputEvent| {
@@ -6985,8 +7080,8 @@ pub fn admin_llm_gateway_page() -> Html {
                                 />
                             </label>
                             <div class={classes!("md:col-span-2")}>
-                                <button class={classes!("btn-terminal", "btn-terminal-primary")} onclick={on_create_proxy_config} disabled={*creating_proxy}>
-                                    { if *creating_proxy { "创建中..." } else { "创建代理配置" } }
+                                <button class={classes!("btn-terminal", "btn-terminal-primary")} onclick={on_create_proxy_config} disabled={*creating_proxy || !can_create_proxy_config}>
+                                    { if *creating_proxy { "创建中..." } else if can_create_proxy_config { "创建代理配置" } else { "edge 节点不可创建槽位" } }
                                 </button>
                             </div>
                         </div>

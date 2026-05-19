@@ -5023,6 +5023,10 @@ fn decode_admin_proxy_config(row: &rusqlite::Row<'_>) -> rusqlite::Result<AdminP
         status: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
+        scope_node_id: None,
+        effective_source: "core".to_string(),
+        has_node_override: false,
+        can_edit_slot_metadata: true,
     })
 }
 

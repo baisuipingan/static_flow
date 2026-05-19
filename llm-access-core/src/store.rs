@@ -906,6 +906,18 @@ pub struct AdminProxyConfig {
     pub created_at: i64,
     /// Update timestamp.
     pub updated_at: i64,
+    /// Node id used to resolve the effective proxy value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scope_node_id: Option<String>,
+    /// Source used to produce the effective proxy fields.
+    #[serde(default)]
+    pub effective_source: String,
+    /// Whether this row has a node-local override.
+    #[serde(default)]
+    pub has_node_override: bool,
+    /// Whether this caller may edit slot metadata such as name/create/delete.
+    #[serde(default)]
+    pub can_edit_slot_metadata: bool,
 }
 
 /// New reusable proxy config row.
@@ -2549,6 +2561,14 @@ pub trait AdminProxyStore: Send + Sync {
         proxy_id: &str,
     ) -> anyhow::Result<Option<AdminProxyConfig>>;
 
+    /// Reset the current node-local override for one proxy config.
+    async fn reset_admin_proxy_config_override(
+        &self,
+        _proxy_id: &str,
+    ) -> anyhow::Result<Option<AdminProxyConfig>> {
+        anyhow::bail!("proxy config overrides are not supported by this store")
+    }
+
     /// List effective provider-level proxy bindings.
     async fn list_admin_proxy_bindings(&self) -> anyhow::Result<Vec<AdminProxyBinding>>;
 
@@ -3211,6 +3231,10 @@ impl AdminProxyStore for EmptyAdminProxyStore {
             status: KEY_STATUS_ACTIVE.to_string(),
             created_at: proxy.created_at_ms,
             updated_at: proxy.created_at_ms,
+            scope_node_id: None,
+            effective_source: "core".to_string(),
+            has_node_override: false,
+            can_edit_slot_metadata: true,
         })
     }
 

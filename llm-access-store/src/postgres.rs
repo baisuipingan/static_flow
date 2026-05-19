@@ -317,6 +317,7 @@ pub struct PostgresControlRepository {
     client: SqlxClient,
     codex_status_cache: Arc<RwLock<Option<CachedCodexRateLimitStatus>>>,
     request_cache: Option<RequestCache>,
+    proxy_scope: ProxyConfigScope,
 }
 
 #[derive(Debug, Clone)]
@@ -342,6 +343,53 @@ struct CodexAdminAccountViewContext {
 struct ProviderProxyResolutionContext {
     proxy_configs_by_id: BTreeMap<String, AdminProxyConfig>,
     binding: AdminProxyBinding,
+}
+
+/// Node-local scope used to resolve effective proxy slot contents.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProxyConfigScope {
+    node_id: String,
+    is_core: bool,
+}
+
+impl ProxyConfigScope {
+    /// Default core scope used when cluster identity is not configured.
+    pub fn core() -> Self {
+        Self {
+            node_id: "core".to_string(),
+            is_core: true,
+        }
+    }
+
+    /// Non-core node scope keyed by the configured node id.
+    pub fn node(node_id: impl Into<String>) -> Self {
+        Self {
+            node_id: node_id.into(),
+            is_core: false,
+        }
+    }
+
+    fn cache_key_segment(&self) -> &str {
+        &self.node_id
+    }
+
+    fn scope_node_id(&self) -> Option<String> {
+        Some(self.node_id.clone())
+    }
+
+    fn can_edit_slot_metadata(&self) -> bool {
+        self.is_core
+    }
+}
+
+#[derive(Debug, Clone)]
+struct ProxyConfigNodeOverride {
+    proxy_url: String,
+    proxy_username: Option<String>,
+    proxy_password: Option<String>,
+    status: String,
+    created_at_ms: i64,
+    updated_at_ms: i64,
 }
 
 #[derive(Debug, Clone)]
@@ -427,6 +475,17 @@ impl PostgresControlRepository {
         database_url: &str,
         request_cache_config: Option<RequestCacheConfig>,
     ) -> anyhow::Result<Self> {
+        Self::connect_with_proxy_scope(database_url, request_cache_config, ProxyConfigScope::core())
+            .await
+    }
+
+    /// Connect to the Postgres control plane with an explicit proxy resolution
+    /// scope.
+    pub async fn connect_with_proxy_scope(
+        database_url: &str,
+        request_cache_config: Option<RequestCacheConfig>,
+        proxy_scope: ProxyConfigScope,
+    ) -> anyhow::Result<Self> {
         let client = SqlxClient::connect(database_url).await?;
         llm_access_migrations::run_postgres_migrations(&client.pool).await?;
         let request_cache = request_cache_config.map(RequestCache::new).transpose()?;
@@ -434,6 +493,7 @@ impl PostgresControlRepository {
             client,
             codex_status_cache: Arc::new(RwLock::new(None)),
             request_cache,
+            proxy_scope,
         })
     }
 
@@ -566,12 +626,15 @@ impl PostgresControlRepository {
         let Some(cache) = self.request_cache.as_ref() else {
             return self.list_admin_proxy_configs_rows().await;
         };
-        let cache_key = cache.proxy_configs_key();
+        let generation = self.current_proxy_metadata_generation().await;
+        let scope = self.proxy_scope.cache_key_segment();
+        let cache_key = cache.proxy_configs_key(scope);
         match cache
             .get_json::<crate::request_cache::CachedProxyConfigsLookup>(&cache_key)
             .await
         {
-            Ok(Some(lookup)) => return Ok(lookup.configs),
+            Ok(Some(lookup)) if lookup.generation == generation => return Ok(lookup.configs),
+            Ok(Some(_)) => {},
             Ok(None) => {},
             Err(err) => {
                 tracing::warn!(
@@ -583,10 +646,11 @@ impl PostgresControlRepository {
         }
         let configs = self.list_admin_proxy_configs_rows().await?;
         let lookup = crate::request_cache::CachedProxyConfigsLookup {
+            generation,
             configs: configs.clone(),
         };
         if let Err(err) = cache
-            .set_json(&cache_key, &lookup, cache.proxy_configs_ttl())
+            .set_json(&cache_key, &lookup, cache.proxy_configs_ttl(scope))
             .await
         {
             tracing::warn!(
@@ -605,12 +669,15 @@ impl PostgresControlRepository {
         let Some(cache) = self.request_cache.as_ref() else {
             return self.load_admin_proxy_binding_row(provider_type).await;
         };
-        let cache_key = cache.proxy_binding_key(provider_type);
+        let generation = self.current_dispatch_generation(provider_type).await;
+        let scope = self.proxy_scope.cache_key_segment();
+        let cache_key = cache.proxy_binding_key(provider_type, scope);
         match cache
             .get_json::<crate::request_cache::CachedProxyBindingLookup>(&cache_key)
             .await
         {
-            Ok(Some(lookup)) => return Ok(lookup.binding),
+            Ok(Some(lookup)) if lookup.generation == generation => return Ok(lookup.binding),
+            Ok(Some(_)) => {},
             Ok(None) => {},
             Err(err) => {
                 tracing::warn!(
@@ -631,10 +698,11 @@ impl PostgresControlRepository {
             .load_admin_proxy_binding_from_configs(provider_type, &proxy_configs_by_id)
             .await?;
         let lookup = crate::request_cache::CachedProxyBindingLookup {
+            generation,
             binding: binding.clone(),
         };
         if let Err(err) = cache
-            .set_json(&cache_key, &lookup, cache.proxy_binding_ttl(provider_type))
+            .set_json(&cache_key, &lookup, cache.proxy_binding_ttl(provider_type, scope))
             .await
         {
             tracing::warn!(
@@ -651,9 +719,10 @@ impl PostgresControlRepository {
         let Some(cache) = self.request_cache.as_ref() else {
             return;
         };
-        let configs_key = cache.proxy_configs_key();
-        let codex_binding_key = cache.proxy_binding_key(core_store::PROVIDER_CODEX);
-        let kiro_binding_key = cache.proxy_binding_key(core_store::PROVIDER_KIRO);
+        let scope = self.proxy_scope.cache_key_segment();
+        let configs_key = cache.proxy_configs_key(scope);
+        let codex_binding_key = cache.proxy_binding_key(core_store::PROVIDER_CODEX, scope);
+        let kiro_binding_key = cache.proxy_binding_key(core_store::PROVIDER_KIRO, scope);
         if let Err(err) = cache
             .delete_many([
                 configs_key.as_str(),
@@ -664,6 +733,16 @@ impl PostgresControlRepository {
         {
             tracing::warn!(error = %err, "failed to invalidate proxy metadata cache");
         }
+    }
+
+    async fn current_proxy_metadata_generation(&self) -> i64 {
+        let codex = self
+            .current_dispatch_generation(core_store::PROVIDER_CODEX)
+            .await;
+        let kiro = self
+            .current_dispatch_generation(core_store::PROVIDER_KIRO)
+            .await;
+        codex.max(kiro)
     }
 
     async fn load_authenticated_key_by_hash(
@@ -866,7 +945,8 @@ impl PostgresControlRepository {
         let Some(cache) = self.request_cache.as_ref() else {
             return;
         };
-        let view_key = cache.account_view_key(provider, account_name);
+        let scope = self.proxy_scope.cache_key_segment();
+        let view_key = cache.account_view_key(provider, account_name, scope);
         let auth_key = cache.account_auth_key(provider, account_name);
         if let Err(err) = cache
             .delete_many([view_key.as_str(), auth_key.as_str()])
@@ -908,9 +988,10 @@ impl PostgresControlRepository {
             },
             _ => return,
         };
+        let scope = self.proxy_scope.cache_key_segment();
         let view_keys = account_names
             .iter()
-            .map(|name| cache.account_view_key(provider, name))
+            .map(|name| cache.account_view_key(provider, name, scope))
             .collect::<Vec<_>>();
         let view_key_refs = view_keys.iter().map(String::as_str).collect::<Vec<_>>();
         if let Err(err) = cache.delete_many(view_key_refs).await {
@@ -1170,6 +1251,7 @@ impl PostgresControlRepository {
                     )?;
                     Ok((row.account_name.clone(), crate::request_cache::CachedCodexAccountView {
                         account_name: row.account_name,
+                        generation: 0,
                         status: row.status,
                         map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
                         auth_refresh_enabled: settings.auth_refresh_enabled,
@@ -1185,9 +1267,13 @@ impl PostgresControlRepository {
                 .collect();
         };
 
+        let generation = self
+            .current_dispatch_generation(core_store::PROVIDER_CODEX)
+            .await;
+        let scope = self.proxy_scope.cache_key_segment();
         let cache_keys = account_names
             .iter()
-            .map(|name| cache.account_view_key(core_store::PROVIDER_CODEX, name))
+            .map(|name| cache.account_view_key(core_store::PROVIDER_CODEX, name, scope))
             .collect::<Vec<_>>();
         let cached_values = match cache
             .mget_json::<crate::request_cache::CachedCodexAccountView>(&cache_keys)
@@ -1202,7 +1288,7 @@ impl PostgresControlRepository {
         let mut views_by_name = BTreeMap::new();
         let mut missing = Vec::new();
         for (account_name, cached) in account_names.iter().cloned().zip(cached_values.into_iter()) {
-            if let Some(view) = cached {
+            if let Some(view) = cached.filter(|view| view.generation == generation) {
                 views_by_name.insert(account_name, view);
             } else {
                 missing.push(account_name);
@@ -1226,6 +1312,7 @@ impl PostgresControlRepository {
             )?;
             let view = crate::request_cache::CachedCodexAccountView {
                 account_name: row.account_name.clone(),
+                generation,
                 status: row.status,
                 map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
                 auth_refresh_enabled: settings.auth_refresh_enabled,
@@ -1237,12 +1324,13 @@ impl PostgresControlRepository {
                 access_token: row.access_token,
                 proxy: cached_proxy_from_option(proxy),
             };
-            let cache_key = cache.account_view_key(core_store::PROVIDER_CODEX, &row.account_name);
+            let cache_key =
+                cache.account_view_key(core_store::PROVIDER_CODEX, &row.account_name, scope);
             if let Err(err) = cache
                 .set_json(
                     &cache_key,
                     &view,
-                    cache.account_view_ttl(core_store::PROVIDER_CODEX, &row.account_name),
+                    cache.account_view_ttl(core_store::PROVIDER_CODEX, &row.account_name, scope),
                 )
                 .await
             {
@@ -1280,15 +1368,20 @@ impl PostgresControlRepository {
                         &row,
                         status_by_account.get(&row.account_name).cloned(),
                         &proxy_context,
+                        0,
                     )
                 })
                 .map(|result| result.map(|view| (view.account_name.clone(), view)))
                 .collect();
         };
 
+        let generation = self
+            .current_dispatch_generation(core_store::PROVIDER_KIRO)
+            .await;
+        let scope = self.proxy_scope.cache_key_segment();
         let cache_keys = account_names
             .iter()
-            .map(|name| cache.account_view_key(core_store::PROVIDER_KIRO, name))
+            .map(|name| cache.account_view_key(core_store::PROVIDER_KIRO, name, scope))
             .collect::<Vec<_>>();
         let cached_values = match cache
             .mget_json::<crate::request_cache::CachedKiroAccountView>(&cache_keys)
@@ -1303,7 +1396,7 @@ impl PostgresControlRepository {
         let mut views_by_name = BTreeMap::new();
         let mut missing = Vec::new();
         for (account_name, cached) in account_names.iter().cloned().zip(cached_values.into_iter()) {
-            if let Some(view) = cached {
+            if let Some(view) = cached.filter(|view| view.generation == generation) {
                 views_by_name.insert(account_name, view);
             } else {
                 missing.push(account_name);
@@ -1326,13 +1419,15 @@ impl PostgresControlRepository {
                 &row,
                 status_by_account.get(&row.account_name).cloned(),
                 &proxy_context,
+                generation,
             )?;
-            let cache_key = cache.account_view_key(core_store::PROVIDER_KIRO, &view.account_name);
+            let cache_key =
+                cache.account_view_key(core_store::PROVIDER_KIRO, &view.account_name, scope);
             if let Err(err) = cache
                 .set_json(
                     &cache_key,
                     &view,
-                    cache.account_view_ttl(core_store::PROVIDER_KIRO, &view.account_name),
+                    cache.account_view_ttl(core_store::PROVIDER_KIRO, &view.account_name, scope),
                 )
                 .await
             {
@@ -2238,7 +2333,7 @@ impl PostgresControlRepository {
         row.map(decode_admin_account_group_row).transpose()
     }
 
-    async fn list_admin_proxy_configs_rows(&self) -> anyhow::Result<Vec<AdminProxyConfig>> {
+    async fn list_admin_proxy_config_base_rows(&self) -> anyhow::Result<Vec<AdminProxyConfig>> {
         self.ensure_connection_alive()?;
         let rows = self
             .client
@@ -2257,7 +2352,27 @@ impl PostgresControlRepository {
             .collect())
     }
 
-    async fn get_admin_proxy_config_row(
+    async fn list_admin_proxy_configs_rows(&self) -> anyhow::Result<Vec<AdminProxyConfig>> {
+        let mut proxies = self.list_admin_proxy_config_base_rows().await?;
+        if self.proxy_scope.can_edit_slot_metadata() {
+            for proxy in &mut proxies {
+                self.apply_proxy_scope_metadata(proxy, "core", false);
+            }
+            return Ok(proxies);
+        }
+        let overrides = self.list_proxy_config_node_overrides().await?;
+        for proxy in &mut proxies {
+            if let Some(override_row) = overrides.get(&proxy.id) {
+                apply_proxy_config_node_override(proxy, override_row);
+                self.apply_proxy_scope_metadata(proxy, "node_override", true);
+            } else {
+                self.apply_proxy_scope_metadata(proxy, "core", false);
+            }
+        }
+        Ok(proxies)
+    }
+
+    async fn get_admin_proxy_config_base_row(
         &self,
         proxy_id: &str,
     ) -> anyhow::Result<Option<AdminProxyConfig>> {
@@ -2274,6 +2389,171 @@ impl PostgresControlRepository {
             .await
             .context("load admin proxy config")?;
         Ok(row.map(decode_admin_proxy_config_row))
+    }
+
+    async fn get_admin_proxy_config_row(
+        &self,
+        proxy_id: &str,
+    ) -> anyhow::Result<Option<AdminProxyConfig>> {
+        let Some(mut proxy) = self.get_admin_proxy_config_base_row(proxy_id).await? else {
+            return Ok(None);
+        };
+        if self.proxy_scope.can_edit_slot_metadata() {
+            self.apply_proxy_scope_metadata(&mut proxy, "core", false);
+            return Ok(Some(proxy));
+        }
+        match self.get_proxy_config_node_override(proxy_id).await? {
+            Some(override_row) => {
+                apply_proxy_config_node_override(&mut proxy, &override_row);
+                self.apply_proxy_scope_metadata(&mut proxy, "node_override", true);
+            },
+            None => self.apply_proxy_scope_metadata(&mut proxy, "core", false),
+        }
+        Ok(Some(proxy))
+    }
+
+    async fn list_proxy_config_node_overrides(
+        &self,
+    ) -> anyhow::Result<BTreeMap<String, ProxyConfigNodeOverride>> {
+        self.ensure_connection_alive()?;
+        let rows = self
+            .client
+            .query(
+                "SELECT proxy_config_id, proxy_url, proxy_username, proxy_password,
+                    status, created_at_ms, updated_at_ms
+                 FROM llm_proxy_config_node_overrides
+                 WHERE node_id = $1",
+                &[&self.proxy_scope.node_id],
+            )
+            .await
+            .context("list postgres proxy config node overrides")?;
+        Ok(rows
+            .into_iter()
+            .map(|row| {
+                (row.get::<_, String>(0), ProxyConfigNodeOverride {
+                    proxy_url: row.get(1),
+                    proxy_username: row.get(2),
+                    proxy_password: row.get(3),
+                    status: row.get(4),
+                    created_at_ms: row.get(5),
+                    updated_at_ms: row.get(6),
+                })
+            })
+            .collect())
+    }
+
+    async fn get_proxy_config_node_override(
+        &self,
+        proxy_id: &str,
+    ) -> anyhow::Result<Option<ProxyConfigNodeOverride>> {
+        self.ensure_connection_alive()?;
+        let row = self
+            .client
+            .query_opt(
+                "SELECT proxy_url, proxy_username, proxy_password,
+                    status, created_at_ms, updated_at_ms
+                 FROM llm_proxy_config_node_overrides
+                 WHERE proxy_config_id = $1 AND node_id = $2",
+                &[&proxy_id, &self.proxy_scope.node_id],
+            )
+            .await
+            .context("load postgres proxy config node override")?;
+        Ok(row.map(|row| ProxyConfigNodeOverride {
+            proxy_url: row.get(0),
+            proxy_username: row.get(1),
+            proxy_password: row.get(2),
+            status: row.get(3),
+            created_at_ms: row.get(4),
+            updated_at_ms: row.get(5),
+        }))
+    }
+
+    async fn patch_admin_proxy_config_node_override(
+        &self,
+        proxy_id: &str,
+        patch: AdminProxyConfigPatch,
+    ) -> anyhow::Result<Option<AdminProxyConfig>> {
+        if patch.name.is_some() {
+            anyhow::bail!("proxy slot names can only be changed on the core node");
+        }
+        let Some(base) = self.get_admin_proxy_config_base_row(proxy_id).await? else {
+            return Ok(None);
+        };
+        let existing = self.get_proxy_config_node_override(proxy_id).await?;
+        let proxy_url = patch
+            .proxy_url
+            .or_else(|| existing.as_ref().map(|row| row.proxy_url.clone()))
+            .unwrap_or(base.proxy_url);
+        let proxy_username = match patch.proxy_username {
+            Some(value) => value,
+            None => existing
+                .as_ref()
+                .map(|row| row.proxy_username.clone())
+                .unwrap_or(base.proxy_username),
+        };
+        let proxy_password = match patch.proxy_password {
+            Some(value) => value,
+            None => existing
+                .as_ref()
+                .map(|row| row.proxy_password.clone())
+                .unwrap_or(base.proxy_password),
+        };
+        let status = patch
+            .status
+            .or_else(|| existing.as_ref().map(|row| row.status.clone()))
+            .unwrap_or(base.status);
+        let created_at_ms = existing
+            .as_ref()
+            .map(|row| row.created_at_ms)
+            .unwrap_or(patch.updated_at_ms);
+        self.ensure_connection_alive()?;
+        self.client
+            .execute(
+                "INSERT INTO llm_proxy_config_node_overrides (
+                    proxy_config_id, node_id, proxy_url, proxy_username, proxy_password,
+                    status, created_at_ms, updated_at_ms
+                 ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+                 ON CONFLICT (proxy_config_id, node_id) DO UPDATE SET
+                    proxy_url = EXCLUDED.proxy_url,
+                    proxy_username = EXCLUDED.proxy_username,
+                    proxy_password = EXCLUDED.proxy_password,
+                    status = EXCLUDED.status,
+                    updated_at_ms = EXCLUDED.updated_at_ms",
+                &[
+                    &proxy_id,
+                    &self.proxy_scope.node_id,
+                    &proxy_url,
+                    &proxy_username,
+                    &proxy_password,
+                    &status,
+                    &created_at_ms,
+                    &patch.updated_at_ms,
+                ],
+            )
+            .await
+            .context("patch postgres proxy config node override")?;
+        self.invalidate_proxy_metadata_cache().await;
+        self.invalidate_all_account_views_for_provider(core_store::PROVIDER_CODEX)
+            .await;
+        self.invalidate_all_account_views_for_provider(core_store::PROVIDER_KIRO)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_CODEX)
+            .await;
+        self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
+            .await;
+        self.get_admin_proxy_config_row(proxy_id).await
+    }
+
+    fn apply_proxy_scope_metadata(
+        &self,
+        proxy: &mut AdminProxyConfig,
+        effective_source: &str,
+        has_node_override: bool,
+    ) {
+        proxy.scope_node_id = self.proxy_scope.scope_node_id();
+        proxy.effective_source = effective_source.to_string();
+        proxy.has_node_override = has_node_override;
+        proxy.can_edit_slot_metadata = self.proxy_scope.can_edit_slot_metadata();
     }
 
     async fn load_admin_proxy_binding_row(
@@ -4747,6 +5027,10 @@ fn decode_admin_proxy_config_row(row: PgRow) -> AdminProxyConfig {
         status: row.get(5),
         created_at: row.get(6),
         updated_at: row.get(7),
+        scope_node_id: None,
+        effective_source: "core".to_string(),
+        has_node_override: false,
+        can_edit_slot_metadata: true,
     }
 }
 
@@ -5134,6 +5418,7 @@ fn build_cached_kiro_account_view(
     row: &KiroRouteCandidateRow,
     cached_status: Option<KiroCachedStatusParts>,
     proxy_context: &ProviderProxyResolutionContext,
+    generation: i64,
 ) -> anyhow::Result<crate::request_cache::CachedKiroAccountView> {
     let cached_balance = cached_status
         .as_ref()
@@ -5160,6 +5445,7 @@ fn build_cached_kiro_account_view(
     )?;
     Ok(crate::request_cache::CachedKiroAccountView {
         account_name: row.account_name.clone(),
+        generation,
         profile_arn: row.profile_arn.clone().or(row.auth_profile_arn.clone()),
         user_id: row.user_id.clone(),
         status: row.status.clone(),
@@ -5411,6 +5697,17 @@ fn provider_proxy_from_admin_proxy(proxy: AdminProxyConfig) -> ProviderProxyConf
         proxy_username: proxy.proxy_username,
         proxy_password: proxy.proxy_password,
     }
+}
+
+fn apply_proxy_config_node_override(
+    proxy: &mut AdminProxyConfig,
+    override_row: &ProxyConfigNodeOverride,
+) {
+    proxy.proxy_url = override_row.proxy_url.clone();
+    proxy.proxy_username = override_row.proxy_username.clone();
+    proxy.proxy_password = override_row.proxy_password.clone();
+    proxy.status = override_row.status.clone();
+    proxy.updated_at = override_row.updated_at_ms;
 }
 
 fn legacy_proxy_json_string(value: &serde_json::Value, keys: &[&str]) -> Option<String> {
@@ -5964,6 +6261,9 @@ impl AdminProxyStore for PostgresControlRepository {
         &self,
         proxy: NewAdminProxyConfig,
     ) -> anyhow::Result<AdminProxyConfig> {
+        if !self.proxy_scope.can_edit_slot_metadata() {
+            anyhow::bail!("proxy slots can only be created on the core node");
+        }
         self.ensure_connection_alive()?;
         self.client
             .execute(
@@ -5999,7 +6299,12 @@ impl AdminProxyStore for PostgresControlRepository {
         proxy_id: &str,
         patch: AdminProxyConfigPatch,
     ) -> anyhow::Result<Option<AdminProxyConfig>> {
-        let Some(mut proxy) = self.get_admin_proxy_config_row(proxy_id).await? else {
+        if !self.proxy_scope.can_edit_slot_metadata() {
+            return self
+                .patch_admin_proxy_config_node_override(proxy_id, patch)
+                .await;
+        }
+        let Some(mut proxy) = self.get_admin_proxy_config_base_row(proxy_id).await? else {
             return Ok(None);
         };
         if let Some(name) = patch.name.as_ref() {
@@ -6046,13 +6351,16 @@ impl AdminProxyStore for PostgresControlRepository {
             .await;
         self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
             .await;
-        Ok(Some(proxy))
+        self.get_admin_proxy_config_row(proxy_id).await
     }
 
     async fn delete_admin_proxy_config(
         &self,
         proxy_id: &str,
     ) -> anyhow::Result<Option<AdminProxyConfig>> {
+        if !self.proxy_scope.can_edit_slot_metadata() {
+            anyhow::bail!("proxy slots can only be deleted on the core node");
+        }
         let Some(proxy) = self.get_admin_proxy_config_row(proxy_id).await? else {
             return Ok(None);
         };
@@ -6071,6 +6379,36 @@ impl AdminProxyStore for PostgresControlRepository {
         self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
             .await;
         Ok(Some(proxy))
+    }
+
+    async fn reset_admin_proxy_config_override(
+        &self,
+        proxy_id: &str,
+    ) -> anyhow::Result<Option<AdminProxyConfig>> {
+        let Some(_) = self.get_admin_proxy_config_base_row(proxy_id).await? else {
+            return Ok(None);
+        };
+        if !self.proxy_scope.can_edit_slot_metadata() {
+            self.ensure_connection_alive()?;
+            self.client
+                .execute(
+                    "DELETE FROM llm_proxy_config_node_overrides
+                     WHERE proxy_config_id = $1 AND node_id = $2",
+                    &[&proxy_id, &self.proxy_scope.node_id],
+                )
+                .await
+                .context("reset postgres proxy config node override")?;
+            self.invalidate_proxy_metadata_cache().await;
+            self.invalidate_all_account_views_for_provider(core_store::PROVIDER_CODEX)
+                .await;
+            self.invalidate_all_account_views_for_provider(core_store::PROVIDER_KIRO)
+                .await;
+            self.bump_dispatch_generation(core_store::PROVIDER_CODEX)
+                .await;
+            self.bump_dispatch_generation(core_store::PROVIDER_KIRO)
+                .await;
+        }
+        self.get_admin_proxy_config_row(proxy_id).await
     }
 
     async fn list_admin_proxy_bindings(&self) -> anyhow::Result<Vec<AdminProxyBinding>> {
@@ -8333,7 +8671,8 @@ mod tests {
     use llm_access_core::{
         provider::{ProtocolFamily, ProviderType, RouteStrategy},
         store::{
-            AdminConfigStore, AdminKeyStore, AdminReviewQueueStore, ControlStore,
+            AdminConfigStore, AdminKeyStore, AdminProxyConfigPatch, AdminProxyStore,
+            AdminReviewQueueStore, ControlStore, NewAdminProxyConfig,
             NewPublicAccountContributionRequest, PublicSubmissionStore, PublicUsageStore,
             UsageEventSink,
         },
@@ -8371,6 +8710,7 @@ mod tests {
                     llm_kiro_status_cache,
                     llm_kiro_accounts,
                     llm_codex_accounts,
+                    llm_proxy_config_node_overrides,
                     llm_proxy_bindings,
                     llm_proxy_configs,
                     llm_account_groups,
@@ -8569,6 +8909,108 @@ mod tests {
         .expect("connect postgres repository with request cache");
 
         assert!(repo.request_cache.is_some());
+    }
+
+    #[tokio::test]
+    async fn postgres_repository_resolves_proxy_configs_per_node_scope() {
+        let Ok(database_url) = std::env::var("TEST_POSTGRES_URL") else {
+            eprintln!("skipping postgres integration test: TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let _guard = test_db_guard().await;
+        reset_test_db(&database_url)
+            .await
+            .expect("reset postgres test database");
+        let core_repo = super::PostgresControlRepository::connect_with_proxy_scope(
+            &database_url,
+            None,
+            super::ProxyConfigScope::core(),
+        )
+        .await
+        .expect("connect core postgres repository");
+        let edge_repo = super::PostgresControlRepository::connect_with_proxy_scope(
+            &database_url,
+            None,
+            super::ProxyConfigScope::node("edge-a"),
+        )
+        .await
+        .expect("connect edge postgres repository");
+
+        core_repo
+            .create_admin_proxy_config(NewAdminProxyConfig {
+                id: "proxy-slot-1".to_string(),
+                name: "slot 1".to_string(),
+                proxy_url: "http://core.proxy:1111".to_string(),
+                proxy_username: Some("core-user".to_string()),
+                proxy_password: Some("core-pass".to_string()),
+                created_at_ms: 100,
+            })
+            .await
+            .expect("create core proxy slot");
+
+        let inherited = edge_repo
+            .get_admin_proxy_config("proxy-slot-1")
+            .await
+            .expect("load inherited edge proxy")
+            .expect("edge sees core slot");
+        assert_eq!(inherited.proxy_url, "http://core.proxy:1111");
+        assert_eq!(inherited.effective_source, "core");
+        assert!(!inherited.has_node_override);
+
+        let overridden = edge_repo
+            .patch_admin_proxy_config("proxy-slot-1", AdminProxyConfigPatch {
+                proxy_url: Some("http://edge.proxy:2222".to_string()),
+                proxy_username: Some(Some("edge-user".to_string())),
+                proxy_password: Some(Some("edge-pass".to_string())),
+                status: Some("active".to_string()),
+                updated_at_ms: 200,
+                ..AdminProxyConfigPatch::default()
+            })
+            .await
+            .expect("patch edge proxy override")
+            .expect("edge proxy slot exists");
+        assert_eq!(overridden.proxy_url, "http://edge.proxy:2222");
+        assert_eq!(overridden.proxy_username.as_deref(), Some("edge-user"));
+        assert_eq!(overridden.effective_source, "node_override");
+        assert!(overridden.has_node_override);
+
+        let core_after_override = core_repo
+            .get_admin_proxy_config("proxy-slot-1")
+            .await
+            .expect("load core proxy")
+            .expect("core slot exists");
+        assert_eq!(core_after_override.proxy_url, "http://core.proxy:1111");
+        assert_eq!(core_after_override.effective_source, "core");
+
+        edge_repo
+            .update_admin_proxy_binding("codex", Some("proxy-slot-1".to_string()))
+            .await
+            .expect("bind codex proxy slot");
+        let edge_context = edge_repo
+            .load_provider_proxy_resolution_context("codex")
+            .await
+            .expect("load edge proxy context");
+        let fixed_proxy = super::resolve_provider_proxy_config_from_context(
+            "fixed",
+            Some("proxy-slot-1"),
+            &edge_context,
+        )
+        .expect("resolve fixed edge proxy")
+        .expect("fixed proxy present");
+        assert_eq!(fixed_proxy.proxy_url, "http://edge.proxy:2222");
+        assert_eq!(
+            edge_context.binding.effective_proxy_url.as_deref(),
+            Some("http://edge.proxy:2222")
+        );
+
+        let reset = edge_repo
+            .reset_admin_proxy_config_override("proxy-slot-1")
+            .await
+            .expect("reset edge proxy override")
+            .expect("edge proxy slot exists after reset");
+        assert_eq!(reset.proxy_url, "http://core.proxy:1111");
+        assert_eq!(reset.effective_source, "core");
+        assert!(!reset.has_node_override);
     }
 
     #[tokio::test]

@@ -6804,13 +6804,26 @@ pub struct AdminUpstreamProxyConfigView {
     pub status: String,
     pub created_at: i64,
     pub updated_at: i64,
+    pub scope_node_id: Option<String>,
+    pub effective_source: String,
+    pub has_node_override: bool,
+    pub can_edit_slot_metadata: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
 #[serde(default)]
 pub struct AdminUpstreamProxyConfigsResponse {
+    pub proxy_config_scope: AdminUpstreamProxyConfigScopeView,
     pub proxy_configs: Vec<AdminUpstreamProxyConfigView>,
     pub generated_at: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct AdminUpstreamProxyConfigScopeView {
+    pub node_id: String,
+    pub is_core: bool,
+    pub can_edit_slot_metadata: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
@@ -7743,6 +7756,10 @@ pub async fn create_admin_llm_gateway_proxy_config(
             status: "active".to_string(),
             created_at: 0,
             updated_at: 0,
+            scope_node_id: Some("core".to_string()),
+            effective_source: "core".to_string(),
+            has_node_override: false,
+            can_edit_slot_metadata: true,
         })
     }
 
@@ -7785,6 +7802,10 @@ pub async fn patch_admin_llm_gateway_proxy_config(
             status: input.status.clone().unwrap_or_else(|| "active".to_string()),
             created_at: 0,
             updated_at: 0,
+            scope_node_id: Some("core".to_string()),
+            effective_source: "core".to_string(),
+            has_node_override: false,
+            can_edit_slot_metadata: true,
         })
     }
 
@@ -7835,6 +7856,46 @@ pub async fn delete_admin_llm_gateway_proxy_config(proxy_id: &str) -> Result<(),
             return Err(format!("Failed: {text}"));
         }
         Ok(())
+    }
+}
+
+pub async fn reset_admin_llm_gateway_proxy_config_override(
+    proxy_id: &str,
+) -> Result<AdminUpstreamProxyConfigView, String> {
+    #[cfg(feature = "mock")]
+    {
+        Ok(AdminUpstreamProxyConfigView {
+            id: proxy_id.to_string(),
+            name: "mock-proxy".to_string(),
+            proxy_url: "http://127.0.0.1:11111".to_string(),
+            status: "active".to_string(),
+            scope_node_id: Some("edge-a".to_string()),
+            effective_source: "core".to_string(),
+            has_node_override: false,
+            can_edit_slot_metadata: false,
+            ..AdminUpstreamProxyConfigView::default()
+        })
+    }
+
+    #[cfg(not(feature = "mock"))]
+    {
+        let url = format!(
+            "{}/admin/llm-gateway/proxy-configs/{}/override",
+            admin_base(),
+            urlencoding::encode(proxy_id)
+        );
+        let response = api_delete(&url)
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {:?}", e))?;
+        if !response.ok() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed: {text}"));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Parse error: {:?}", e))
     }
 }
 

@@ -93,6 +93,11 @@ const POSTGRES_MIGRATIONS: &[SqlMigration] = &[
         name: "followups",
         sql: include_str!("../migrations/postgres/0002_followups.sql"),
     },
+    SqlMigration {
+        version: 11,
+        name: "proxy_config_node_overrides",
+        sql: include_str!("../migrations/postgres/0011_proxy_config_node_overrides.sql"),
+    },
 ];
 
 /// Return target SQLite migrations in execution order.
@@ -305,6 +310,24 @@ mod tests {
         assert!(migrations
             .iter()
             .any(|migration| migration.sql.contains("llm_runtime_config")));
+    }
+
+    #[test]
+    fn postgres_migrations_include_proxy_node_overrides() {
+        let migrations = super::postgres_migrations();
+        let migration = migrations
+            .iter()
+            .find(|migration| migration.name == "proxy_config_node_overrides")
+            .expect("proxy node override migration exists");
+
+        assert_eq!(migration.version, 11);
+        assert!(migration.sql.contains("llm_proxy_config_node_overrides"));
+        assert!(migration
+            .sql
+            .contains("PRIMARY KEY (proxy_config_id, node_id)"));
+        assert!(migration
+            .sql
+            .contains("REFERENCES llm_proxy_configs(proxy_config_id)"));
     }
 
     #[test]

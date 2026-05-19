@@ -27,7 +27,10 @@ use llm_access_core::store::{
 };
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use llm_access_core::usage::UsageEvent;
-use llm_access_store::{postgres::PostgresControlRepository, repository::SqliteControlRepository};
+use llm_access_store::{
+    postgres::{PostgresControlRepository, ProxyConfigScope},
+    repository::SqliteControlRepository,
+};
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use tokio::{
     sync::{mpsc, watch, Mutex},
@@ -271,8 +274,14 @@ impl LlmAccessRuntime {
                     format!("missing control database env `{database_url_env}`")
                 })?;
                 let request_cache = resolve_request_cache_config(config)?;
+                let proxy_scope = postgres_proxy_config_scope(config);
                 let repository = Arc::new(
-                    PostgresControlRepository::connect(&database_url, request_cache).await?,
+                    PostgresControlRepository::connect_with_proxy_scope(
+                        &database_url,
+                        request_cache,
+                        proxy_scope,
+                    )
+                    .await?,
                 );
                 Self::from_open_repository(config, cluster_state, geoip, email_notifier, repository)
                     .await
@@ -494,6 +503,15 @@ impl LlmAccessRuntime {
     /// No-op when DuckDB usage persistence is not compiled in.
     #[cfg(not(any(feature = "duckdb-runtime", feature = "duckdb-bundled")))]
     pub async fn shutdown_usage_events(&self) {}
+}
+
+fn postgres_proxy_config_scope(config: &StorageConfig) -> ProxyConfigScope {
+    match config.node_identity.as_ref() {
+        Some(identity) if identity.node_class == crate::cluster::NodeClass::Edge => {
+            ProxyConfigScope::node(identity.node_id.clone())
+        },
+        _ => ProxyConfigScope::core(),
+    }
 }
 
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
