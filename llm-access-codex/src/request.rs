@@ -1023,6 +1023,28 @@ fn validate_tool_call_history(root: &Map<String, Value>) -> CodexGatewayResult<(
 pub(crate) fn normalize_tool_parameters_schema(value: Value) -> Value {
     match value {
         Value::Object(mut obj) => {
+            if let Some(array_ref) = obj
+                .get("$ref")
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .and_then(|reference| reference.strip_suffix("[]"))
+                .filter(|reference| !reference.is_empty())
+            {
+                let mut rewritten = Map::new();
+                rewritten.insert("type".to_string(), Value::String("array".to_string()));
+                rewritten.insert(
+                    "items".to_string(),
+                    normalize_tool_parameters_schema(json!({ "$ref": array_ref })),
+                );
+                for (key, child) in obj {
+                    if key == "$ref" {
+                        continue;
+                    }
+                    rewritten.insert(key, normalize_tool_parameters_schema(child));
+                }
+                return Value::Object(rewritten);
+            }
+
             if obj
                 .get("type")
                 .and_then(Value::as_str)
@@ -1161,6 +1183,10 @@ fn openai_chat_tool_name_value<'a>(
     openai_chat_tool_field(tool_obj, function, "name")
 }
 
+fn legacy_openai_function_name_value(function_obj: &Map<String, Value>) -> Option<&Value> {
+    function_obj.get("name")
+}
+
 fn map_openai_chat_function_tool(
     tool_obj: &Map<String, Value>,
     tool_name_map: &BTreeMap<String, String>,
@@ -1207,6 +1233,20 @@ fn collect_openai_tool_names(obj: &Map<String, Value>) -> Vec<String> {
         }
     }
 
+    if let Some(functions) = obj.get("functions").and_then(Value::as_array) {
+        for function in functions {
+            let Some(function_obj) = function.as_object() else {
+                continue;
+            };
+            let name = coerce_non_empty_scalar_to_string(legacy_openai_function_name_value(
+                function_obj,
+            ));
+            if let Some(name) = name {
+                names.push(name);
+            }
+        }
+    }
+
     if let Some(dynamic_tools) = get_dynamic_tools_array(obj) {
         for dynamic_tool in dynamic_tools {
             let Some(name) = dynamic_tool
@@ -1241,6 +1281,15 @@ fn collect_openai_tool_names(obj: &Map<String, Value>) -> Vec<String> {
         })
     {
         names.push(name.to_string());
+    }
+
+    if let Some(name) = obj
+        .get("function_call")
+        .and_then(Value::as_object)
+        .and_then(legacy_openai_function_name_value)
+        .and_then(|value| coerce_non_empty_scalar_to_string(Some(value)))
+    {
+        names.push(name);
     }
 
     if let Some(messages) = obj.get("messages").and_then(Value::as_array) {
@@ -1827,6 +1876,27 @@ fn adapt_openai_chat_completions_request(
         }
     }
 
+    if let Some(functions) = obj.get("functions").and_then(Value::as_array) {
+        let mut mapped_functions = out
+            .remove("tools")
+            .and_then(|value| value.as_array().cloned())
+            .unwrap_or_default();
+        for function in functions {
+            let Some(function_obj) = function.as_object() else {
+                continue;
+            };
+            let mut wrapped = Map::new();
+            wrapped.insert("type".to_string(), Value::String("function".to_string()));
+            wrapped.insert("function".to_string(), Value::Object(function_obj.clone()));
+            if let Some(mapped) = map_openai_chat_function_tool(&wrapped, &tool_name_map) {
+                mapped_functions.push(mapped);
+            }
+        }
+        if !mapped_functions.is_empty() {
+            out.insert("tools".to_string(), Value::Array(mapped_functions));
+        }
+    }
+
     if let Some(dynamic_tools) = get_dynamic_tools_array(obj) {
         let mut mapped_dynamic_tools = out
             .remove("tools")
@@ -1896,6 +1966,29 @@ fn adapt_openai_chat_completions_request(
                 }
             } else {
                 out.insert("tool_choice".to_string(), tool_choice.clone());
+            }
+        }
+    }
+
+    if !out.contains_key("tool_choice") {
+        if let Some(function_call) = obj.get("function_call") {
+            if let Some(function_call_str) = function_call.as_str() {
+                out.insert(
+                    "tool_choice".to_string(),
+                    Value::String(function_call_str.to_string()),
+                );
+            } else if let Some(function_call_obj) = function_call.as_object() {
+                if let Some(name) = coerce_non_empty_scalar_to_string(
+                    legacy_openai_function_name_value(function_call_obj),
+                ) {
+                    out.insert(
+                        "tool_choice".to_string(),
+                        json!({
+                            "type": "function",
+                            "name": shorten_openai_tool_name_with_map(&name, &tool_name_map),
+                        }),
+                    );
+                }
             }
         }
     }
@@ -2945,6 +3038,44 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn prepare_gateway_request_accepts_legacy_functions_and_function_call() {
+        let headers = axum::http::HeaderMap::new();
+        let body = Body::from(
+            r#"{
+                "model":"gpt-5.3-codex",
+                "messages":[{"role":"user","content":"hello"}],
+                "functions":[{
+                    "name":"lookup",
+                    "description":"Look up data.",
+                    "parameters":{"type":"object","properties":{"q":{"type":"string"}}}
+                }],
+                "function_call":{"name":"lookup"}
+            }"#,
+        );
+
+        let prepared = prepare_gateway_request(
+            "/v1/chat/completions",
+            "",
+            axum::http::Method::POST,
+            &headers,
+            body,
+            1024 * 1024,
+        )
+        .await
+        .expect("legacy chat function request should normalize");
+
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&prepared.request_body).expect("upstream body json");
+        assert_eq!(upstream["tools"][0]["type"], json!("function"));
+        assert_eq!(upstream["tools"][0]["name"], json!("lookup"));
+        assert_eq!(
+            upstream["tools"][0]["parameters"],
+            json!({"type":"object","properties":{"q":{"type":"string"}}})
+        );
+        assert_eq!(upstream["tool_choice"], json!({"type":"function","name":"lookup"}));
+    }
+
+    #[tokio::test]
     async fn prepare_gateway_request_coerces_chat_function_tool_choice_scalar_name_to_string() {
         let headers = axum::http::HeaderMap::new();
         let body = Body::from(
@@ -3307,6 +3438,56 @@ mod tests {
         assert!(upstream.get("include").is_none());
         assert!(upstream.get("client_metadata").is_none());
         assert!(upstream.get("tool_choice").is_none());
+    }
+
+    #[tokio::test]
+    async fn prepare_gateway_request_rewrites_array_style_local_schema_refs() {
+        let headers = axum::http::HeaderMap::new();
+        let body = Body::from(
+            r##"{
+                "model":"gpt-5.3-codex",
+                "messages":[{"role":"user","content":"hello"}],
+                "tools":[{
+                    "type":"function",
+                    "function":{
+                        "name":"ai-game-developer_assets-create-folder",
+                        "parameters":{
+                            "type":"object",
+                            "properties":{
+                                "folders":{"$ref":"#/$defs/game_tools.CreateFolderInput[]"}
+                            },
+                            "$defs":{
+                                "game_tools.CreateFolderInput":{
+                                    "type":"object",
+                                    "properties":{"path":{"type":"string"}}
+                                }
+                            }
+                        }
+                    }
+                }]
+            }"##,
+        );
+
+        let prepared = prepare_gateway_request(
+            "/v1/chat/completions",
+            "",
+            axum::http::Method::POST,
+            &headers,
+            body,
+            1024 * 1024,
+        )
+        .await
+        .expect("array-style local refs should normalize");
+
+        let upstream: serde_json::Value =
+            serde_json::from_slice(&prepared.request_body).expect("upstream body json");
+        assert_eq!(
+            upstream["tools"][0]["parameters"]["properties"]["folders"],
+            json!({
+                "type":"array",
+                "items":{"$ref":"#/$defs/game_tools.CreateFolderInput"}
+            })
+        );
     }
 
     #[tokio::test]
