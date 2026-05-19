@@ -101,10 +101,13 @@ const KIRO_LAST_MESSAGE_PART_PREVIEW_CHARS: usize = 320;
 const KIRO_LAST_MESSAGE_TOTAL_PREVIEW_CHARS: usize = 1_024;
 const KIRO_VISION_BRIDGE_MODEL: &str = "claude-sonnet-4.6";
 const CODEX_QUOTA_EXHAUSTION_COOLDOWN: Duration = Duration::from_secs(5 * 60);
-const DEFAULT_PROVIDER_CLIENT_CACHE_CAPACITY: usize = 8;
-const MAX_PROVIDER_CLIENT_CACHE_CAPACITY: usize = 64;
-const DEFAULT_PROVIDER_CLIENT_POOL_MAX_IDLE_PER_HOST: usize = 1;
-const MAX_PROVIDER_CLIENT_POOL_MAX_IDLE_PER_HOST: usize = 8;
+const DEFAULT_PROVIDER_CLIENT_CACHE_CAPACITY: usize = 50;
+const MAX_PROVIDER_CLIENT_CACHE_CAPACITY: usize = 128;
+const DEFAULT_PROVIDER_CLIENT_POOL_IDLE_TIMEOUT_SECONDS: u64 = 600;
+const MIN_PROVIDER_CLIENT_POOL_IDLE_TIMEOUT_SECONDS: u64 = 30;
+const MAX_PROVIDER_CLIENT_POOL_IDLE_TIMEOUT_SECONDS: u64 = 3600;
+const DEFAULT_PROVIDER_CLIENT_POOL_MAX_IDLE_PER_HOST: usize = 4;
+const MAX_PROVIDER_CLIENT_POOL_MAX_IDLE_PER_HOST: usize = 16;
 const KIRO_VISION_BRIDGE_PROMPT: &str = "Describe the attached image(s) for another Claude model \
                                          that will answer the user's request. Include visible \
                                          text, objects, colors, layout, charts, tables, and \
@@ -4696,7 +4699,7 @@ static KIRO_REMOTE_MEDIA_CLIENT: std::sync::LazyLock<reqwest::Client> =
         reqwest::Client::builder()
             .timeout(KIRO_REMOTE_MEDIA_TIMEOUT)
             .redirect(reqwest::redirect::Policy::none())
-            .pool_idle_timeout(Duration::from_secs(90))
+            .pool_idle_timeout(provider_client_pool_idle_timeout())
             .pool_max_idle_per_host(provider_client_pool_max_idle_per_host())
             .tcp_keepalive(Duration::from_secs(30))
             .build()
@@ -4705,7 +4708,7 @@ static KIRO_REMOTE_MEDIA_CLIENT: std::sync::LazyLock<reqwest::Client> =
 
 fn build_provider_client(proxy: Option<&ProviderProxyConfig>) -> anyhow::Result<reqwest::Client> {
     let mut builder = reqwest::Client::builder()
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_idle_timeout(provider_client_pool_idle_timeout())
         .pool_max_idle_per_host(provider_client_pool_max_idle_per_host())
         .tcp_keepalive(Duration::from_secs(30));
     if let Some(proxy_config) = proxy {
@@ -4751,6 +4754,20 @@ fn provider_client_cache_capacity() -> NonZeroUsize {
         .map(|value| value.clamp(1, MAX_PROVIDER_CLIENT_CACHE_CAPACITY))
         .unwrap_or(DEFAULT_PROVIDER_CLIENT_CACHE_CAPACITY);
     NonZeroUsize::new(capacity).expect("provider client cache capacity is non-zero")
+}
+
+fn provider_client_pool_idle_timeout() -> Duration {
+    let seconds = std::env::var("LLM_ACCESS_PROVIDER_CLIENT_POOL_IDLE_TIMEOUT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| {
+            value.clamp(
+                MIN_PROVIDER_CLIENT_POOL_IDLE_TIMEOUT_SECONDS,
+                MAX_PROVIDER_CLIENT_POOL_IDLE_TIMEOUT_SECONDS,
+            )
+        })
+        .unwrap_or(DEFAULT_PROVIDER_CLIENT_POOL_IDLE_TIMEOUT_SECONDS);
+    Duration::from_secs(seconds)
 }
 
 fn provider_client_pool_max_idle_per_host() -> usize {
