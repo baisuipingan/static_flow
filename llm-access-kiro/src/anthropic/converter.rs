@@ -110,6 +110,7 @@ const STRUCTURED_OUTPUT_TOOL_DESCRIPTION: &str =
      this tool exactly once and do not emit any free-form text outside the tool call.";
 const KIRO_MAX_CURRENT_MESSAGE_IMAGES: usize = 10;
 const KIRO_MAX_CONVERSATION_DOCUMENTS: usize = 5;
+const EMPTY_TOOL_RESULT_PLACEHOLDER: &str = "(empty result)";
 
 /// Maps an Anthropic model name (e.g. `"claude-sonnet-4-6"`) to the
 /// canonical Kiro model identifier. Returns `None` for unrecognized models.
@@ -771,13 +772,26 @@ fn schema_contains_multimodal_unsupported_keywords(value: &serde_json::Value) ->
     }
 }
 
+fn content_value_contains_image(content: &serde_json::Value) -> bool {
+    let serde_json::Value::Array(items) = content else {
+        return false;
+    };
+    items.iter().any(|item| {
+        let Some(block_type) = item.get("type").and_then(|value| value.as_str()) else {
+            return false;
+        };
+        match block_type {
+            "image" => true,
+            "tool_result" => item
+                .get("content")
+                .is_some_and(content_value_contains_image),
+            _ => false,
+        }
+    })
+}
+
 fn request_message_contains_image(message: &super::types::Message) -> bool {
-    match &message.content {
-        serde_json::Value::Array(items) => items
-            .iter()
-            .any(|item| item.get("type").and_then(|value| value.as_str()) == Some("image")),
-        _ => false,
-    }
+    content_value_contains_image(&message.content)
 }
 
 fn apply_multimodal_tool_schema_compatibility(tools: &mut [Tool], has_images: bool) {
@@ -1719,15 +1733,26 @@ fn process_message_content(
                             }
                         },
                         "document" => {
-                            if let (Some(name), Some(source)) = (block.name, block.source) {
-                                if let Some(document) = kiro_document_from_source(name, source) {
+                            if let Some(source) = block.source {
+                                if let Some(document) = kiro_document_from_block(block.name, source)
+                                {
                                     documents.push(document);
                                 }
                             }
                         },
                         "tool_result" => {
                             if let Some(tool_use_id) = block.tool_use_id {
-                                let result_content = extract_tool_result_content(&block.content);
+                                let (tool_result_images, tool_result_documents) =
+                                    extract_tool_result_attachments(&block.content);
+                                let has_tool_result_attachments = !tool_result_images.is_empty()
+                                    || !tool_result_documents.is_empty();
+                                images.extend(tool_result_images);
+                                documents.extend(tool_result_documents);
+                                let mut result_content =
+                                    extract_tool_result_content(&block.content);
+                                if result_content.trim().is_empty() && has_tool_result_attachments {
+                                    result_content = EMPTY_TOOL_RESULT_PLACEHOLDER.to_string();
+                                }
                                 let is_error = block.is_error.unwrap_or(false);
                                 let mut result = if is_error {
                                     ToolResult::error(&tool_use_id, result_content)
@@ -1777,6 +1802,51 @@ fn kiro_document_from_source(
         _ => return None,
     };
     Some(KiroDocument::from_base64(name, format, bytes))
+}
+
+fn kiro_document_from_block(
+    name: Option<String>,
+    mut source: super::types::ImageSource,
+) -> Option<KiroDocument> {
+    let normalized_media_type = canonical_document_media_type(&source.media_type)?;
+    let normalized_name = normalize_document_name(name.as_deref(), normalized_media_type);
+    source.media_type = normalized_media_type.to_string();
+    kiro_document_from_source(normalized_name, source)
+}
+
+fn extract_tool_result_attachments(
+    content: &Option<serde_json::Value>,
+) -> (Vec<KiroImage>, Vec<KiroDocument>) {
+    let mut images = Vec::new();
+    let mut documents = Vec::new();
+    let Some(serde_json::Value::Array(items)) = content else {
+        return (images, documents);
+    };
+
+    for item in items {
+        let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) else {
+            continue;
+        };
+        match block.block_type.as_str() {
+            "image" => {
+                if let Some(source) = block.source {
+                    if let Some(format) = get_image_format(&source.media_type) {
+                        images.push(KiroImage::from_base64(format, source.data));
+                    }
+                }
+            },
+            "document" => {
+                if let Some(source) = block.source {
+                    if let Some(document) = kiro_document_from_block(block.name, source) {
+                        documents.push(document);
+                    }
+                }
+            },
+            _ => {},
+        }
+    }
+
+    (images, documents)
 }
 
 pub fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
@@ -4022,6 +4092,328 @@ mod tests {
         assert!(current.content.is_empty());
         assert_eq!(current.user_input_message_context.tool_results.len(), 1);
         assert_eq!(current.user_input_message_context.tool_results[0].tool_use_id, "tool-1");
+    }
+
+    #[test]
+    fn convert_request_extracts_images_from_tool_result_content_into_current_turn() {
+        let req = base_request(vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Read the screenshot"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "read_image",
+                        "input": {"path": "/tmp/screenshot.png"}
+                    }
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "aGVsbG8="
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            },
+        ]);
+
+        let result =
+            convert_request(&req).expect("tool_result image content should become current images");
+        let current =
+            serde_json::to_value(&result.conversation_state.current_message.user_input_message)
+                .expect("serialize current message");
+
+        assert_eq!(current["images"].as_array().map(Vec::len), Some(1));
+        assert_eq!(current["images"][0]["format"], "png");
+        assert_eq!(
+            current["userInputMessageContext"]["toolResults"]
+                .as_array()
+                .map(Vec::len),
+            Some(1)
+        );
+        assert_eq!(
+            current["userInputMessageContext"]["toolResults"][0]["content"][0]["text"],
+            "(empty result)"
+        );
+    }
+
+    #[test]
+    fn convert_request_preserves_tool_result_text_while_extracting_images() {
+        let req = base_request(vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Read the screenshot"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "read_image",
+                        "input": {"path": "/tmp/screenshot.png"}
+                    }
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": "Screenshot captured"
+                            },
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "aGVsbG8="
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            },
+        ]);
+
+        let result =
+            convert_request(&req).expect("mixed tool_result content should stay supported");
+        let current =
+            serde_json::to_value(&result.conversation_state.current_message.user_input_message)
+                .expect("serialize current message");
+
+        assert_eq!(current["images"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            current["userInputMessageContext"]["toolResults"][0]["content"][0]["text"],
+            "Screenshot captured"
+        );
+    }
+
+    #[test]
+    fn convert_request_extracts_multiple_images_from_single_tool_result() {
+        let req = base_request(vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Read the screenshots"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "read_image",
+                        "input": {"path": "/tmp/screenshots"}
+                    }
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "cG5n"
+                                }
+                            },
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/jpeg",
+                                    "data": "anBlZw=="
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            },
+        ]);
+
+        let result = convert_request(&req)
+            .expect("multiple tool_result images should become current message images");
+        let current =
+            serde_json::to_value(&result.conversation_state.current_message.user_input_message)
+                .expect("serialize current message");
+
+        assert_eq!(current["images"].as_array().map(Vec::len), Some(2));
+        assert_eq!(current["images"][0]["format"], "png");
+        assert_eq!(current["images"][1]["format"], "jpeg");
+        assert_eq!(
+            current["userInputMessageContext"]["toolResults"][0]["content"][0]["text"],
+            "(empty result)"
+        );
+    }
+
+    #[test]
+    fn convert_request_extracts_documents_from_tool_result_content_into_current_turn() {
+        let req = base_request(vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Read the document"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "read_document",
+                        "input": {"path": "/tmp/plain.txt"}
+                    }
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": [
+                            {
+                                "type": "document",
+                                "name": "plain.txt",
+                                "source": {
+                                    "type": "text",
+                                    "media_type": "text/plain",
+                                    "data": "plain document body"
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            },
+        ]);
+
+        let result = convert_request(&req)
+            .expect("tool_result document content should become current documents");
+        let current =
+            serde_json::to_value(&result.conversation_state.current_message.user_input_message)
+                .expect("serialize current message");
+
+        assert_eq!(current["documents"].as_array().map(Vec::len), Some(1));
+        assert_eq!(current["documents"][0]["name"], "plain");
+        assert_eq!(current["documents"][0]["format"], "txt");
+        assert_eq!(
+            current["userInputMessageContext"]["toolResults"][0]["content"][0]["text"],
+            "(empty result)"
+        );
+    }
+
+    #[test]
+    fn convert_request_detects_images_inside_history_tool_results() {
+        let mut req = base_request(vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Read the screenshot"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "read_image",
+                        "input": {"path": "/tmp/screenshot.png"}
+                    }
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": [
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "aGVsbG8="
+                                }
+                            }
+                        ]
+                    }
+                ]),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("Done"),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("继续"),
+            },
+        ]);
+        req.tools = Some(vec![AnthropicTool {
+            tool_type: None,
+            name: "analyze_image".to_string(),
+            description: "Analyze an image".to_string(),
+            input_schema: HashMap::from([(
+                "anyOf".to_string(),
+                serde_json::json!([
+                    {"type": "object"},
+                    {"type": "string"}
+                ]),
+            )]),
+            max_uses: None,
+        }]);
+
+        let result = convert_request(&req).expect("history tool_result image should be detected");
+
+        assert!(result.has_history_images);
+        assert_eq!(
+            result
+                .conversation_state
+                .current_message
+                .user_input_message
+                .user_input_message_context
+                .tools[0]
+                .tool_specification
+                .input_schema
+                .json,
+            permissive_object_schema()
+        );
+        let history_user_with_image = result
+            .conversation_state
+            .history
+            .iter()
+            .find_map(|message| match message {
+                Message::User(message) if !message.user_input_message.images.is_empty() => {
+                    Some(&message.user_input_message)
+                },
+                _ => None,
+            })
+            .expect("history tool_result turn should retain extracted images");
+        assert_eq!(history_user_with_image.images.len(), 1);
+        assert_eq!(history_user_with_image.images[0].format, "png");
     }
 
     #[test]
