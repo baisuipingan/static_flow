@@ -177,6 +177,99 @@ fn chat_extension_item_from_responses_item(
     }
 }
 
+fn object_u64_field(map: &Map<String, Value>, key: &str) -> Option<u64> {
+    map.get(key).and_then(Value::as_u64)
+}
+
+fn nested_u64_field(map: &Map<String, Value>, object_key: &str, key: &str) -> Option<u64> {
+    map.get(object_key)
+        .and_then(Value::as_object)
+        .and_then(|obj| obj.get(key))
+        .and_then(Value::as_u64)
+}
+
+fn ensure_object_field<'a>(
+    map: &'a mut Map<String, Value>,
+    key: &str,
+) -> &'a mut Map<String, Value> {
+    if !map.get(key).is_some_and(Value::is_object) {
+        map.insert(key.to_string(), json!({}));
+    }
+    map.get_mut(key)
+        .and_then(Value::as_object_mut)
+        .expect("object field")
+}
+
+fn copy_detail_field_if_absent(
+    target: &mut Map<String, Value>,
+    source: Option<&Map<String, Value>>,
+    key: &str,
+) {
+    if target.contains_key(key) {
+        return;
+    }
+    if let Some(value) = source.and_then(|details| details.get(key)).cloned() {
+        target.insert(key.to_string(), value);
+    }
+}
+
+fn normalize_responses_usage_for_chat_completion(usage: Value) -> Value {
+    let Value::Object(mut map) = usage else {
+        return usage;
+    };
+
+    let input_tokens = object_u64_field(&map, "input_tokens");
+    let output_tokens = object_u64_field(&map, "output_tokens");
+    let prompt_tokens = object_u64_field(&map, "prompt_tokens").or(input_tokens);
+    let completion_tokens = object_u64_field(&map, "completion_tokens").or(output_tokens);
+    let total_tokens = object_u64_field(&map, "total_tokens").or_else(|| {
+        prompt_tokens
+            .or(completion_tokens)
+            .map(|_| prompt_tokens.unwrap_or(0) + completion_tokens.unwrap_or(0))
+    });
+    let cached_tokens = nested_u64_field(&map, "prompt_tokens_details", "cached_tokens")
+        .or_else(|| nested_u64_field(&map, "input_tokens_details", "cached_tokens"))
+        .or_else(|| object_u64_field(&map, "prompt_cache_hit_tokens"))
+        .or_else(|| object_u64_field(&map, "cached_tokens"));
+    let input_details = map
+        .get("input_tokens_details")
+        .and_then(Value::as_object)
+        .cloned();
+    let output_details = map
+        .get("output_tokens_details")
+        .and_then(Value::as_object)
+        .cloned();
+
+    if let Some(prompt_tokens) = prompt_tokens {
+        map.insert("prompt_tokens".to_string(), json!(prompt_tokens));
+    }
+    if let Some(completion_tokens) = completion_tokens {
+        map.insert("completion_tokens".to_string(), json!(completion_tokens));
+    }
+    if let Some(total_tokens) = total_tokens {
+        map.insert("total_tokens".to_string(), json!(total_tokens));
+    }
+
+    if cached_tokens.is_some() || input_details.is_some() {
+        let prompt_details = ensure_object_field(&mut map, "prompt_tokens_details");
+        if let Some(cached_tokens) = cached_tokens {
+            prompt_details.insert("cached_tokens".to_string(), json!(cached_tokens));
+        }
+        for key in ["cached_creation_tokens", "text_tokens", "audio_tokens", "image_tokens"] {
+            copy_detail_field_if_absent(prompt_details, input_details.as_ref(), key);
+        }
+    }
+
+    if let Some(output_details) = output_details.as_ref() {
+        let completion_details = ensure_object_field(&mut map, "completion_tokens_details");
+        for key in ["reasoning_tokens", "text_tokens", "audio_tokens"] {
+            copy_detail_field_if_absent(completion_details, Some(output_details), key);
+        }
+    }
+
+    Value::Object(map)
+}
+
 /// Adapt a completed responses payload into the classic chat/completions
 /// schema.
 fn map_response_to_chat_completion(
@@ -283,7 +376,7 @@ fn map_response_to_chat_completion(
         })]),
     );
     if let Some(usage) = usage {
-        out.insert("usage".to_string(), usage);
+        out.insert("usage".to_string(), normalize_responses_usage_for_chat_completion(usage));
     }
     Value::Object(out)
 }
@@ -745,7 +838,10 @@ fn convert_response_value_to_chat_chunk(
                 .or_else(|| value.get("usage").cloned())
             {
                 if let Some(obj) = out.as_object_mut() {
-                    obj.insert("usage".to_string(), usage);
+                    obj.insert(
+                        "usage".to_string(),
+                        normalize_responses_usage_for_chat_completion(usage),
+                    );
                 }
             }
             Some(out)
@@ -1030,6 +1126,65 @@ mod tests {
             json!("image_generation_call")
         );
         assert_eq!(mapped["choices"][0]["finish_reason"], json!("tool_calls"));
+    }
+
+    #[test]
+    fn completed_chat_completion_normalizes_responses_usage_for_openai_clients() {
+        let value = json!({
+            "id": "resp_1",
+            "model": "gpt-5.3-codex",
+            "usage": {
+                "input_tokens": 100,
+                "input_tokens_details": {
+                    "cached_tokens": 40
+                },
+                "output_tokens": 25
+            },
+            "output": [
+                {
+                    "type": "message",
+                    "content": [
+                        {"type": "output_text", "text": "done"}
+                    ]
+                }
+            ]
+        });
+
+        let mapped = super::map_response_to_chat_completion(&value, None);
+        assert_eq!(mapped["usage"]["prompt_tokens"], json!(100));
+        assert_eq!(mapped["usage"]["completion_tokens"], json!(25));
+        assert_eq!(mapped["usage"]["total_tokens"], json!(125));
+        assert_eq!(mapped["usage"]["prompt_tokens_details"]["cached_tokens"], json!(40));
+        assert_eq!(mapped["usage"]["input_tokens"], json!(100));
+        assert_eq!(mapped["usage"]["output_tokens"], json!(25));
+    }
+
+    #[test]
+    fn streamed_completed_chat_chunk_normalizes_responses_usage_for_openai_clients() {
+        let mut metadata = ChatStreamMetadata::default();
+        let value = json!({
+            "type": "response.completed",
+            "response": {
+                "id": "resp_1",
+                "model": "gpt-5.3-codex",
+                "usage": {
+                    "input_tokens": 50,
+                    "input_tokens_details": {
+                        "cached_tokens": 30
+                    },
+                    "output_tokens": 20
+                }
+            }
+        });
+
+        let chunk =
+            convert_response_value_to_chat_chunk(&value, None, &mut metadata).expect("chunk");
+        assert_eq!(chunk["usage"]["prompt_tokens"], json!(50));
+        assert_eq!(chunk["usage"]["completion_tokens"], json!(20));
+        assert_eq!(chunk["usage"]["total_tokens"], json!(70));
+        assert_eq!(chunk["usage"]["prompt_tokens_details"]["cached_tokens"], json!(30));
+        assert_eq!(chunk["usage"]["input_tokens"], json!(50));
+        assert_eq!(chunk["usage"]["output_tokens"], json!(20));
     }
 
     #[test]
