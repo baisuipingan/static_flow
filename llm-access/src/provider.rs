@@ -45,8 +45,9 @@ use llm_access_core::{
     routes::provider_route_requirement,
     store::{
         compute_kiro_billable_tokens, is_terminal_codex_auth_error, AdminConfigStore,
-        AuthenticatedKey, ControlStore, EmptyAdminConfigStore, ProviderCodexRoute,
-        ProviderKiroRoute, ProviderProxyConfig, ProviderRouteStore,
+        AdminKiroStatusCacheUpdate, AuthenticatedKey, ControlStore, EmptyAdminConfigStore,
+        ProviderCodexAuthUpdate, ProviderCodexRoute, ProviderKiroAuthUpdate, ProviderKiroRoute,
+        ProviderProxyConfig, ProviderRouteStore,
     },
     usage::{UsageEvent, UsageStreamDetails, UsageTiming},
 };
@@ -461,6 +462,39 @@ impl ProviderState {
         Arc::clone(&self.route_store)
     }
 
+    pub(crate) async fn authenticate_bearer_secret(
+        &self,
+        secret: &str,
+    ) -> anyhow::Result<Option<AuthenticatedKey>> {
+        self.control_store.authenticate_bearer_secret(secret).await
+    }
+
+    pub(crate) async fn dispatch_admin_probe_with_proxy(
+        &self,
+        key: AuthenticatedKey,
+        request: Request<Body>,
+        proxy: ProviderProxyConfig,
+    ) -> Response {
+        if !is_active_key(&key) {
+            return (StatusCode::FORBIDDEN, "llm key is not active").into_response();
+        }
+        if !key_matches_route(&key, request.uri().path()) {
+            return (StatusCode::FORBIDDEN, "llm key does not match provider route")
+                .into_response();
+        }
+        if is_quota_exhausted(&key) {
+            return quota_exhausted_response(&key);
+        }
+
+        let mut deps = self.dispatch_deps();
+        deps.route_store = Arc::new(ForcedProxyRouteStore {
+            inner: Arc::clone(&self.route_store),
+            proxy,
+        });
+        let _activity_guard = self.request_activity.start(&key.key_id);
+        self.dispatcher.dispatch(key, request, deps).await
+    }
+
     pub(crate) fn kiro_cache_stats(
         &self,
         config: KiroCacheSimulationConfig,
@@ -480,6 +514,133 @@ impl ProviderState {
             codex_account_cooldowns: Arc::clone(&self.codex_account_cooldowns),
             kiro_request_scheduler: Arc::clone(&self.kiro_request_scheduler),
         }
+    }
+}
+
+struct ForcedProxyRouteStore {
+    inner: Arc<dyn ProviderRouteStore>,
+    proxy: ProviderProxyConfig,
+}
+
+impl ForcedProxyRouteStore {
+    fn force_codex_proxy(&self, mut route: ProviderCodexRoute) -> ProviderCodexRoute {
+        route.proxy = Some(self.proxy.clone());
+        route
+    }
+
+    fn force_kiro_proxy(&self, mut route: ProviderKiroRoute) -> ProviderKiroRoute {
+        route.proxy = Some(self.proxy.clone());
+        route
+    }
+}
+
+#[async_trait]
+impl ProviderRouteStore for ForcedProxyRouteStore {
+    async fn resolve_codex_route(
+        &self,
+        key: &AuthenticatedKey,
+    ) -> anyhow::Result<Option<ProviderCodexRoute>> {
+        Ok(self
+            .inner
+            .resolve_codex_route(key)
+            .await?
+            .map(|route| self.force_codex_proxy(route)))
+    }
+
+    async fn resolve_codex_route_candidates(
+        &self,
+        key: &AuthenticatedKey,
+    ) -> anyhow::Result<Vec<ProviderCodexRoute>> {
+        Ok(self
+            .inner
+            .resolve_codex_route_candidates(key)
+            .await?
+            .into_iter()
+            .map(|route| self.force_codex_proxy(route))
+            .collect())
+    }
+
+    async fn resolve_codex_account_route(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<Option<ProviderCodexRoute>> {
+        Ok(self
+            .inner
+            .resolve_codex_account_route(account_name)
+            .await?
+            .map(|route| self.force_codex_proxy(route)))
+    }
+
+    async fn resolve_kiro_route(
+        &self,
+        key: &AuthenticatedKey,
+    ) -> anyhow::Result<Option<ProviderKiroRoute>> {
+        Ok(self
+            .inner
+            .resolve_kiro_route(key)
+            .await?
+            .map(|route| self.force_kiro_proxy(route)))
+    }
+
+    async fn resolve_kiro_route_candidates(
+        &self,
+        key: &AuthenticatedKey,
+    ) -> anyhow::Result<Vec<ProviderKiroRoute>> {
+        Ok(self
+            .inner
+            .resolve_kiro_route_candidates(key)
+            .await?
+            .into_iter()
+            .map(|route| self.force_kiro_proxy(route))
+            .collect())
+    }
+
+    async fn resolve_kiro_account_route(
+        &self,
+        account_name: &str,
+    ) -> anyhow::Result<Option<ProviderKiroRoute>> {
+        Ok(self
+            .inner
+            .resolve_kiro_account_route(account_name)
+            .await?
+            .map(|route| self.force_kiro_proxy(route)))
+    }
+
+    async fn save_kiro_auth_update(&self, update: ProviderKiroAuthUpdate) -> anyhow::Result<()> {
+        self.inner.save_kiro_auth_update(update).await
+    }
+
+    async fn save_codex_auth_update(&self, update: ProviderCodexAuthUpdate) -> anyhow::Result<()> {
+        self.inner.save_codex_auth_update(update).await
+    }
+
+    async fn set_codex_account_auto_refresh_enabled(
+        &self,
+        account_name: &str,
+        enabled: bool,
+        updated_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .set_codex_account_auto_refresh_enabled(account_name, enabled, updated_at_ms)
+            .await
+    }
+
+    async fn mark_kiro_account_quota_exhausted(
+        &self,
+        account_name: &str,
+        error_message: &str,
+        checked_at_ms: i64,
+    ) -> anyhow::Result<()> {
+        self.inner
+            .mark_kiro_account_quota_exhausted(account_name, error_message, checked_at_ms)
+            .await
+    }
+
+    async fn save_kiro_status_cache_update(
+        &self,
+        update: AdminKiroStatusCacheUpdate,
+    ) -> anyhow::Result<()> {
+        self.inner.save_kiro_status_cache_update(update).await
     }
 }
 
@@ -7161,6 +7322,17 @@ mod tests {
             Ok(Some(self.kiro_route.clone()))
         }
 
+        async fn resolve_kiro_account_route(
+            &self,
+            account_name: &str,
+        ) -> anyhow::Result<Option<ProviderKiroRoute>> {
+            if self.kiro_route.account_name == account_name {
+                Ok(Some(self.kiro_route.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+
         async fn save_kiro_auth_update(
             &self,
             _update: ProviderKiroAuthUpdate,
@@ -7604,6 +7776,67 @@ mod tests {
             proxy_password: None,
         });
         route
+    }
+
+    #[tokio::test]
+    async fn forced_proxy_route_store_overrides_candidates_and_hydrated_routes() {
+        let mut codex_route = codex_route_for_account("codex-a", "upstream-token");
+        codex_route.proxy = Some(ProviderProxyConfig {
+            proxy_url: "http://old-proxy:1000".to_string(),
+            proxy_username: None,
+            proxy_password: None,
+        });
+        let mut kiro_route = static_kiro_route();
+        kiro_route.proxy = Some(ProviderProxyConfig {
+            proxy_url: "http://old-proxy:1000".to_string(),
+            proxy_username: None,
+            proxy_password: None,
+        });
+        let forced_proxy = ProviderProxyConfig {
+            proxy_url: "socks5://forced-proxy:1080".to_string(),
+            proxy_username: Some("probe".to_string()),
+            proxy_password: Some("secret".to_string()),
+        };
+        let store = super::ForcedProxyRouteStore {
+            inner: Arc::new(StaticRouteStore {
+                codex_route,
+                kiro_route,
+            }),
+            proxy: forced_proxy.clone(),
+        };
+        let key = AuthenticatedKey {
+            key_id: "key".to_string(),
+            key_name: "probe-key".to_string(),
+            provider_type: "codex".to_string(),
+            protocol_family: "openai".to_string(),
+            status: "active".to_string(),
+            quota_billable_limit: 100,
+            billable_tokens_used: 0,
+        };
+
+        let codex_candidates = store
+            .resolve_codex_route_candidates(&key)
+            .await
+            .expect("codex candidates");
+        assert_eq!(codex_candidates[0].proxy.as_ref(), Some(&forced_proxy));
+        let codex_hydrated = store
+            .resolve_codex_account_route("codex-a")
+            .await
+            .expect("codex hydrate")
+            .expect("codex route");
+        assert_eq!(codex_hydrated.proxy.as_ref(), Some(&forced_proxy));
+
+        let kiro_candidates = store
+            .resolve_kiro_route_candidates(&key)
+            .await
+            .expect("kiro candidates");
+        assert_eq!(kiro_candidates[0].proxy.as_ref(), Some(&forced_proxy));
+        let kiro_hydrated = store
+            .resolve_kiro_account_route("kiro-a")
+            .await
+            .expect("kiro hydrate")
+            .expect("kiro route");
+        assert_eq!(kiro_hydrated.proxy.as_ref(), Some(&forced_proxy));
     }
 
     #[test]

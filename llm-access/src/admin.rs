@@ -10,9 +10,9 @@ use std::{
 
 use anyhow::Context;
 use axum::{
-    body::Body,
+    body::{to_bytes, Body},
     extract::{OriginalUri, Path, Query, State},
-    http::{header, HeaderMap, StatusCode, Uri},
+    http::{header, HeaderMap, Method, Request, StatusCode, Uri},
     response::{IntoResponse, Response},
     Json,
 };
@@ -95,6 +95,12 @@ const MAX_ADMIN_LIST_LIMIT: usize = 200;
 const DEFAULT_ADMIN_IMPORT_JOB_LIMIT: usize = 20;
 const MAX_ADMIN_IMPORT_JOB_LIMIT: usize = 50;
 const PROXY_CONNECTIVITY_CHECK_TIMEOUT_SECONDS: u64 = 10;
+const PROXY_FULL_CHAIN_CHECK_TIMEOUT_SECONDS: u64 = 120;
+const PROXY_FULL_CHAIN_CHECK_MAX_BODY_BYTES: usize = 1024 * 1024;
+const PROXY_FULL_CHAIN_CODEX_KEY_NAME: &str = "admin-key";
+const PROXY_FULL_CHAIN_KIRO_KEY_NAME: &str = "admin";
+const PROXY_FULL_CHAIN_CODEX_MODEL: &str = "gpt-5.5";
+const PROXY_FULL_CHAIN_KIRO_MODEL: &str = "claude-sonnet-4-6";
 const CODEX_ACCESS_TOKEN_VALIDATION_TIMEOUT_SECONDS: u64 = 20;
 const CODEX_WIRE_ORIGINATOR: &str = "codex_cli_rs";
 const BAND_CONTIGUITY_TOLERANCE: f64 = 1e-12;
@@ -419,6 +425,18 @@ struct AdminProxyCheckResponse {
     ok: bool,
     targets: Vec<AdminProxyCheckTargetView>,
     checked_at: i64,
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct CheckLlmGatewayProxyConfigRequest {
+    #[serde(default)]
+    mode: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AdminProxyCheckMode {
+    Connectivity,
+    FullChain,
 }
 
 #[derive(Debug, Serialize)]
@@ -1242,6 +1260,7 @@ pub(crate) async fn check_llm_gateway_proxy_config(
     State(state): State<HttpState>,
     headers: HeaderMap,
     Path((proxy_id, provider_type)): Path<(String, String)>,
+    payload: Option<Json<CheckLlmGatewayProxyConfigRequest>>,
 ) -> Response {
     if let Err(response) = ensure_admin_access(&headers) {
         return response.into_response();
@@ -1249,6 +1268,10 @@ pub(crate) async fn check_llm_gateway_proxy_config(
     if let Err(response) = validate_provider_type(&provider_type) {
         return response.into_response();
     }
+    let mode = match normalize_proxy_check_mode(payload.as_ref().map(|payload| &payload.0)) {
+        Ok(mode) => mode,
+        Err(response) => return response.into_response(),
+    };
     let proxy = match state
         .admin_proxy_store
         .get_admin_proxy_config(&proxy_id)
@@ -1258,7 +1281,15 @@ pub(crate) async fn check_llm_gateway_proxy_config(
         Ok(None) => return not_found("LLM gateway proxy config not found").into_response(),
         Err(_) => return internal_error("Failed to load llm gateway proxy config").into_response(),
     };
-    match run_proxy_connectivity_check(&proxy, &provider_type).await {
+    let check_result = match mode {
+        AdminProxyCheckMode::Connectivity => run_proxy_connectivity_check(&proxy, &provider_type)
+            .await
+            .map_err(|_| internal_error("Failed to check upstream proxy config")),
+        AdminProxyCheckMode::FullChain => {
+            run_proxy_full_chain_check(&state, &proxy, &provider_type).await
+        },
+    };
+    match check_result {
         Ok(result) => {
             if let Some(update) = proxy_endpoint_check_update_from_response(&result) {
                 match state
@@ -1283,7 +1314,7 @@ pub(crate) async fn check_llm_gateway_proxy_config(
             }
             Json(result).into_response()
         },
-        Err(_) => internal_error("Failed to check upstream proxy config").into_response(),
+        Err(response) => response.into_response(),
     }
 }
 
@@ -4980,6 +5011,176 @@ async fn run_proxy_connectivity_check(
         targets: vec![target],
         checked_at: now_ms(),
     })
+}
+
+async fn run_proxy_full_chain_check(
+    state: &HttpState,
+    proxy: &core_store::AdminProxyConfig,
+    provider_type: &str,
+) -> Result<AdminProxyCheckResponse, AdminHttpError> {
+    let spec = proxy_full_chain_probe_spec(provider_type);
+    let admin_key = load_full_chain_probe_key(state, spec.key_name, provider_type).await?;
+    let authenticated_key = state
+        .provider_state
+        .authenticate_bearer_secret(&admin_key.secret)
+        .await
+        .map_err(|_| internal_error("Failed to authenticate real proxy probe key"))?
+        .ok_or_else(|| internal_error("Real proxy probe key secret is not accepted"))?;
+    if authenticated_key.key_id != admin_key.id
+        || authenticated_key.provider_type != provider_type
+        || authenticated_key.status != KEY_STATUS_ACTIVE
+    {
+        return Err(internal_error("Real proxy probe key state is inconsistent"));
+    }
+    let proxy_config = provider_proxy_config_from_admin(proxy);
+    let request = Request::builder()
+        .method(Method::POST)
+        .uri(spec.path)
+        .header(header::CONTENT_TYPE, "application/json")
+        .header(header::USER_AGENT, "llm-access-admin-proxy-probe")
+        .body(Body::from(spec.body))
+        .map_err(|_| internal_error("Failed to build real proxy probe request"))?;
+
+    let started_at = Instant::now();
+    let result =
+        tokio::time::timeout(Duration::from_secs(PROXY_FULL_CHAIN_CHECK_TIMEOUT_SECONDS), async {
+            let response = state
+                .provider_state
+                .dispatch_admin_probe_with_proxy(authenticated_key, request, proxy_config)
+                .await;
+            let status = response.status();
+            let bytes = to_bytes(response.into_body(), PROXY_FULL_CHAIN_CHECK_MAX_BODY_BYTES)
+                .await
+                .context("read real proxy probe response body")?;
+            Ok::<_, anyhow::Error>((status, String::from_utf8_lossy(&bytes).to_string()))
+        })
+        .await;
+    let latency_ms = started_at.elapsed().as_millis().min(i64::MAX as u128) as i64;
+    let target = match result {
+        Ok(Ok((status, body))) => AdminProxyCheckTargetView {
+            target: provider_type.to_string(),
+            url: spec.path.to_string(),
+            reachable: status.is_success(),
+            status_code: Some(status.as_u16()),
+            latency_ms,
+            error_message: (!status.is_success()).then(|| summarize_upstream_error_body(&body)),
+        },
+        Ok(Err(err)) => AdminProxyCheckTargetView {
+            target: provider_type.to_string(),
+            url: spec.path.to_string(),
+            reachable: false,
+            status_code: None,
+            latency_ms,
+            error_message: Some(err.to_string()),
+        },
+        Err(_) => AdminProxyCheckTargetView {
+            target: provider_type.to_string(),
+            url: spec.path.to_string(),
+            reachable: false,
+            status_code: None,
+            latency_ms,
+            error_message: Some(format!(
+                "real gateway probe timed out after {PROXY_FULL_CHAIN_CHECK_TIMEOUT_SECONDS}s"
+            )),
+        },
+    };
+    Ok(AdminProxyCheckResponse {
+        proxy_config_id: proxy.id.clone(),
+        proxy_config_name: proxy.name.clone(),
+        provider_type: provider_type.to_string(),
+        auth_label: format!("{} real gateway probe", spec.key_name),
+        ok: target.reachable,
+        targets: vec![target],
+        checked_at: now_ms(),
+    })
+}
+
+struct ProxyFullChainProbeSpec {
+    key_name: &'static str,
+    path: &'static str,
+    body: Vec<u8>,
+}
+
+fn proxy_full_chain_probe_spec(provider_type: &str) -> ProxyFullChainProbeSpec {
+    match provider_type {
+        PROVIDER_CODEX => ProxyFullChainProbeSpec {
+            key_name: PROXY_FULL_CHAIN_CODEX_KEY_NAME,
+            path: "/api/codex-gateway/v1/responses",
+            body: serde_json::to_vec(&serde_json::json!({
+                "model": PROXY_FULL_CHAIN_CODEX_MODEL,
+                "input": "ping",
+                "instructions": "Reply with one short word.",
+                "max_output_tokens": 1,
+                "stream": true
+            }))
+            .expect("static codex probe json should serialize"),
+        },
+        PROVIDER_KIRO => ProxyFullChainProbeSpec {
+            key_name: PROXY_FULL_CHAIN_KIRO_KEY_NAME,
+            path: "/api/kiro-gateway/v1/messages",
+            body: serde_json::to_vec(&serde_json::json!({
+                "model": PROXY_FULL_CHAIN_KIRO_MODEL,
+                "max_tokens": 1,
+                "stream": true,
+                "messages": [{
+                    "role": "user",
+                    "content": "ping"
+                }]
+            }))
+            .expect("static kiro probe json should serialize"),
+        },
+        _ => unreachable!("provider type must be validated before proxy check"),
+    }
+}
+
+async fn load_full_chain_probe_key(
+    state: &HttpState,
+    key_name: &str,
+    provider_type: &str,
+) -> Result<core_store::AdminKey, AdminHttpError> {
+    let keys = state
+        .admin_key_store
+        .list_admin_keys()
+        .await
+        .map_err(|_| internal_error("Failed to load real proxy probe keys"))?;
+    keys.into_iter()
+        .find(|key| {
+            key.name == key_name
+                && key.provider_type == provider_type
+                && key.status == KEY_STATUS_ACTIVE
+        })
+        .ok_or_else(|| {
+            not_found(&format!(
+                "Active {provider_type} real proxy probe key '{key_name}' not found"
+            ))
+        })
+}
+
+fn provider_proxy_config_from_admin(
+    proxy: &core_store::AdminProxyConfig,
+) -> core_store::ProviderProxyConfig {
+    core_store::ProviderProxyConfig {
+        proxy_url: proxy.proxy_url.clone(),
+        proxy_username: proxy.proxy_username.clone(),
+        proxy_password: proxy.proxy_password.clone(),
+    }
+}
+
+fn normalize_proxy_check_mode(
+    request: Option<&CheckLlmGatewayProxyConfigRequest>,
+) -> Result<AdminProxyCheckMode, AdminHttpError> {
+    let Some(mode) = request
+        .and_then(|request| request.mode.as_deref())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(AdminProxyCheckMode::Connectivity);
+    };
+    match mode {
+        "connectivity" => Ok(AdminProxyCheckMode::Connectivity),
+        "full_chain" | "real" | "real_gateway" => Ok(AdminProxyCheckMode::FullChain),
+        _ => Err(bad_request("unknown proxy check mode")),
+    }
 }
 
 fn proxy_endpoint_check_update_from_response(

@@ -1,6 +1,5 @@
 use js_sys::Date;
-use wasm_bindgen::prelude::*;
-use wasm_bindgen::JsCast;
+use wasm_bindgen::{prelude::*, JsCast};
 use web_sys::{HtmlInputElement, HtmlSelectElement};
 use yew::prelude::*;
 
@@ -134,9 +133,18 @@ pub fn date_range_picker(props: &DateRangePickerProps) -> Html {
     let view_year = use_state(|| initial_view_year);
     let view_month = use_state(|| initial_view_month);
 
-    let start_hour = use_state(|| props.start_ms.map(|ms| ms_to_local_parts(ms).3).unwrap_or(0));
-    let start_minute =
-        use_state(|| props.start_ms.map(|ms| ms_to_local_parts(ms).4).unwrap_or(0));
+    let start_hour = use_state(|| {
+        props
+            .start_ms
+            .map(|ms| ms_to_local_parts(ms).3)
+            .unwrap_or(0)
+    });
+    let start_minute = use_state(|| {
+        props
+            .start_ms
+            .map(|ms| ms_to_local_parts(ms).4)
+            .unwrap_or(0)
+    });
     let end_hour = use_state(|| props.end_ms.map(|ms| ms_to_local_parts(ms).3).unwrap_or(23));
     let end_minute = use_state(|| props.end_ms.map(|ms| ms_to_local_parts(ms).4).unwrap_or(59));
 
@@ -153,8 +161,7 @@ pub fn date_range_picker(props: &DateRangePickerProps) -> Html {
         })
     });
 
-    let presets =
-        if props.presets.is_empty() { default_presets() } else { props.presets.clone() };
+    let presets = if props.presets.is_empty() { default_presets() } else { props.presets.clone() };
 
     // Sync draft state from props when popup opens or props change.
     {
@@ -215,20 +222,20 @@ pub fn date_range_picker(props: &DateRangePickerProps) -> Html {
                 if let Some(doc) = document {
                     let panel_ref = panel_ref.clone();
                     let open = open.clone();
-                    let listener = wasm_bindgen::closure::Closure::wrap(Box::new(
-                        move |evt: web_sys::Event| {
+                    let listener =
+                        wasm_bindgen::closure::Closure::wrap(Box::new(move |evt: web_sys::Event| {
                             if let Some(panel) = panel_ref.get() {
-                                if let Some(target) =
-                                    evt.target().and_then(|t| t.dyn_into::<web_sys::Node>().ok())
+                                if let Some(target) = evt
+                                    .target()
+                                    .and_then(|t| t.dyn_into::<web_sys::Node>().ok())
                                 {
                                     if !panel.contains(Some(&target)) {
                                         open.set(false);
                                     }
                                 }
                             }
-                        },
-                    )
-                        as Box<dyn FnMut(web_sys::Event)>);
+                        })
+                            as Box<dyn FnMut(web_sys::Event)>);
                     let _ = doc.add_event_listener_with_callback(
                         "mousedown",
                         listener.as_ref().unchecked_ref(),
@@ -407,26 +414,21 @@ pub fn date_range_picker(props: &DateRangePickerProps) -> Html {
             let on_day_click = on_day_click.clone();
 
             let mut style = String::new();
-            let mut classes_str =
-                "h-8 rounded-md text-xs font-medium flex items-center justify-center \
-                 cursor-pointer transition-all select-none"
-                    .to_string();
+            let mut classes_str = "h-8 rounded-md text-xs font-medium flex items-center \
+                                   justify-center cursor-pointer transition-all select-none"
+                .to_string();
 
             if is_start || is_end {
                 style.push_str(
-                    "background:var(--primary);color:#fff;\
-                     box-shadow:0 2px 6px rgba(var(--primary-rgb),0.35);",
+                    "background:var(--primary);color:#fff;box-shadow:0 2px 6px \
+                     rgba(var(--primary-rgb),0.35);",
                 );
             } else if in_range {
-                style.push_str(
-                    "background:rgba(var(--primary-rgb),0.12);\
-                     color:var(--primary);",
-                );
+                style.push_str("background:rgba(var(--primary-rgb),0.12);color:var(--primary);");
             } else if is_today {
                 classes_str.push_str(" hover:bg-[var(--surface-alt)]");
                 style.push_str(
-                    "border:1px solid rgba(var(--primary-rgb),0.4);\
-                     color:var(--primary);",
+                    "border:1px solid rgba(var(--primary-rgb),0.4);color:var(--primary);",
                 );
             } else {
                 classes_str.push_str(" hover:bg-[var(--surface-alt)] text-[var(--text)]");
@@ -446,7 +448,8 @@ pub fn date_range_picker(props: &DateRangePickerProps) -> Html {
         cells
     };
 
-    // Year options: from 5 years ago to next year, plus include current view year if outside.
+    // Year options: from 5 years ago to next year, plus include current view year
+    // if outside.
     let year_options: Vec<u32> = {
         let mut years: Vec<u32> = (now_year.saturating_sub(5)..=now_year + 1).collect();
         if !years.contains(&year) {
@@ -458,10 +461,14 @@ pub fn date_range_picker(props: &DateRangePickerProps) -> Html {
     };
 
     let draft_start_text = (*draft_start_day)
-        .map(|(y, m, d)| format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m + 1, d, *start_hour, *start_minute))
+        .map(|(y, m, d)| {
+            format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m + 1, d, *start_hour, *start_minute)
+        })
         .unwrap_or_else(|| "未选择".to_string());
     let draft_end_text = (*draft_end_day)
-        .map(|(y, m, d)| format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m + 1, d, *end_hour, *end_minute))
+        .map(|(y, m, d)| {
+            format!("{:04}-{:02}-{:02} {:02}:{:02}", y, m + 1, d, *end_hour, *end_minute)
+        })
         .unwrap_or_else(|| "未选择".to_string());
 
     let has_value = props.start_ms.is_some() || props.end_ms.is_some();

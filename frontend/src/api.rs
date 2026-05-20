@@ -7916,24 +7916,46 @@ pub async fn check_admin_llm_gateway_proxy_config(
     proxy_id: &str,
     provider_type: &str,
 ) -> Result<AdminUpstreamProxyCheckResponse, String> {
+    check_admin_llm_gateway_proxy_config_with_mode(proxy_id, provider_type, None).await
+}
+
+pub async fn check_admin_llm_gateway_proxy_config_full_chain(
+    proxy_id: &str,
+    provider_type: &str,
+) -> Result<AdminUpstreamProxyCheckResponse, String> {
+    check_admin_llm_gateway_proxy_config_with_mode(proxy_id, provider_type, Some("full_chain"))
+        .await
+}
+
+async fn check_admin_llm_gateway_proxy_config_with_mode(
+    proxy_id: &str,
+    provider_type: &str,
+    mode: Option<&str>,
+) -> Result<AdminUpstreamProxyCheckResponse, String> {
     #[cfg(feature = "mock")]
     {
         Ok(AdminUpstreamProxyCheckResponse {
             proxy_config_id: proxy_id.to_string(),
             proxy_config_name: "mock-proxy".to_string(),
             provider_type: provider_type.to_string(),
-            auth_label: format!("{provider_type} auth `mock`"),
+            auth_label: mode
+                .map(|mode| format!("{provider_type} {mode} probe `mock`"))
+                .unwrap_or_else(|| format!("{provider_type} auth `mock`")),
             ok: true,
             targets: vec![AdminUpstreamProxyCheckTargetView {
                 target: provider_type.to_string(),
-                url: if provider_type == "kiro" {
+                url: if mode == Some("full_chain") && provider_type == "kiro" {
+                    "/api/kiro-gateway/v1/messages".to_string()
+                } else if mode == Some("full_chain") {
+                    "/api/codex-gateway/v1/responses".to_string()
+                } else if provider_type == "kiro" {
                     "https://management.us-east-1.kiro.dev/getUsageLimits".to_string()
                 } else {
                     "https://chatgpt.com/backend-api/codex/v1/models".to_string()
                 },
                 reachable: true,
                 status_code: Some(200),
-                latency_ms: 120,
+                latency_ms: if mode == Some("full_chain") { 842 } else { 120 },
                 error_message: None,
             }],
             checked_at: 0,
@@ -7948,10 +7970,16 @@ pub async fn check_admin_llm_gateway_proxy_config(
             urlencoding::encode(proxy_id),
             urlencoding::encode(provider_type)
         );
-        let response = api_post(&url)
-            .send()
-            .await
-            .map_err(|e| format!("Network error: {:?}", e))?;
+        let response = if let Some(mode) = mode {
+            api_post(&url)
+                .json(&serde_json::json!({ "mode": mode }))
+                .map_err(|e| format!("Serialize error: {:?}", e))?
+                .send()
+                .await
+        } else {
+            api_post(&url).send().await
+        }
+        .map_err(|e| format!("Network error: {:?}", e))?;
         if !response.ok() {
             let text = response.text().await.unwrap_or_default();
             return Err(format!("Failed: {text}"));

@@ -1238,9 +1238,8 @@ fn collect_openai_tool_names(obj: &Map<String, Value>) -> Vec<String> {
             let Some(function_obj) = function.as_object() else {
                 continue;
             };
-            let name = coerce_non_empty_scalar_to_string(legacy_openai_function_name_value(
-                function_obj,
-            ));
+            let name =
+                coerce_non_empty_scalar_to_string(legacy_openai_function_name_value(function_obj));
             if let Some(name) = name {
                 names.push(name);
             }
@@ -1973,10 +1972,7 @@ fn adapt_openai_chat_completions_request(
     if !out.contains_key("tool_choice") {
         if let Some(function_call) = obj.get("function_call") {
             if let Some(function_call_str) = function_call.as_str() {
-                out.insert(
-                    "tool_choice".to_string(),
-                    Value::String(function_call_str.to_string()),
-                );
+                out.insert("tool_choice".to_string(), Value::String(function_call_str.to_string()));
             } else if let Some(function_call_obj) = function_call.as_object() {
                 if let Some(name) = coerce_non_empty_scalar_to_string(
                     legacy_openai_function_name_value(function_call_obj),

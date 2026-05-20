@@ -15,11 +15,12 @@ use crate::{
         admin_reject_llm_gateway_account_contribution_request,
         admin_reject_llm_gateway_token_request,
         admin_validate_llm_gateway_account_contribution_request,
-        check_admin_llm_gateway_proxy_config, create_admin_llm_gateway_account_group,
-        create_admin_llm_gateway_account_import_job, create_admin_llm_gateway_key,
-        create_admin_llm_gateway_proxy_config, delete_admin_llm_gateway_account,
-        delete_admin_llm_gateway_account_group, delete_admin_llm_gateway_key,
-        delete_admin_llm_gateway_proxy_config, delete_admin_llm_gateway_sponsor_request,
+        check_admin_llm_gateway_proxy_config, check_admin_llm_gateway_proxy_config_full_chain,
+        create_admin_llm_gateway_account_group, create_admin_llm_gateway_account_import_job,
+        create_admin_llm_gateway_key, create_admin_llm_gateway_proxy_config,
+        delete_admin_llm_gateway_account, delete_admin_llm_gateway_account_group,
+        delete_admin_llm_gateway_key, delete_admin_llm_gateway_proxy_config,
+        delete_admin_llm_gateway_sponsor_request,
         fetch_admin_llm_gateway_account_contribution_requests,
         fetch_admin_llm_gateway_account_group_options, fetch_admin_llm_gateway_account_groups_page,
         fetch_admin_llm_gateway_account_import_job, fetch_admin_llm_gateway_account_import_jobs,
@@ -1932,7 +1933,7 @@ fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
     };
     let form = use_state(|| ProxyForm::from_config(&proxy_config));
     let saving = use_state(|| false);
-    let checking = use_state(|| false);
+    let checking = use_state(|| None::<String>);
     let feedback = use_state(|| None::<String>);
 
     {
@@ -2073,37 +2074,49 @@ fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
         let feedback = feedback.clone();
         let on_changed = props.on_changed.clone();
         let on_flash = props.on_flash.clone();
-        Callback::from(move |provider_type: String| {
+        Callback::from(move |(provider_type, full_chain): (String, bool)| {
             let proxy_id = proxy_id.clone();
             let checking = checking.clone();
             let feedback = feedback.clone();
             let on_changed = on_changed.clone();
             let on_flash = on_flash.clone();
             wasm_bindgen_futures::spawn_local(async move {
-                if *checking {
+                if (*checking).is_some() {
                     return;
                 }
-                checking.set(true);
-                match check_admin_llm_gateway_proxy_config(&proxy_id, &provider_type).await {
+                let action_key = format!(
+                    "{}-{}",
+                    provider_type,
+                    if full_chain { "full-chain" } else { "connectivity" }
+                );
+                let action_label = if full_chain {
+                    format!("{} 全链路", provider_type.to_uppercase())
+                } else {
+                    provider_type.to_uppercase()
+                };
+                checking.set(Some(action_key));
+                let result = if full_chain {
+                    check_admin_llm_gateway_proxy_config_full_chain(&proxy_id, &provider_type).await
+                } else {
+                    check_admin_llm_gateway_proxy_config(&proxy_id, &provider_type).await
+                };
+                match result {
                     Ok(result) => {
                         let message = format_proxy_check_message(&result);
                         feedback.set(Some(if result.ok {
-                            format!("{} 检查完成", provider_type.to_uppercase())
+                            format!("{action_label} 检查完成")
                         } else {
-                            format!("{} 检查失败", provider_type.to_uppercase())
+                            format!("{action_label} 检查失败")
                         }));
                         on_flash.emit((message, !result.ok));
                         on_changed.emit(());
                     },
                     Err(err) => {
                         feedback.set(Some(err.clone()));
-                        on_flash.emit((
-                            format!("{} 代理检查失败\n{err}", provider_type.to_uppercase()),
-                            true,
-                        ));
+                        on_flash.emit((format!("{action_label} 代理检查失败\n{err}"), true));
                     },
                 }
-                checking.set(false);
+                checking.set(None);
             });
         })
     };
@@ -2269,21 +2282,41 @@ fn proxy_config_editor_card(props: &ProxyConfigEditorCardProps) -> Html {
                     class={classes!("btn-terminal")}
                     onclick={{
                         let on_check_provider = on_check_provider.clone();
-                        Callback::from(move |_| on_check_provider.emit("codex".to_string()))
+                        Callback::from(move |_| on_check_provider.emit(("codex".to_string(), false)))
                     }}
-                    disabled={*saving || *checking}
+                    disabled={*saving || (*checking).is_some()}
                 >
-                    { if *checking { "检查中..." } else { "检查 Codex" } }
+                    { if (*checking).as_deref() == Some("codex-connectivity") { "检查中..." } else { "检查 Codex" } }
                 </button>
                 <button
                     class={classes!("btn-terminal")}
                     onclick={{
                         let on_check_provider = on_check_provider.clone();
-                        Callback::from(move |_| on_check_provider.emit("kiro".to_string()))
+                        Callback::from(move |_| on_check_provider.emit(("kiro".to_string(), false)))
                     }}
-                    disabled={*saving || *checking}
+                    disabled={*saving || (*checking).is_some()}
                 >
-                    { if *checking { "检查中..." } else { "检查 Kiro" } }
+                    { if (*checking).as_deref() == Some("kiro-connectivity") { "检查中..." } else { "检查 Kiro" } }
+                </button>
+                <button
+                    class={classes!("btn-terminal")}
+                    onclick={{
+                        let on_check_provider = on_check_provider.clone();
+                        Callback::from(move |_| on_check_provider.emit(("codex".to_string(), true)))
+                    }}
+                    disabled={*saving || (*checking).is_some()}
+                >
+                    { if (*checking).as_deref() == Some("codex-full-chain") { "请求中..." } else { "全链路 Codex" } }
+                </button>
+                <button
+                    class={classes!("btn-terminal")}
+                    onclick={{
+                        let on_check_provider = on_check_provider.clone();
+                        Callback::from(move |_| on_check_provider.emit(("kiro".to_string(), true)))
+                    }}
+                    disabled={*saving || (*checking).is_some()}
+                >
+                    { if (*checking).as_deref() == Some("kiro-full-chain") { "请求中..." } else { "全链路 Kiro" } }
                 </button>
                 <button class={classes!("btn-terminal", "btn-terminal-primary")} onclick={on_save.clone()} disabled={*saving}>
                     { if *saving { "保存中..." } else { "保存" } }

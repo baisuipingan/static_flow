@@ -28,12 +28,12 @@ pub mod probe;
 pub mod routes;
 /// Shared service state and initialization.
 pub mod state;
+/// Shared request and response types.
+pub mod types;
 /// Resumable upload lifecycle and chunk append logic.
 pub mod upload;
 /// Disk-backed upload task metadata storage.
 pub mod upload_store;
-/// Shared request and response types.
-pub mod types;
 
 /// Re-exported local-media state for the media service.
 pub use state::LocalMediaState;

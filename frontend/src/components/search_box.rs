@@ -1,7 +1,8 @@
 //! Reusable inline search box for admin list filtering.
 //!
 //! Behavior:
-//! * Controlled by parent: `value` / `on_change` + debounced `on_debounced_change`.
+//! * Controlled by parent: `value` / `on_change` + debounced
+//!   `on_debounced_change`.
 //! * Optional `on_submit` fired on Enter (for server-driven searches that
 //!   trigger a refetch only on explicit confirmation).
 //! * `x` button clears the value (fires `on_change("")`).
@@ -28,7 +29,8 @@ pub struct SearchBoxProps {
     pub debounce_ms: u32,
     #[prop_or_default]
     pub input_class: Classes,
-    /// When `true`, the clear (×) button is hidden even if `value` is non-empty.
+    /// When `true`, the clear (×) button is hidden even if `value` is
+    /// non-empty.
     #[prop_or(false)]
     pub hide_clear: bool,
 }

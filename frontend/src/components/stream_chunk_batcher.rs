@@ -28,8 +28,7 @@
 //! the batching. Call `cancel()` explicitly from the effect cleanup path
 //! (or from the owner's `Drop`) to abort a pending flush.
 
-use std::cell::RefCell;
-use std::rc::Rc;
+use std::{cell::RefCell, rc::Rc};
 
 use gloo_timers::callback::Timeout;
 use yew::UseStateHandle;
@@ -37,7 +36,8 @@ use yew::UseStateHandle;
 /// Default interval between flushes.
 pub const DEFAULT_FLUSH_INTERVAL_MS: u32 = 100;
 
-/// Batches SSE chunks and flushes them into a `Vec<T>` state at a fixed cadence.
+/// Batches SSE chunks and flushes them into a `Vec<T>` state at a fixed
+/// cadence.
 ///
 /// Cheap to clone (internal `Rc`); all clones share the same pending buffer
 /// and timer slot.
@@ -55,7 +55,9 @@ where
     K: PartialEq + 'static,
 {
     fn clone(&self) -> Self {
-        Self { inner: self.inner.clone() }
+        Self {
+            inner: self.inner.clone(),
+        }
     }
 }
 
@@ -123,7 +125,10 @@ where
             let before = next.len();
             for chunk in drained {
                 let key = (inner.dedup_key)(&chunk);
-                if !next.iter().any(|existing| (inner.dedup_key)(existing) == key) {
+                if !next
+                    .iter()
+                    .any(|existing| (inner.dedup_key)(existing) == key)
+                {
                     next.push(chunk);
                 }
             }
