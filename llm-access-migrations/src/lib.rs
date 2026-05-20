@@ -103,6 +103,11 @@ const POSTGRES_MIGRATIONS: &[SqlMigration] = &[
         name: "proxy_config_endpoint_checks",
         sql: include_str!("../migrations/postgres/0012_proxy_config_endpoint_checks.sql"),
     },
+    SqlMigration {
+        version: 13,
+        name: "kiro_remote_media_resolution",
+        sql: include_str!("../migrations/postgres/0013_kiro_remote_media_resolution.sql"),
+    },
 ];
 
 /// Return target SQLite migrations in execution order.
@@ -333,6 +338,20 @@ mod tests {
         assert!(migration
             .sql
             .contains("REFERENCES llm_proxy_configs(proxy_config_id)"));
+    }
+
+    #[test]
+    fn postgres_migrations_include_kiro_remote_media_resolution_toggle() {
+        let migrations = super::postgres_migrations();
+        let migration = migrations
+            .iter()
+            .find(|migration| migration.name == "kiro_remote_media_resolution")
+            .expect("kiro remote media migration exists");
+
+        assert_eq!(migration.version, 13);
+        assert!(migration
+            .sql
+            .contains("kiro_remote_media_resolution_enabled"));
     }
 
     #[test]

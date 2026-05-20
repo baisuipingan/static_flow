@@ -105,6 +105,8 @@ pub(crate) struct CachedKiroRequestSnapshot {
     pub cache_estimation_enabled: bool,
     pub zero_cache_debug_enabled: bool,
     pub full_request_logging_enabled: bool,
+    #[serde(default)]
+    pub remote_media_resolution_enabled: bool,
     pub model_name_map_json: String,
     pub cache_kmodels_json: String,
     pub cache_policy_json: String,

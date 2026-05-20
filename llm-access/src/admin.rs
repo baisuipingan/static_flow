@@ -522,6 +522,8 @@ pub(crate) struct PatchLlmGatewayKeyRequest {
     #[serde(default)]
     kiro_full_request_logging_enabled: Option<bool>,
     #[serde(default)]
+    kiro_remote_media_resolution_enabled: Option<bool>,
+    #[serde(default)]
     kiro_cache_policy_override_json: Option<Option<String>>,
     #[serde(default)]
     kiro_billable_model_multipliers_override_json: Option<Option<String>>,
@@ -5526,6 +5528,7 @@ fn normalize_key_patch(
         kiro_cache_estimation_enabled: request.kiro_cache_estimation_enabled,
         kiro_zero_cache_debug_enabled: request.kiro_zero_cache_debug_enabled,
         kiro_full_request_logging_enabled: request.kiro_full_request_logging_enabled,
+        kiro_remote_media_resolution_enabled: request.kiro_remote_media_resolution_enabled,
         kiro_cache_policy_override_json: request.kiro_cache_policy_override_json,
         kiro_billable_model_multipliers_override_json,
         updated_at_ms: now_ms(),
@@ -6506,6 +6509,7 @@ mod tests {
             kiro_cache_estimation_enabled: None,
             kiro_zero_cache_debug_enabled: None,
             kiro_full_request_logging_enabled: None,
+            kiro_remote_media_resolution_enabled: None,
             kiro_cache_policy_override_json: None,
             kiro_billable_model_multipliers_override_json: None,
         }
@@ -6541,6 +6545,7 @@ mod tests {
             kiro_cache_estimation_enabled: true,
             kiro_zero_cache_debug_enabled: false,
             kiro_full_request_logging_enabled: false,
+            kiro_remote_media_resolution_enabled: false,
             kiro_cache_policy_override_json: policy_override_json,
             kiro_billable_model_multipliers_override_json: None,
             effective_kiro_cache_policy_json: "{}".to_string(),
@@ -6631,6 +6636,16 @@ mod tests {
         let patch = normalize_key_patch(request).expect("full request logging toggle");
 
         assert_eq!(patch.kiro_full_request_logging_enabled, Some(true));
+    }
+
+    #[test]
+    fn normalize_key_patch_accepts_kiro_remote_media_resolution_toggle() {
+        let mut request = empty_key_patch_request();
+        request.kiro_remote_media_resolution_enabled = Some(true);
+
+        let patch = normalize_key_patch(request).expect("remote media resolution toggle");
+
+        assert_eq!(patch.kiro_remote_media_resolution_enabled, Some(true));
     }
 
     #[test]

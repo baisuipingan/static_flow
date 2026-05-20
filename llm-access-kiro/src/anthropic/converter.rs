@@ -13,7 +13,7 @@ use base64::Engine as _;
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
 
-use super::types::{ContentBlock, MessagesRequest, Metadata};
+use super::types::{ContentBlock, MessagesRequest, Metadata, SystemMessage};
 use crate::wire::{
     AssistantMessage, ConversationState, CurrentMessage, HistoryAssistantMessage,
     HistoryUserMessage, InputSchema, KiroDocument, KiroImage, Message, Tool, ToolResult,
@@ -1384,8 +1384,8 @@ pub fn convert_normalized_request_with_resolved_session(
         .iter()
         .any(request_message_contains_image);
 
-    let agent_continuation_id = Uuid::new_v4().to_string();
     let mut user_input = merge_current_user_messages(&current_messages, &model_id)?;
+    apply_thinking_prefix_to_current_turn(req, &mut user_input);
     let mut tool_name_map = HashMap::new();
     let mut tools = convert_tools(&req.tools, &mut tool_name_map);
     let structured_output_tool_name = append_structured_output_tool(req, &mut tools);
@@ -1428,8 +1428,6 @@ pub fn convert_normalized_request_with_resolved_session(
 
     Ok(ConversionResult {
         conversation_state: ConversationState::new(resolved_conversation.conversation_id)
-            .with_agent_continuation_id(agent_continuation_id)
-            .with_agent_task_type("vibe")
             .with_chat_trigger_type("MANUAL")
             .with_current_message(CurrentMessage::new(user_input))
             .with_history(history),
@@ -1981,8 +1979,10 @@ fn append_structured_output_tool(req: &MessagesRequest, tools: &mut Vec<Tool>) -
     Some(tool_name)
 }
 
-// Generates the XML thinking-mode prefix to inject into the system prompt
-// based on the request's thinking configuration.
+// Generates the XML thinking-mode prefix from the request's thinking
+// configuration. This is intentionally applied only to the current user turn:
+// Kiro has no first-class thinking-level request field, and placing the dynamic
+// level/budget in history would poison the stable cache prefix.
 //
 // For adaptive thinking, preserve the caller's exact effort label instead of
 // normalizing it. Local verification against Kiro showed that `low`,
@@ -2015,7 +2015,23 @@ fn generate_thinking_prefix(req: &MessagesRequest) -> Option<String> {
 }
 
 fn has_thinking_tags(content: &str) -> bool {
-    content.contains("<thinking_mode>") || content.contains("<max_thinking_length>")
+    content.contains("<thinking_mode>")
+        || content.contains("<max_thinking_length>")
+        || content.contains("<thinking_effort>")
+}
+
+fn apply_thinking_prefix_to_current_turn(req: &MessagesRequest, user_input: &mut UserInputMessage) {
+    let Some(prefix) = generate_thinking_prefix(req) else {
+        return;
+    };
+    if has_thinking_tags(&user_input.content) {
+        return;
+    }
+    user_input.content = if user_input.content.is_empty() {
+        prefix
+    } else {
+        format!("{prefix}\n{}", user_input.content)
+    };
 }
 
 fn requested_model_identity_id(model: &str) -> &str {
@@ -2075,52 +2091,37 @@ fn normalize_claude_code_model_identity(content: String, requested_model: &str) 
 }
 
 fn strip_volatile_claude_code_billing_header(content: String) -> String {
-    let mut line_start = 0;
-    while line_start < content.len() {
-        let line_end = content[line_start..]
-            .find('\n')
-            .map(|offset| line_start + offset)
-            .unwrap_or(content.len());
-        let next_line_start = if line_end < content.len() { line_end + 1 } else { line_end };
-        let line = &content[line_start..line_end];
-        if line.starts_with(CLAUDE_CODE_BILLING_HEADER_PREFIX) {
-            let remainder = content[next_line_start..].trim_start();
-            if starts_with_claude_identity(remainder) {
-                let prefix = &content[..line_start];
-                return if prefix.is_empty() {
-                    remainder.to_string()
-                } else if prefix.ends_with('\n') {
-                    format!("{prefix}{remainder}")
-                } else {
-                    format!("{prefix}\n{remainder}")
-                };
-            }
-        }
-        if line_end == content.len() {
-            break;
-        }
-        line_start = next_line_start;
-    }
     content
+        .lines()
+        .filter(|line| !is_claude_code_billing_header_text(line))
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
-fn starts_with_claude_identity(content: &str) -> bool {
-    content.starts_with(CLAUDE_CODE_CLI_SYSTEM_IDENTITY_LINE)
-        || content.starts_with(CLAUDE_AGENT_SDK_SYSTEM_IDENTITY_LINE)
+fn is_claude_code_billing_header_text(content: &str) -> bool {
+    let trimmed = content.trim_start();
+    trimmed.starts_with(CLAUDE_CODE_BILLING_HEADER_PREFIX)
+        && (trimmed.contains("cc_version=")
+            || trimmed.contains("cc_entrypoint=")
+            || trimmed.contains("cch="))
+}
+
+fn cleaned_system_message_text(message: &SystemMessage) -> Option<String> {
+    let content = strip_volatile_claude_code_billing_header(message.text.clone());
+    (!content.trim().is_empty()).then_some(content)
 }
 
 fn build_injected_system_content(
     req: &MessagesRequest,
     structured_output_tool_name: Option<&str>,
 ) -> Option<String> {
-    let thinking_prefix = generate_thinking_prefix(req);
     let system_content = req
         .system
         .as_ref()
         .map(|system| {
             system
                 .iter()
-                .map(|message| message.text.clone())
+                .filter_map(cleaned_system_message_text)
                 .collect::<Vec<_>>()
                 .join("\n")
         })
@@ -2130,17 +2131,8 @@ fn build_injected_system_content(
         .map(|content| format!("{content}\n{SYSTEM_CHUNKED_POLICY}"));
 
     let mut parts = Vec::new();
-    match (thinking_prefix, system_content) {
-        (Some(prefix), Some(content)) => {
-            if has_thinking_tags(&content) {
-                parts.push(content);
-            } else {
-                parts.push(format!("{prefix}\n{content}"));
-            }
-        },
-        (Some(prefix), None) => parts.push(prefix),
-        (None, Some(content)) => parts.push(content),
-        (None, None) => {},
+    if let Some(content) = system_content {
+        parts.push(content);
     }
     if let Some(tool_name) = structured_output_tool_name {
         parts.push(structured_output_instruction(tool_name));
@@ -2149,9 +2141,9 @@ fn build_injected_system_content(
 }
 
 // Builds the Kiro history from Anthropic messages that precede the current
-// trailing user turn. Injects system prompt (with thinking prefix) as a
-// synthetic user/assistant turn pair at the start, then merges consecutive
-// same-role messages into single turns.
+// trailing user turn. Injects stable system prompt text as a synthetic
+// user/assistant turn pair at the start, then merges consecutive same-role
+// messages into single turns.
 fn build_history(
     req: &MessagesRequest,
     messages: &[super::types::Message],
@@ -2242,6 +2234,7 @@ fn merge_user_messages(
     model_id: &str,
 ) -> Result<HistoryUserMessage, ConversionError> {
     let mut content_parts = Vec::new();
+    let mut images = Vec::new();
     let mut documents = Vec::new();
     let mut tool_results = Vec::new();
     for message in messages {
@@ -2249,14 +2242,15 @@ fn merge_user_messages(
         if !processed.text.is_empty() {
             content_parts.push(processed.text);
         }
+        images.extend(processed.images);
         documents.extend(processed.documents);
         tool_results.extend(processed.tool_results);
     }
     let content = content_parts.join("\n");
     let mut user_message = UserMessage::new(&content, model_id);
-    // Kiro rejects replaying image payloads inside history user turns. We keep
-    // the textual turn content and rely on a stable upstream session for any
-    // prior multimodal context.
+    if !images.is_empty() {
+        user_message = user_message.with_images(images);
+    }
     dedupe_documents_in_place(&mut documents, &mut HashSet::new());
     if !documents.is_empty() {
         user_message = user_message.with_documents(documents);
@@ -3215,7 +3209,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_request_injects_enabled_thinking_budget_prefix() {
+    fn convert_request_injects_enabled_thinking_budget_prefix_into_current_turn() {
         let mut req = base_request(vec![AnthropicMessage {
             role: "user".to_string(),
             content: serde_json::json!("Hello"),
@@ -3226,17 +3220,20 @@ mod tests {
         });
 
         let result = convert_request(&req).expect("conversion should succeed");
-        let system_prefix = match &result.conversation_state.history[0] {
-            Message::User(message) => &message.user_input_message.content,
-            other => panic!("expected injected system user message, got {other:?}"),
-        };
+        let current = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
 
-        assert!(system_prefix.contains("<thinking_mode>enabled</thinking_mode>"));
-        assert!(system_prefix.contains("<max_thinking_length>4096</max_thinking_length>"));
+        assert!(result.conversation_state.history.is_empty());
+        assert!(current.contains("<thinking_mode>enabled</thinking_mode>"));
+        assert!(current.contains("<max_thinking_length>4096</max_thinking_length>"));
+        assert!(current.contains("Hello"));
     }
 
     #[test]
-    fn preserves_thinking_effort_when_output_config_is_supplied() {
+    fn preserves_thinking_effort_on_current_turn_when_output_config_is_supplied() {
         let mut req = base_request(vec![AnthropicMessage {
             role: "user".to_string(),
             content: serde_json::json!("Hello"),
@@ -3251,17 +3248,20 @@ mod tests {
         });
 
         let result = convert_request(&req).expect("conversion should succeed");
-        let system_prefix = match &result.conversation_state.history[0] {
-            Message::User(message) => &message.user_input_message.content,
-            other => panic!("expected injected system user message, got {other:?}"),
-        };
+        let current = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
 
-        assert!(system_prefix.contains("<thinking_mode>adaptive</thinking_mode>"));
-        assert!(system_prefix.contains("<thinking_effort>medium</thinking_effort>"));
+        assert!(result.conversation_state.history.is_empty());
+        assert!(current.contains("<thinking_mode>adaptive</thinking_mode>"));
+        assert!(current.contains("<thinking_effort>medium</thinking_effort>"));
+        assert!(current.contains("Hello"));
     }
 
     #[test]
-    fn convert_request_defaults_adaptive_thinking_effort_to_xhigh() {
+    fn convert_request_defaults_adaptive_thinking_effort_to_xhigh_on_current_turn() {
         let mut req = base_request(vec![AnthropicMessage {
             role: "user".to_string(),
             content: serde_json::json!("Hello"),
@@ -3272,12 +3272,67 @@ mod tests {
         });
 
         let result = convert_request(&req).expect("conversion should succeed");
+        let current = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
+
+        assert!(result.conversation_state.history.is_empty());
+        assert!(current.contains("<thinking_effort>xhigh</thinking_effort>"));
+        assert!(current.contains("Hello"));
+    }
+
+    #[test]
+    fn convert_request_keeps_thinking_model_dynamic_tags_out_of_system_prefix() {
+        let mut req = base_request(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!("Hello"),
+        }]);
+        req.model = "claude-opus-4-7-thinking".to_string();
+        req.system = Some(vec![SystemMessage {
+            text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+        }]);
+        req.thinking = Some(crate::anthropic::types::Thinking {
+            thinking_type: "adaptive".to_string(),
+            budget_tokens: 20_000,
+        });
+        req.output_config = Some(crate::anthropic::types::OutputConfig {
+            effort: Some("xhigh".to_string()),
+            format: None,
+        });
+
+        let result = convert_request(&req).expect("conversion should succeed");
         let system_prefix = match &result.conversation_state.history[0] {
             Message::User(message) => &message.user_input_message.content,
             other => panic!("expected injected system user message, got {other:?}"),
         };
+        let current = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
 
-        assert!(system_prefix.contains("<thinking_effort>xhigh</thinking_effort>"));
+        assert!(current.contains("<thinking_effort>xhigh</thinking_effort>"));
+        assert!(!system_prefix.contains("<thinking_effort>xhigh</thinking_effort>"));
+        assert!(system_prefix.contains(
+            "You are powered by the model named Opus 4.7. The exact model ID is claude-opus-4-7."
+        ));
+        assert!(!system_prefix.contains("claude-opus-4-7-thinking"));
+    }
+
+    #[test]
+    fn convert_request_does_not_send_random_agent_continuation_metadata_by_default() {
+        let req = base_request(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!("Hello"),
+        }]);
+
+        let result = convert_request(&req).expect("conversion should succeed");
+
+        assert_eq!(result.conversation_state.chat_trigger_type.as_deref(), Some("MANUAL"));
+        assert!(result.conversation_state.agent_continuation_id.is_none());
+        assert!(result.conversation_state.agent_task_type.is_none());
     }
 
     #[test]
@@ -3363,8 +3418,14 @@ mod tests {
             Message::User(message) => &message.user_input_message.content,
             other => panic!("expected injected system user message, got {other:?}"),
         };
+        let current = &result
+            .conversation_state
+            .current_message
+            .user_input_message
+            .content;
 
-        assert!(system_prefix.contains("<thinking_effort>high</thinking_effort>"));
+        assert!(current.contains("<thinking_effort>high</thinking_effort>"));
+        assert!(!system_prefix.contains("<thinking_effort>high</thinking_effort>"));
         assert!(system_prefix.contains("你是 Claude Opus 4.7，知识库截至时间 2026-01。"));
         assert!(system_prefix.contains("You are Claude Code, Anthropic's official CLI for Claude."));
         assert!(!system_prefix.contains("x-anthropic-billing-header:"));
@@ -3396,6 +3457,38 @@ mod tests {
         assert!(system_prefix.starts_with("You are Claude Code, Anthropic's official CLI"));
         assert!(!system_prefix.contains("x-anthropic-billing-header:"));
         assert!(!system_prefix.contains("cch=638d8"));
+    }
+
+    #[test]
+    fn convert_request_strips_billing_header_block_with_leading_whitespace() {
+        let mut req = base_request(vec![AnthropicMessage {
+            role: "user".to_string(),
+            content: serde_json::json!("Hello"),
+        }]);
+        req.system = Some(vec![
+            SystemMessage {
+                text: "  x-anthropic-billing-header: cc_version=2.1.130.abc; cc_entrypoint=cli; \
+                       cch=11111;"
+                    .to_string(),
+            },
+            SystemMessage {
+                text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
+            },
+            SystemMessage {
+                text: "Project prompt".to_string(),
+            },
+        ]);
+
+        let result = convert_request(&req).expect("conversion should succeed");
+        let system_prefix = match &result.conversation_state.history[0] {
+            Message::User(message) => &message.user_input_message.content,
+            other => panic!("expected injected system user message, got {other:?}"),
+        };
+
+        assert!(system_prefix.starts_with("You are Claude Code, Anthropic's official CLI"));
+        assert!(system_prefix.contains("Project prompt"));
+        assert!(!system_prefix.contains("x-anthropic-billing-header:"));
+        assert!(!system_prefix.contains("cch=11111"));
     }
 
     #[test]
@@ -3640,7 +3733,7 @@ mod tests {
         assert_eq!(current.content, "Describe this image");
         assert_eq!(current.images.len(), 1);
         assert_eq!(current.images[0].format, "png");
-        assert!(current.origin.is_none());
+        assert_eq!(current.origin.as_deref(), Some("AI_EDITOR"));
     }
 
     #[test]
@@ -3853,7 +3946,7 @@ mod tests {
     }
 
     #[test]
-    fn convert_request_drops_images_from_history_turns() {
+    fn convert_request_preserves_images_from_history_turns() {
         let req = base_request(vec![
             AnthropicMessage {
                 role: "user".to_string(),
@@ -3889,7 +3982,8 @@ mod tests {
             other => panic!("expected user history entry, got {other:?}"),
         };
         assert_eq!(history_user.content, "Describe this image");
-        assert!(history_user.images.is_empty());
+        assert_eq!(history_user.images.len(), 1);
+        assert_eq!(history_user.images[0].format, "png");
         assert_eq!(history_user.origin.as_deref(), Some("AI_EDITOR"));
     }
 

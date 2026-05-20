@@ -120,6 +120,8 @@ pub struct KeyRouteConfig {
     pub kiro_zero_cache_debug_enabled: bool,
     /// Whether every Kiro request should retain full request payloads.
     pub kiro_full_request_logging_enabled: bool,
+    /// Whether URL image/document sources should be fetched server-side.
+    pub kiro_remote_media_resolution_enabled: bool,
     /// Optional Kiro cache policy override JSON.
     pub kiro_cache_policy_override_json: Option<String>,
     /// Optional Kiro billable multiplier override JSON.
@@ -778,6 +780,7 @@ impl SqliteControlStore {
             kiro_cache_estimation_enabled: true,
             kiro_zero_cache_debug_enabled: false,
             kiro_full_request_logging_enabled: false,
+            kiro_remote_media_resolution_enabled: false,
             kiro_cache_policy_override_json: None,
             kiro_billable_model_multipliers_override_json: None,
         };
@@ -1036,6 +1039,7 @@ impl SqliteControlStore {
                 cache_estimation_enabled: bundle.route.kiro_cache_estimation_enabled,
                 zero_cache_debug_enabled: bundle.route.kiro_zero_cache_debug_enabled,
                 full_request_logging_enabled: bundle.route.kiro_full_request_logging_enabled,
+                remote_media_resolution_enabled: false,
                 model_name_map_json: bundle
                     .route
                     .model_name_map_json
@@ -2856,6 +2860,7 @@ impl SqliteControlStore {
             cache_estimation_enabled: true,
             zero_cache_debug_enabled: false,
             full_request_logging_enabled: false,
+            remote_media_resolution_enabled: false,
             model_name_map_json: "{}".to_string(),
             cache_kmodels_json: runtime_config.kiro_cache_kmodels_json,
             cache_policy_json: runtime_config.kiro_cache_policy_json,
@@ -4920,6 +4925,7 @@ fn decode_key_bundle(row: &rusqlite::Row<'_>) -> rusqlite::Result<KeyBundle> {
             kiro_cache_estimation_enabled: row.get::<_, Option<i64>>(19)?.unwrap_or(0) != 0,
             kiro_zero_cache_debug_enabled: row.get::<_, Option<i64>>(20)?.unwrap_or(0) != 0,
             kiro_full_request_logging_enabled: row.get::<_, Option<i64>>(21)?.unwrap_or(0) != 0,
+            kiro_remote_media_resolution_enabled: false,
             kiro_cache_policy_override_json: row.get(22)?,
             kiro_billable_model_multipliers_override_json: row.get(23)?,
         },
@@ -4975,6 +4981,7 @@ fn admin_key_from_bundle(bundle: &KeyBundle) -> AdminKey {
         kiro_cache_estimation_enabled: bundle.route.kiro_cache_estimation_enabled,
         kiro_zero_cache_debug_enabled: bundle.route.kiro_zero_cache_debug_enabled,
         kiro_full_request_logging_enabled: bundle.route.kiro_full_request_logging_enabled,
+        kiro_remote_media_resolution_enabled: bundle.route.kiro_remote_media_resolution_enabled,
         kiro_cache_policy_override_json: bundle.route.kiro_cache_policy_override_json.clone(),
         kiro_billable_model_multipliers_override_json: bundle
             .route
@@ -5907,6 +5914,7 @@ mod tests {
             kiro_cache_estimation_enabled: true,
             kiro_zero_cache_debug_enabled: false,
             kiro_full_request_logging_enabled: true,
+            kiro_remote_media_resolution_enabled: false,
             kiro_cache_policy_override_json: Some(r#"{"enabled":true}"#.to_string()),
             kiro_billable_model_multipliers_override_json: None,
         };
@@ -5970,6 +5978,7 @@ mod tests {
             kiro_cache_estimation_enabled: false,
             kiro_zero_cache_debug_enabled: false,
             kiro_full_request_logging_enabled: false,
+            kiro_remote_media_resolution_enabled: false,
             kiro_cache_policy_override_json: None,
             kiro_billable_model_multipliers_override_json: None,
         };
@@ -6007,7 +6016,7 @@ mod tests {
             [(0, "codex", Some("codex-group")), (1, "codex", None), (2, "kiro", Some("kiro-group"))]
         {
             let key_id = format!("key-{index}");
-            let billable_tokens = ((index + 1) * 100) as i64;
+            let billable_tokens = (index + 1) * 100;
             repo.upsert_key_bundle(
                 &super::KeyRecord {
                     key_id: key_id.clone(),
@@ -6019,7 +6028,7 @@ mod tests {
                     protocol_family: if provider == "kiro" { "anthropic" } else { "openai" }
                         .to_string(),
                     public_visible: index != 1,
-                    quota_billable_limit: 1000 + (index as i64 * 10),
+                    quota_billable_limit: 1000 + (index * 10),
                     created_at_ms: 10 + index,
                     updated_at_ms: 20 + index,
                 },
@@ -6036,6 +6045,7 @@ mod tests {
                     kiro_cache_estimation_enabled: true,
                     kiro_zero_cache_debug_enabled: false,
                     kiro_full_request_logging_enabled: false,
+                    kiro_remote_media_resolution_enabled: false,
                     kiro_cache_policy_override_json: None,
                     kiro_billable_model_multipliers_override_json: None,
                 },
@@ -6169,6 +6179,7 @@ mod tests {
             kiro_cache_estimation_enabled: true,
             kiro_zero_cache_debug_enabled: false,
             kiro_full_request_logging_enabled: false,
+            kiro_remote_media_resolution_enabled: false,
             kiro_cache_policy_override_json: None,
             kiro_billable_model_multipliers_override_json: None,
         };
@@ -7326,6 +7337,7 @@ mod tests {
                 kiro_cache_estimation_enabled: true,
                 kiro_zero_cache_debug_enabled: false,
                 kiro_full_request_logging_enabled: false,
+                kiro_remote_media_resolution_enabled: false,
                 kiro_cache_policy_override_json: Some(
                     r#"{"small_input_high_credit_boost":{"target_input_tokens":50000}}"#
                         .to_string(),

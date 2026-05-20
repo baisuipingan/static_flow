@@ -1654,7 +1654,7 @@ mod tests {
 
     #[test]
     fn background_snapshot_preserves_new_accounts_from_latest_snapshot() {
-        let original_accounts = vec![sample_admin_account("alpha"), sample_admin_account("beta")];
+        let original_accounts = [sample_admin_account("alpha"), sample_admin_account("beta")];
         let current_accounts = vec![
             sample_admin_account("alpha"),
             sample_admin_account("beta"),

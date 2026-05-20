@@ -275,6 +275,7 @@ mod tests {
             cache_estimation_enabled: true,
             zero_cache_debug_enabled: false,
             full_request_logging_enabled: false,
+            remote_media_resolution_enabled: false,
             model_name_map_json: "{}".to_string(),
             cache_kmodels_json: llm_access_core::store::default_kiro_cache_kmodels_json(),
             cache_policy_json: llm_access_core::store::default_kiro_cache_policy_json(),

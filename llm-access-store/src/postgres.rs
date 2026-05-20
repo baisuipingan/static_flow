@@ -1206,6 +1206,7 @@ impl PostgresControlRepository {
             cache_estimation_enabled: bundle.route.kiro_cache_estimation_enabled,
             zero_cache_debug_enabled: bundle.route.kiro_zero_cache_debug_enabled,
             full_request_logging_enabled: bundle.route.kiro_full_request_logging_enabled,
+            remote_media_resolution_enabled: bundle.route.kiro_remote_media_resolution_enabled,
             model_name_map_json: bundle
                 .route
                 .model_name_map_json
@@ -1686,6 +1687,7 @@ impl PostgresControlRepository {
                     r.request_max_concurrency, r.request_min_start_interval_ms,
                     r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
                     r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.kiro_remote_media_resolution_enabled,
                     r.kiro_cache_policy_override_json::text,
                     r.kiro_billable_model_multipliers_override_json::text,
                     COALESCE(u.input_uncached_tokens, 0),
@@ -1721,6 +1723,7 @@ impl PostgresControlRepository {
                     r.request_max_concurrency, r.request_min_start_interval_ms,
                     r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
                     r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.kiro_remote_media_resolution_enabled,
                     r.kiro_cache_policy_override_json::text,
                     r.kiro_billable_model_multipliers_override_json::text,
                     COALESCE(u.input_uncached_tokens, 0),
@@ -1828,6 +1831,7 @@ impl PostgresControlRepository {
                     r.request_max_concurrency, r.request_min_start_interval_ms,
                     r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
                     r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.kiro_remote_media_resolution_enabled,
                     r.kiro_cache_policy_override_json::text,
                     r.kiro_billable_model_multipliers_override_json::text,
                     COALESCE(u.input_uncached_tokens, 0),
@@ -1889,6 +1893,7 @@ impl PostgresControlRepository {
                         r.request_max_concurrency, r.request_min_start_interval_ms,
                         r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
                         r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                        r.kiro_remote_media_resolution_enabled,
                         r.kiro_cache_policy_override_json,
                         r.kiro_billable_model_multipliers_override_json,
                         COALESCE(u.input_uncached_tokens, 0) AS input_uncached_tokens,
@@ -2038,6 +2043,7 @@ impl PostgresControlRepository {
                     page_keys.kiro_cache_estimation_enabled,
                     page_keys.kiro_zero_cache_debug_enabled,
                     page_keys.kiro_full_request_logging_enabled,
+                    page_keys.kiro_remote_media_resolution_enabled,
                     page_keys.kiro_cache_policy_override_json::text,
                     page_keys.kiro_billable_model_multipliers_override_json::text,
                     page_keys.input_uncached_tokens,
@@ -2093,6 +2099,7 @@ impl PostgresControlRepository {
                     r.request_max_concurrency, r.request_min_start_interval_ms,
                     r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
                     r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.kiro_remote_media_resolution_enabled,
                     r.kiro_cache_policy_override_json::text,
                     r.kiro_billable_model_multipliers_override_json::text,
                     COALESCE(u.input_uncached_tokens, 0),
@@ -4482,11 +4489,11 @@ impl PostgresControlRepository {
                     account_group_id, model_name_map_json, request_max_concurrency,
                     request_min_start_interval_ms, kiro_request_validation_enabled,
                     kiro_cache_estimation_enabled, kiro_zero_cache_debug_enabled,
-                    kiro_full_request_logging_enabled, kiro_cache_policy_override_json,
-                    kiro_billable_model_multipliers_override_json
+                    kiro_full_request_logging_enabled, kiro_remote_media_resolution_enabled,
+                    kiro_cache_policy_override_json, kiro_billable_model_multipliers_override_json
                  ) VALUES (
                     $1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, $8, $9, $10, $11, $12,
-                    $13::jsonb, $14::jsonb
+                    $13, $14::jsonb, $15::jsonb
                  )
                  ON CONFLICT(key_id) DO UPDATE SET
                     route_strategy = EXCLUDED.route_strategy,
@@ -4501,6 +4508,8 @@ impl PostgresControlRepository {
                     kiro_zero_cache_debug_enabled = EXCLUDED.kiro_zero_cache_debug_enabled,
                     kiro_full_request_logging_enabled =
                         EXCLUDED.kiro_full_request_logging_enabled,
+                    kiro_remote_media_resolution_enabled =
+                        EXCLUDED.kiro_remote_media_resolution_enabled,
                     kiro_cache_policy_override_json =
                         EXCLUDED.kiro_cache_policy_override_json,
                     kiro_billable_model_multipliers_override_json =
@@ -4518,6 +4527,7 @@ impl PostgresControlRepository {
                     &route.kiro_cache_estimation_enabled,
                     &route.kiro_zero_cache_debug_enabled,
                     &route.kiro_full_request_logging_enabled,
+                    &route.kiro_remote_media_resolution_enabled,
                     &route.kiro_cache_policy_override_json,
                     &route.kiro_billable_model_multipliers_override_json,
                 ],
@@ -4937,7 +4947,7 @@ fn decode_runtime_config_row(row: PgRow) -> anyhow::Result<RuntimeConfigRecord> 
 
 fn decode_key_bundle(row: &PgRow) -> anyhow::Result<KeyBundle> {
     let key_id: String = row.get(0);
-    let credit_total_raw: String = row.get(28);
+    let credit_total_raw: String = row.get(29);
     let credit_total = credit_total_raw
         .parse::<f64>()
         .with_context(|| format!("parse key rollup credit_total `{credit_total_raw}`"))?;
@@ -4968,19 +4978,20 @@ fn decode_key_bundle(row: &PgRow) -> anyhow::Result<KeyBundle> {
             kiro_cache_estimation_enabled: row.get::<_, Option<bool>>(19).unwrap_or(false),
             kiro_zero_cache_debug_enabled: row.get::<_, Option<bool>>(20).unwrap_or(false),
             kiro_full_request_logging_enabled: row.get::<_, Option<bool>>(21).unwrap_or(false),
-            kiro_cache_policy_override_json: row.get(22),
-            kiro_billable_model_multipliers_override_json: row.get(23),
+            kiro_remote_media_resolution_enabled: row.get::<_, Option<bool>>(22).unwrap_or(false),
+            kiro_cache_policy_override_json: row.get(23),
+            kiro_billable_model_multipliers_override_json: row.get(24),
         },
         rollup: KeyUsageRollup {
             key_id,
-            input_uncached_tokens: row.get(24),
-            input_cached_tokens: row.get(25),
-            output_tokens: row.get(26),
-            billable_tokens: row.get(27),
+            input_uncached_tokens: row.get(25),
+            input_cached_tokens: row.get(26),
+            output_tokens: row.get(27),
+            billable_tokens: row.get(28),
             credit_total,
-            credit_missing_events: row.get(29),
-            last_used_at_ms: row.get(30),
-            updated_at_ms: row.get(31),
+            credit_missing_events: row.get(30),
+            last_used_at_ms: row.get(31),
+            updated_at_ms: row.get(32),
         },
     })
 }
@@ -5027,6 +5038,7 @@ fn admin_key_from_bundle(bundle: &KeyBundle) -> AdminKey {
         kiro_cache_estimation_enabled: bundle.route.kiro_cache_estimation_enabled,
         kiro_zero_cache_debug_enabled: bundle.route.kiro_zero_cache_debug_enabled,
         kiro_full_request_logging_enabled: bundle.route.kiro_full_request_logging_enabled,
+        kiro_remote_media_resolution_enabled: bundle.route.kiro_remote_media_resolution_enabled,
         kiro_cache_policy_override_json: bundle.route.kiro_cache_policy_override_json.clone(),
         kiro_billable_model_multipliers_override_json: bundle
             .route
@@ -5067,7 +5079,7 @@ fn decode_kiro_candidate_credit_summary_row(
 fn decode_kiro_admin_key_row(row: PgRow) -> anyhow::Result<AdminKey> {
     let bundle = decode_key_bundle(&row)?;
     let mut key = admin_key_from_bundle(&bundle);
-    key.kiro_candidate_credit_summary = Some(decode_kiro_candidate_credit_summary_row(&row, 32));
+    key.kiro_candidate_credit_summary = Some(decode_kiro_candidate_credit_summary_row(&row, 33));
     Ok(key)
 }
 
@@ -5998,6 +6010,7 @@ impl AdminKeyStore for PostgresControlRepository {
                 r.request_max_concurrency, r.request_min_start_interval_ms,
                 r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
                 r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                r.kiro_remote_media_resolution_enabled,
                 r.kiro_cache_policy_override_json::text,
                 r.kiro_billable_model_multipliers_override_json::text,
                 COALESCE(u.input_uncached_tokens, 0),
@@ -6086,6 +6099,7 @@ impl AdminKeyStore for PostgresControlRepository {
             kiro_cache_estimation_enabled: true,
             kiro_zero_cache_debug_enabled: false,
             kiro_full_request_logging_enabled: false,
+            kiro_remote_media_resolution_enabled: false,
             kiro_cache_policy_override_json: None,
             kiro_billable_model_multipliers_override_json: None,
         };
@@ -6168,6 +6182,9 @@ impl AdminKeyStore for PostgresControlRepository {
         }
         if let Some(value) = patch.kiro_full_request_logging_enabled {
             bundle.route.kiro_full_request_logging_enabled = value;
+        }
+        if let Some(value) = patch.kiro_remote_media_resolution_enabled {
+            bundle.route.kiro_remote_media_resolution_enabled = value;
         }
         if let Some(value) = patch.kiro_cache_policy_override_json.as_ref() {
             bundle.route.kiro_cache_policy_override_json = value.clone();
@@ -7522,6 +7539,7 @@ impl AdminKiroAccountStore for PostgresControlRepository {
             cache_estimation_enabled: true,
             zero_cache_debug_enabled: false,
             full_request_logging_enabled: false,
+            remote_media_resolution_enabled: false,
             model_name_map_json: "{}".to_string(),
             cache_kmodels_json: runtime_config.kiro_cache_kmodels_json,
             cache_policy_json: runtime_config.kiro_cache_policy_json,
@@ -7809,6 +7827,7 @@ impl ProviderRouteStore for PostgresControlRepository {
                 cache_estimation_enabled: snapshot.cache_estimation_enabled,
                 zero_cache_debug_enabled: snapshot.zero_cache_debug_enabled,
                 full_request_logging_enabled: snapshot.full_request_logging_enabled,
+                remote_media_resolution_enabled: snapshot.remote_media_resolution_enabled,
                 model_name_map_json: snapshot.model_name_map_json.clone(),
                 cache_kmodels_json: snapshot.cache_kmodels_json.clone(),
                 cache_policy_json: snapshot.cache_policy_json.clone(),
@@ -7873,6 +7892,7 @@ impl ProviderRouteStore for PostgresControlRepository {
             cache_estimation_enabled: true,
             zero_cache_debug_enabled: false,
             full_request_logging_enabled: false,
+            remote_media_resolution_enabled: false,
             model_name_map_json: "{}".to_string(),
             cache_kmodels_json: runtime_config.kiro_cache_kmodels_json,
             cache_policy_json: runtime_config.kiro_cache_policy_json,

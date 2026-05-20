@@ -1034,7 +1034,7 @@ mod tests {
         fixture.write_sealed_event("evt-worker-http");
         fixture.run_one_import().await.expect("import");
 
-        let app = super::primary_worker_router(fixture.worker.as_ref());
+        let app = super::primary_worker_router(&fixture.worker);
         let response = app
             .clone()
             .oneshot(
@@ -1072,7 +1072,7 @@ mod tests {
         fixture.write_sealed_event("evt-worker-chart");
         fixture.run_one_import().await.expect("import");
 
-        let app = super::primary_worker_router(fixture.worker.as_ref());
+        let app = super::primary_worker_router(&fixture.worker);
         let response = app
             .oneshot(
                 Request::builder()
@@ -1097,7 +1097,7 @@ mod tests {
     #[tokio::test]
     async fn usage_worker_status_includes_process_memory() {
         let fixture = UsageWorkerFixture::new();
-        let app = super::primary_worker_router(fixture.worker.as_ref());
+        let app = super::primary_worker_router(&fixture.worker);
 
         let response = app
             .oneshot(
@@ -1120,7 +1120,7 @@ mod tests {
     struct UsageWorkerFixture {
         _temp_dir: tempfile::TempDir,
         journal_root: PathBuf,
-        worker: Arc<UsageWorker>,
+        worker: UsageWorker,
         duckdb: Arc<DuckDbUsageRepository>,
     }
 
@@ -1142,10 +1142,8 @@ mod tests {
                 })
                 .expect("open duckdb"),
             );
-            let worker = Arc::new(
-                UsageWorker::new(journal_root.clone(), duckdb.clone(), consumer_lease_ms)
-                    .expect("worker"),
-            );
+            let worker = UsageWorker::new(journal_root.clone(), duckdb.clone(), consumer_lease_ms)
+                .expect("worker");
             Self {
                 _temp_dir: temp_dir,
                 journal_root,

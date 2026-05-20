@@ -118,10 +118,6 @@ impl UserInputMessage {
 
     pub fn with_images(mut self, images: Vec<KiroImage>) -> Self {
         self.images = images;
-        if !self.images.is_empty() {
-            // Kiro rejects current-turn image payloads when `origin` is present.
-            self.origin = None;
-        }
         self
     }
 
@@ -131,11 +127,7 @@ impl UserInputMessage {
     }
 
     pub fn with_origin(mut self, origin: impl Into<String>) -> Self {
-        if self.images.is_empty() {
-            self.origin = Some(origin.into());
-        } else {
-            self.origin = None;
-        }
+        self.origin = Some(origin.into());
         self
     }
 }
@@ -284,6 +276,11 @@ impl UserMessage {
 
     pub fn with_documents(mut self, documents: Vec<KiroDocument>) -> Self {
         self.documents = documents;
+        self
+    }
+
+    pub fn with_images(mut self, images: Vec<KiroImage>) -> Self {
+        self.images = images;
         self
     }
 }

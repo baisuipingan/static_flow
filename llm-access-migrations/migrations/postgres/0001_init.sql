@@ -30,7 +30,8 @@ CREATE TABLE IF NOT EXISTS llm_key_route_config (
     kiro_zero_cache_debug_enabled BOOLEAN NOT NULL DEFAULT FALSE,
     kiro_cache_policy_override_json JSONB,
     kiro_billable_model_multipliers_override_json JSONB,
-    kiro_full_request_logging_enabled BOOLEAN NOT NULL DEFAULT FALSE
+    kiro_full_request_logging_enabled BOOLEAN NOT NULL DEFAULT FALSE,
+    kiro_remote_media_resolution_enabled BOOLEAN NOT NULL DEFAULT FALSE
 );
 
 CREATE INDEX IF NOT EXISTS idx_llm_key_route_config_group
