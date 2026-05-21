@@ -1105,6 +1105,7 @@ fn key_editor_card(props: &KeyEditorCardProps) -> Html {
             .map(|value| value.to_string())
             .unwrap_or_default()
     });
+    let codex_fast_enabled = use_state(|| key_item.codex_fast_enabled);
     let saving = use_state(|| false);
     let feedback = use_state(|| None::<String>);
 
@@ -1120,6 +1121,7 @@ fn key_editor_card(props: &KeyEditorCardProps) -> Html {
         let account_group_id = account_group_id.clone();
         let request_max_concurrency = request_max_concurrency.clone();
         let request_min_start_interval_ms = request_min_start_interval_ms.clone();
+        let codex_fast_enabled = codex_fast_enabled.clone();
         use_effect_with((props.key_item.clone(), props.account_groups.clone()), move |_| {
             name.set(key_item.name.clone());
             quota.set(key_item.quota_billable_limit.to_string());
@@ -1148,6 +1150,7 @@ fn key_editor_card(props: &KeyEditorCardProps) -> Html {
                     .map(|value| value.to_string())
                     .unwrap_or_default(),
             );
+            codex_fast_enabled.set(key_item.codex_fast_enabled);
             || ()
         });
     }
@@ -1214,6 +1217,7 @@ fn key_editor_card(props: &KeyEditorCardProps) -> Html {
         let account_group_id = account_group_id.clone();
         let request_max_concurrency = request_max_concurrency.clone();
         let request_min_start_interval_ms = request_min_start_interval_ms.clone();
+        let codex_fast_enabled = codex_fast_enabled.clone();
         let saving = saving.clone();
         let feedback = feedback.clone();
         let on_flash = props.on_flash.clone();
@@ -1231,6 +1235,7 @@ fn key_editor_card(props: &KeyEditorCardProps) -> Html {
             let request_max_concurrency_value = (*request_max_concurrency).trim().to_string();
             let request_min_start_interval_ms_value =
                 (*request_min_start_interval_ms).trim().to_string();
+            let codex_fast_enabled_value = *codex_fast_enabled;
             let saving = saving.clone();
             let feedback = feedback.clone();
             let on_flash = on_flash.clone();
@@ -1285,6 +1290,7 @@ fn key_editor_card(props: &KeyEditorCardProps) -> Html {
                     model_name_map: None,
                     request_max_concurrency: request_max_concurrency_value,
                     request_min_start_interval_ms: request_min_start_interval_ms_value,
+                    codex_fast_enabled: Some(codex_fast_enabled_value),
                     kiro_request_validation_enabled: None,
                     kiro_cache_estimation_enabled: None,
                     kiro_zero_cache_debug_enabled: None,
@@ -1514,6 +1520,21 @@ fn key_editor_card(props: &KeyEditorCardProps) -> Html {
                         }}
                     />
                     <span>{ "公开" }</span>
+                </label>
+                <label class={classes!("flex", "items-center", "gap-2", "text-sm")}>
+                    <input
+                        type="checkbox"
+                        checked={*codex_fast_enabled}
+                        onchange={{
+                            let codex_fast_enabled = codex_fast_enabled.clone();
+                            Callback::from(move |event: Event| {
+                                if let Some(target) = event.target_dyn_into::<HtmlInputElement>() {
+                                    codex_fast_enabled.set(target.checked());
+                                }
+                            })
+                        }}
+                    />
+                    <span>{ "允许 Fast（service_tier，计费 x2）" }</span>
                 </label>
                 <select
                     key={format!("{}-status-{}", key_item.id, (*status).clone())}

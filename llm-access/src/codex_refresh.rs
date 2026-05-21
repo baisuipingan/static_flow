@@ -658,6 +658,7 @@ mod tests {
             auth_json,
             map_gpt53_codex_to_spark: false,
             auth_refresh_enabled: true,
+            codex_fast_enabled: true,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
             account_request_max_concurrency: None,

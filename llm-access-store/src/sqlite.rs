@@ -112,6 +112,8 @@ pub struct KeyRouteConfig {
     pub request_max_concurrency: Option<i64>,
     /// Optional per-key pacing interval.
     pub request_min_start_interval_ms: Option<i64>,
+    /// Whether Codex fast/priority requests are enabled for this key.
+    pub codex_fast_enabled: bool,
     /// Whether Kiro public request validation is enabled.
     pub kiro_request_validation_enabled: bool,
     /// Whether Kiro cache estimation is enabled.
@@ -410,11 +412,12 @@ impl SqliteControlStore {
             "INSERT INTO llm_key_route_config (
                 key_id, route_strategy, fixed_account_name, auto_account_names_json,
                 account_group_id, model_name_map_json, request_max_concurrency,
-                request_min_start_interval_ms, kiro_request_validation_enabled,
-                kiro_cache_estimation_enabled, kiro_zero_cache_debug_enabled,
-                kiro_full_request_logging_enabled, kiro_cache_policy_override_json,
+                request_min_start_interval_ms, codex_fast_enabled,
+                kiro_request_validation_enabled, kiro_cache_estimation_enabled,
+                kiro_zero_cache_debug_enabled, kiro_full_request_logging_enabled,
+                kiro_cache_policy_override_json,
                 kiro_billable_model_multipliers_override_json
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)
             ON CONFLICT(key_id) DO UPDATE SET
                 route_strategy = excluded.route_strategy,
                 fixed_account_name = excluded.fixed_account_name,
@@ -423,6 +426,7 @@ impl SqliteControlStore {
                 model_name_map_json = excluded.model_name_map_json,
                 request_max_concurrency = excluded.request_max_concurrency,
                 request_min_start_interval_ms = excluded.request_min_start_interval_ms,
+                codex_fast_enabled = excluded.codex_fast_enabled,
                 kiro_request_validation_enabled = excluded.kiro_request_validation_enabled,
                 kiro_cache_estimation_enabled = excluded.kiro_cache_estimation_enabled,
                 kiro_zero_cache_debug_enabled = excluded.kiro_zero_cache_debug_enabled,
@@ -440,6 +444,7 @@ impl SqliteControlStore {
                 &route.model_name_map_json,
                 route.request_max_concurrency,
                 route.request_min_start_interval_ms,
+                route.codex_fast_enabled as i64,
                 route.kiro_request_validation_enabled as i64,
                 route.kiro_cache_estimation_enabled as i64,
                 route.kiro_zero_cache_debug_enabled as i64,
@@ -492,8 +497,9 @@ impl SqliteControlStore {
                     r.route_strategy, r.fixed_account_name, r.auto_account_names_json,
                     r.account_group_id, r.model_name_map_json,
                     r.request_max_concurrency, r.request_min_start_interval_ms,
-                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
-                    r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.codex_fast_enabled, r.kiro_request_validation_enabled,
+                    r.kiro_cache_estimation_enabled, r.kiro_zero_cache_debug_enabled,
+                    r.kiro_full_request_logging_enabled,
                     r.kiro_cache_policy_override_json,
                     r.kiro_billable_model_multipliers_override_json,
                     COALESCE(u.input_uncached_tokens, 0),
@@ -526,8 +532,9 @@ impl SqliteControlStore {
                     r.route_strategy, r.fixed_account_name, r.auto_account_names_json,
                     r.account_group_id, r.model_name_map_json,
                     r.request_max_concurrency, r.request_min_start_interval_ms,
-                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
-                    r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.codex_fast_enabled, r.kiro_request_validation_enabled,
+                    r.kiro_cache_estimation_enabled, r.kiro_zero_cache_debug_enabled,
+                    r.kiro_full_request_logging_enabled,
                     r.kiro_cache_policy_override_json,
                     r.kiro_billable_model_multipliers_override_json,
                     COALESCE(u.input_uncached_tokens, 0),
@@ -561,8 +568,9 @@ impl SqliteControlStore {
                     r.route_strategy, r.fixed_account_name, r.auto_account_names_json,
                     r.account_group_id, r.model_name_map_json,
                     r.request_max_concurrency, r.request_min_start_interval_ms,
-                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
-                    r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.codex_fast_enabled, r.kiro_request_validation_enabled,
+                    r.kiro_cache_estimation_enabled, r.kiro_zero_cache_debug_enabled,
+                    r.kiro_full_request_logging_enabled,
                     r.kiro_cache_policy_override_json,
                     r.kiro_billable_model_multipliers_override_json,
                     COALESCE(u.input_uncached_tokens, 0),
@@ -671,8 +679,9 @@ impl SqliteControlStore {
                     r.route_strategy, r.fixed_account_name, r.auto_account_names_json,
                     r.account_group_id, r.model_name_map_json,
                     r.request_max_concurrency, r.request_min_start_interval_ms,
-                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
-                    r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
+                    r.codex_fast_enabled, r.kiro_request_validation_enabled,
+                    r.kiro_cache_estimation_enabled, r.kiro_zero_cache_debug_enabled,
+                    r.kiro_full_request_logging_enabled,
                     r.kiro_cache_policy_override_json,
                     r.kiro_billable_model_multipliers_override_json,
                     COALESCE(u.input_uncached_tokens, 0),
@@ -776,6 +785,7 @@ impl SqliteControlStore {
             request_min_start_interval_ms: key
                 .request_min_start_interval_ms
                 .map(|value| value as i64),
+            codex_fast_enabled: true,
             kiro_request_validation_enabled: true,
             kiro_cache_estimation_enabled: true,
             kiro_zero_cache_debug_enabled: false,
@@ -886,6 +896,7 @@ impl SqliteControlStore {
                 auth_json: record.auth_json,
                 map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
                 auth_refresh_enabled: settings.auth_refresh_enabled,
+                codex_fast_enabled: bundle.route.codex_fast_enabled,
                 request_max_concurrency: bundle
                     .route
                     .request_max_concurrency
@@ -1194,6 +1205,9 @@ impl SqliteControlStore {
         }
         if let Some(value) = patch.request_min_start_interval_ms {
             bundle.route.request_min_start_interval_ms = value.map(|value| value as i64);
+        }
+        if let Some(value) = patch.codex_fast_enabled {
+            bundle.route.codex_fast_enabled = value;
         }
         if let Some(value) = patch.kiro_request_validation_enabled {
             bundle.route.kiro_request_validation_enabled = value;
@@ -2101,6 +2115,7 @@ impl SqliteControlStore {
             auth_json: record.auth_json,
             map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
             auth_refresh_enabled: settings.auth_refresh_enabled,
+            codex_fast_enabled: true,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
             account_request_max_concurrency: settings.request_max_concurrency,
@@ -4894,10 +4909,10 @@ impl SqliteControlStore {
 
 fn decode_key_bundle(row: &rusqlite::Row<'_>) -> rusqlite::Result<KeyBundle> {
     let key_id: String = row.get(0)?;
-    let credit_total_raw: String = row.get(28)?;
+    let credit_total_raw: String = row.get(29)?;
     let credit_total = credit_total_raw
         .parse::<f64>()
-        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(28, Type::Text, Box::new(err)))?;
+        .map_err(|err| rusqlite::Error::FromSqlConversionFailure(29, Type::Text, Box::new(err)))?;
     Ok(KeyBundle {
         key: KeyRecord {
             key_id: key_id.clone(),
@@ -4921,24 +4936,25 @@ fn decode_key_bundle(row: &rusqlite::Row<'_>) -> rusqlite::Result<KeyBundle> {
             model_name_map_json: row.get(15)?,
             request_max_concurrency: row.get(16)?,
             request_min_start_interval_ms: row.get(17)?,
-            kiro_request_validation_enabled: row.get::<_, Option<i64>>(18)?.unwrap_or(0) != 0,
-            kiro_cache_estimation_enabled: row.get::<_, Option<i64>>(19)?.unwrap_or(0) != 0,
-            kiro_zero_cache_debug_enabled: row.get::<_, Option<i64>>(20)?.unwrap_or(0) != 0,
-            kiro_full_request_logging_enabled: row.get::<_, Option<i64>>(21)?.unwrap_or(0) != 0,
+            codex_fast_enabled: row.get::<_, Option<i64>>(18)?.unwrap_or(1) != 0,
+            kiro_request_validation_enabled: row.get::<_, Option<i64>>(19)?.unwrap_or(0) != 0,
+            kiro_cache_estimation_enabled: row.get::<_, Option<i64>>(20)?.unwrap_or(0) != 0,
+            kiro_zero_cache_debug_enabled: row.get::<_, Option<i64>>(21)?.unwrap_or(0) != 0,
+            kiro_full_request_logging_enabled: row.get::<_, Option<i64>>(22)?.unwrap_or(0) != 0,
             kiro_remote_media_resolution_enabled: false,
-            kiro_cache_policy_override_json: row.get(22)?,
-            kiro_billable_model_multipliers_override_json: row.get(23)?,
+            kiro_cache_policy_override_json: row.get(23)?,
+            kiro_billable_model_multipliers_override_json: row.get(24)?,
         },
         rollup: KeyUsageRollup {
             key_id,
-            input_uncached_tokens: row.get(24)?,
-            input_cached_tokens: row.get(25)?,
-            output_tokens: row.get(26)?,
-            billable_tokens: row.get(27)?,
+            input_uncached_tokens: row.get(25)?,
+            input_cached_tokens: row.get(26)?,
+            output_tokens: row.get(27)?,
+            billable_tokens: row.get(28)?,
             credit_total,
-            credit_missing_events: row.get(29)?,
-            last_used_at_ms: row.get(30)?,
-            updated_at_ms: row.get(31)?,
+            credit_missing_events: row.get(30)?,
+            last_used_at_ms: row.get(31)?,
+            updated_at_ms: row.get(32)?,
         },
     })
 }
@@ -4977,6 +4993,7 @@ fn admin_key_from_bundle(bundle: &KeyBundle) -> AdminKey {
             .route
             .request_min_start_interval_ms
             .map(|value| value as u64),
+        codex_fast_enabled: bundle.route.codex_fast_enabled,
         kiro_request_validation_enabled: bundle.route.kiro_request_validation_enabled,
         kiro_cache_estimation_enabled: bundle.route.kiro_cache_estimation_enabled,
         kiro_zero_cache_debug_enabled: bundle.route.kiro_zero_cache_debug_enabled,
@@ -5910,6 +5927,7 @@ mod tests {
             model_name_map_json: None,
             request_max_concurrency: Some(2),
             request_min_start_interval_ms: Some(100),
+            codex_fast_enabled: true,
             kiro_request_validation_enabled: true,
             kiro_cache_estimation_enabled: true,
             kiro_zero_cache_debug_enabled: false,
@@ -5974,6 +5992,7 @@ mod tests {
             model_name_map_json: None,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
+            codex_fast_enabled: true,
             kiro_request_validation_enabled: false,
             kiro_cache_estimation_enabled: false,
             kiro_zero_cache_debug_enabled: false,
@@ -6041,6 +6060,7 @@ mod tests {
                     model_name_map_json: None,
                     request_max_concurrency: None,
                     request_min_start_interval_ms: None,
+                    codex_fast_enabled: true,
                     kiro_request_validation_enabled: true,
                     kiro_cache_estimation_enabled: true,
                     kiro_zero_cache_debug_enabled: false,
@@ -6175,6 +6195,7 @@ mod tests {
             model_name_map_json: None,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
+            codex_fast_enabled: true,
             kiro_request_validation_enabled: true,
             kiro_cache_estimation_enabled: true,
             kiro_zero_cache_debug_enabled: false,
@@ -6677,6 +6698,7 @@ mod tests {
             model_name_map: None,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
+            codex_fast_enabled: Some(false),
             updated_at_ms: 200,
             ..llm_access_core::store::AdminKeyPatch::default()
         })
@@ -6700,6 +6722,7 @@ mod tests {
         assert_eq!(route.auth_json, r#"{"access_token":"access-route"}"#);
         assert!(route.map_gpt53_codex_to_spark);
         assert!(!route.auth_refresh_enabled);
+        assert!(!route.codex_fast_enabled);
         assert_eq!(route.request_max_concurrency, Some(2));
         assert_eq!(route.request_min_start_interval_ms, Some(50));
         assert_eq!(route.account_request_max_concurrency, Some(3));
@@ -6707,6 +6730,36 @@ mod tests {
         let proxy = route.proxy.expect("codex proxy");
         assert_eq!(proxy.proxy_url, "http://127.0.0.1:9010");
         assert_eq!(proxy.proxy_username.as_deref(), Some("codex-user"));
+    }
+
+    #[test]
+    fn create_admin_key_defaults_codex_fast_to_enabled() {
+        let conn = rusqlite::Connection::open_in_memory().expect("open sqlite");
+        crate::initialize_sqlite_target(&conn).expect("init schema");
+        let repo = super::SqliteControlStore::new(conn);
+
+        let key = repo
+            .create_admin_key(&llm_access_core::store::NewAdminKey {
+                id: "key-fast-default".to_string(),
+                name: "fast default".to_string(),
+                secret: "sfk_fast_default".to_string(),
+                key_hash: "hash-fast-default".to_string(),
+                provider_type: "codex".to_string(),
+                protocol_family: "openai".to_string(),
+                public_visible: false,
+                quota_billable_limit: 1000,
+                request_max_concurrency: None,
+                request_min_start_interval_ms: None,
+                created_at_ms: 100,
+            })
+            .expect("create key");
+
+        assert!(key.codex_fast_enabled);
+        let bundle = repo
+            .get_key("key-fast-default")
+            .expect("load key")
+            .expect("key exists");
+        assert!(bundle.route.codex_fast_enabled);
     }
 
     #[test]
@@ -7333,6 +7386,7 @@ mod tests {
                 ),
                 request_max_concurrency: Some(2),
                 request_min_start_interval_ms: Some(50),
+                codex_fast_enabled: true,
                 kiro_request_validation_enabled: true,
                 kiro_cache_estimation_enabled: true,
                 kiro_zero_cache_debug_enabled: false,

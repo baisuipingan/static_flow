@@ -292,6 +292,53 @@ pub fn apply_gpt53_codex_spark_mapping(
     Ok(mapped)
 }
 
+/// Apply the per-key Codex fast policy to the upstream request body.
+pub fn apply_codex_fast_policy(
+    prepared: &PreparedGatewayRequest,
+    enabled: bool,
+) -> CodexGatewayResult<PreparedGatewayRequest> {
+    let mut value = serde_json::from_slice::<Value>(&prepared.request_body)
+        .map_err(|err| internal_error("Failed to parse llm gateway request body", err))?;
+    let Some(root) = value.as_object_mut() else {
+        return Err(internal_error(
+            "Failed to apply llm gateway fast policy",
+            "request body is not a JSON object",
+        ));
+    };
+
+    let mut changed = false;
+    if let Some(service_tier) = root.get_mut("service_tier") {
+        let normalized_fast = service_tier
+            .as_str()
+            .is_some_and(|raw| raw.eq_ignore_ascii_case("fast"));
+        let is_priority = service_tier
+            .as_str()
+            .is_some_and(|raw| raw.eq_ignore_ascii_case("priority"));
+        if normalized_fast {
+            *service_tier = Value::String("priority".to_string());
+            changed = true;
+        }
+        if !enabled && (normalized_fast || is_priority) {
+            root.remove("service_tier");
+            changed = true;
+        }
+    }
+
+    let billable_multiplier = resolve_billable_multiplier(Some(&value));
+    if !changed && prepared.billable_multiplier == billable_multiplier {
+        return Ok(prepared.clone());
+    }
+
+    let request_body = Bytes::from(serde_json::to_vec(&value).map_err(|err| {
+        internal_error("Failed to encode llm gateway fast-policy request body", err)
+    })?);
+
+    let mut adjusted = prepared.clone();
+    adjusted.request_body = request_body;
+    adjusted.billable_multiplier = billable_multiplier;
+    Ok(adjusted)
+}
+
 /// Align the outgoing native responses `store` field with the selected
 /// upstream provider semantics.
 pub fn align_responses_store_with_upstream(
@@ -2348,7 +2395,7 @@ mod tests {
 
     use super::{
         adapt_openai_chat_completions_request, align_responses_store_with_upstream,
-        codex_default_instructions, prepare_gateway_request,
+        apply_codex_fast_policy, codex_default_instructions, prepare_gateway_request,
     };
     use crate::types::{GatewayResponseAdapter, PreparedGatewayRequest};
 
@@ -2545,6 +2592,66 @@ mod tests {
         assert_eq!(body.get("store"), None);
         assert_eq!(body.get("previous_response_id"), None);
         assert_eq!(body["input"][0].get("id"), None);
+    }
+
+    #[test]
+    fn apply_codex_fast_policy_keeps_priority_and_multiplier_when_enabled() {
+        let prepared = prepared_responses_request(
+            "/v1/responses",
+            json!({
+                "model": "gpt-5.3-codex",
+                "input": "hello",
+                "service_tier": "fast"
+            }),
+        );
+
+        let adjusted =
+            apply_codex_fast_policy(&prepared, true).expect("fast-enabled policy should succeed");
+        let body: serde_json::Value =
+            serde_json::from_slice(&adjusted.request_body).expect("adjusted body json");
+
+        assert_eq!(body.get("service_tier"), Some(&json!("priority")));
+        assert_eq!(adjusted.billable_multiplier, 2);
+    }
+
+    #[test]
+    fn apply_codex_fast_policy_strips_priority_and_multiplier_when_disabled() {
+        let prepared = prepared_responses_request(
+            "/v1/responses",
+            json!({
+                "model": "gpt-5.3-codex",
+                "input": "hello",
+                "service_tier": "priority"
+            }),
+        );
+
+        let adjusted =
+            apply_codex_fast_policy(&prepared, false).expect("fast-disabled policy should succeed");
+        let body: serde_json::Value =
+            serde_json::from_slice(&adjusted.request_body).expect("adjusted body json");
+
+        assert_eq!(body.get("service_tier"), None);
+        assert_eq!(adjusted.billable_multiplier, 1);
+    }
+
+    #[test]
+    fn apply_codex_fast_policy_leaves_flex_unchanged_when_disabled() {
+        let prepared = prepared_responses_request(
+            "/v1/responses",
+            json!({
+                "model": "gpt-5.3-codex",
+                "input": "hello",
+                "service_tier": "flex"
+            }),
+        );
+
+        let adjusted =
+            apply_codex_fast_policy(&prepared, false).expect("non-fast tier policy should succeed");
+        let body: serde_json::Value =
+            serde_json::from_slice(&adjusted.request_body).expect("adjusted body json");
+
+        assert_eq!(body.get("service_tier"), Some(&json!("flex")));
+        assert_eq!(adjusted.billable_multiplier, 1);
     }
 
     #[tokio::test]

@@ -531,6 +531,8 @@ pub struct AdminKey {
     pub request_max_concurrency: Option<u64>,
     /// Per-key request pacing interval.
     pub request_min_start_interval_ms: Option<u64>,
+    /// Whether Codex fast/priority requests are allowed for this key.
+    pub codex_fast_enabled: bool,
     /// Whether Kiro request validation is enabled.
     pub kiro_request_validation_enabled: bool,
     /// Whether Kiro cache estimation is enabled.
@@ -801,6 +803,8 @@ pub struct AdminKeyPatch {
     pub request_max_concurrency: Option<Option<u64>>,
     /// New per-key request pacing interval.
     pub request_min_start_interval_ms: Option<Option<u64>>,
+    /// New Codex fast toggle.
+    pub codex_fast_enabled: Option<bool>,
     /// New Kiro request-validation toggle.
     pub kiro_request_validation_enabled: Option<bool>,
     /// New Kiro cache-estimation toggle.
@@ -1527,6 +1531,8 @@ pub struct ProviderCodexRoute {
     pub map_gpt53_codex_to_spark: bool,
     /// Whether this account may participate in automatic auth refresh.
     pub auth_refresh_enabled: bool,
+    /// Whether Codex fast/priority requests are allowed for this key.
+    pub codex_fast_enabled: bool,
     /// Request concurrency cap configured on this key route.
     pub request_max_concurrency: Option<u64>,
     /// Minimum interval between request starts configured on this key route.
@@ -3191,6 +3197,7 @@ impl AdminKeyStore for EmptyAdminKeyStore {
             model_name_map: None,
             request_max_concurrency: key.request_max_concurrency,
             request_min_start_interval_ms: key.request_min_start_interval_ms,
+            codex_fast_enabled: true,
             kiro_request_validation_enabled: true,
             kiro_cache_estimation_enabled: true,
             kiro_zero_cache_debug_enabled: false,

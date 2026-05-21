@@ -1145,6 +1145,7 @@ impl PostgresControlRepository {
                 .route
                 .request_min_start_interval_ms
                 .and_then(non_negative_i64_to_u64),
+            codex_fast_enabled: bundle.route.codex_fast_enabled,
             codex_weight_free: runtime_config.codex_weight_free,
             codex_weight_plus: runtime_config.codex_weight_plus,
             codex_weight_pro5x: runtime_config.codex_weight_pro5x,
@@ -1685,7 +1686,8 @@ impl PostgresControlRepository {
                     r.route_strategy, r.fixed_account_name, r.auto_account_names_json::text,
                     r.account_group_id, r.model_name_map_json::text,
                     r.request_max_concurrency, r.request_min_start_interval_ms,
-                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
+                    r.codex_fast_enabled, r.kiro_request_validation_enabled,
+                    r.kiro_cache_estimation_enabled,
                     r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
                     r.kiro_remote_media_resolution_enabled,
                     r.kiro_cache_policy_override_json::text,
@@ -1721,7 +1723,8 @@ impl PostgresControlRepository {
                     r.route_strategy, r.fixed_account_name, r.auto_account_names_json::text,
                     r.account_group_id, r.model_name_map_json::text,
                     r.request_max_concurrency, r.request_min_start_interval_ms,
-                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
+                    r.codex_fast_enabled, r.kiro_request_validation_enabled,
+                    r.kiro_cache_estimation_enabled,
                     r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
                     r.kiro_remote_media_resolution_enabled,
                     r.kiro_cache_policy_override_json::text,
@@ -1829,7 +1832,8 @@ impl PostgresControlRepository {
                     r.route_strategy, r.fixed_account_name, r.auto_account_names_json::text,
                     r.account_group_id, r.model_name_map_json::text,
                     r.request_max_concurrency, r.request_min_start_interval_ms,
-                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
+                    r.codex_fast_enabled, r.kiro_request_validation_enabled,
+                    r.kiro_cache_estimation_enabled,
                     r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
                     r.kiro_remote_media_resolution_enabled,
                     r.kiro_cache_policy_override_json::text,
@@ -1891,7 +1895,8 @@ impl PostgresControlRepository {
                         r.route_strategy, r.fixed_account_name, r.auto_account_names_json,
                         r.account_group_id, r.model_name_map_json,
                         r.request_max_concurrency, r.request_min_start_interval_ms,
-                        r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
+                        r.codex_fast_enabled, r.kiro_request_validation_enabled,
+                        r.kiro_cache_estimation_enabled,
                         r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
                         r.kiro_remote_media_resolution_enabled,
                         r.kiro_cache_policy_override_json,
@@ -2039,7 +2044,7 @@ impl PostgresControlRepository {
                     page_keys.auto_account_names_json::text,
                     page_keys.account_group_id, page_keys.model_name_map_json::text,
                     page_keys.request_max_concurrency, page_keys.request_min_start_interval_ms,
-                    page_keys.kiro_request_validation_enabled,
+                    page_keys.codex_fast_enabled, page_keys.kiro_request_validation_enabled,
                     page_keys.kiro_cache_estimation_enabled,
                     page_keys.kiro_zero_cache_debug_enabled,
                     page_keys.kiro_full_request_logging_enabled,
@@ -2097,7 +2102,8 @@ impl PostgresControlRepository {
                     r.route_strategy, r.fixed_account_name, r.auto_account_names_json::text,
                     r.account_group_id, r.model_name_map_json::text,
                     r.request_max_concurrency, r.request_min_start_interval_ms,
-                    r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
+                    r.codex_fast_enabled, r.kiro_request_validation_enabled,
+                    r.kiro_cache_estimation_enabled,
                     r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
                     r.kiro_remote_media_resolution_enabled,
                     r.kiro_cache_policy_override_json::text,
@@ -4487,13 +4493,14 @@ impl PostgresControlRepository {
                 "INSERT INTO llm_key_route_config (
                     key_id, route_strategy, fixed_account_name, auto_account_names_json,
                     account_group_id, model_name_map_json, request_max_concurrency,
-                    request_min_start_interval_ms, kiro_request_validation_enabled,
-                    kiro_cache_estimation_enabled, kiro_zero_cache_debug_enabled,
-                    kiro_full_request_logging_enabled, kiro_remote_media_resolution_enabled,
-                    kiro_cache_policy_override_json, kiro_billable_model_multipliers_override_json
+                    request_min_start_interval_ms, codex_fast_enabled,
+                    kiro_request_validation_enabled, kiro_cache_estimation_enabled,
+                    kiro_zero_cache_debug_enabled, kiro_full_request_logging_enabled,
+                    kiro_remote_media_resolution_enabled, kiro_cache_policy_override_json,
+                    kiro_billable_model_multipliers_override_json
                  ) VALUES (
                     $1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, $8, $9, $10, $11, $12,
-                    $13, $14::jsonb, $15::jsonb
+                    $13, $14, $15::jsonb, $16::jsonb
                  )
                  ON CONFLICT(key_id) DO UPDATE SET
                     route_strategy = EXCLUDED.route_strategy,
@@ -4503,6 +4510,7 @@ impl PostgresControlRepository {
                     model_name_map_json = EXCLUDED.model_name_map_json,
                     request_max_concurrency = EXCLUDED.request_max_concurrency,
                     request_min_start_interval_ms = EXCLUDED.request_min_start_interval_ms,
+                    codex_fast_enabled = EXCLUDED.codex_fast_enabled,
                     kiro_request_validation_enabled = EXCLUDED.kiro_request_validation_enabled,
                     kiro_cache_estimation_enabled = EXCLUDED.kiro_cache_estimation_enabled,
                     kiro_zero_cache_debug_enabled = EXCLUDED.kiro_zero_cache_debug_enabled,
@@ -4523,6 +4531,7 @@ impl PostgresControlRepository {
                     &route.model_name_map_json,
                     &route.request_max_concurrency,
                     &route.request_min_start_interval_ms,
+                    &route.codex_fast_enabled,
                     &route.kiro_request_validation_enabled,
                     &route.kiro_cache_estimation_enabled,
                     &route.kiro_zero_cache_debug_enabled,
@@ -4947,7 +4956,7 @@ fn decode_runtime_config_row(row: PgRow) -> anyhow::Result<RuntimeConfigRecord> 
 
 fn decode_key_bundle(row: &PgRow) -> anyhow::Result<KeyBundle> {
     let key_id: String = row.get(0);
-    let credit_total_raw: String = row.get(29);
+    let credit_total_raw: String = row.get(30);
     let credit_total = credit_total_raw
         .parse::<f64>()
         .with_context(|| format!("parse key rollup credit_total `{credit_total_raw}`"))?;
@@ -4974,24 +4983,25 @@ fn decode_key_bundle(row: &PgRow) -> anyhow::Result<KeyBundle> {
             model_name_map_json: row.get(15),
             request_max_concurrency: row.get(16),
             request_min_start_interval_ms: row.get(17),
-            kiro_request_validation_enabled: row.get::<_, Option<bool>>(18).unwrap_or(false),
-            kiro_cache_estimation_enabled: row.get::<_, Option<bool>>(19).unwrap_or(false),
-            kiro_zero_cache_debug_enabled: row.get::<_, Option<bool>>(20).unwrap_or(false),
-            kiro_full_request_logging_enabled: row.get::<_, Option<bool>>(21).unwrap_or(false),
-            kiro_remote_media_resolution_enabled: row.get::<_, Option<bool>>(22).unwrap_or(false),
-            kiro_cache_policy_override_json: row.get(23),
-            kiro_billable_model_multipliers_override_json: row.get(24),
+            codex_fast_enabled: row.get::<_, Option<bool>>(18).unwrap_or(true),
+            kiro_request_validation_enabled: row.get::<_, Option<bool>>(19).unwrap_or(false),
+            kiro_cache_estimation_enabled: row.get::<_, Option<bool>>(20).unwrap_or(false),
+            kiro_zero_cache_debug_enabled: row.get::<_, Option<bool>>(21).unwrap_or(false),
+            kiro_full_request_logging_enabled: row.get::<_, Option<bool>>(22).unwrap_or(false),
+            kiro_remote_media_resolution_enabled: row.get::<_, Option<bool>>(23).unwrap_or(false),
+            kiro_cache_policy_override_json: row.get(24),
+            kiro_billable_model_multipliers_override_json: row.get(25),
         },
         rollup: KeyUsageRollup {
             key_id,
-            input_uncached_tokens: row.get(25),
-            input_cached_tokens: row.get(26),
-            output_tokens: row.get(27),
-            billable_tokens: row.get(28),
+            input_uncached_tokens: row.get(26),
+            input_cached_tokens: row.get(27),
+            output_tokens: row.get(28),
+            billable_tokens: row.get(29),
             credit_total,
-            credit_missing_events: row.get(30),
-            last_used_at_ms: row.get(31),
-            updated_at_ms: row.get(32),
+            credit_missing_events: row.get(31),
+            last_used_at_ms: row.get(32),
+            updated_at_ms: row.get(33),
         },
     })
 }
@@ -5034,6 +5044,7 @@ fn admin_key_from_bundle(bundle: &KeyBundle) -> AdminKey {
             .route
             .request_min_start_interval_ms
             .and_then(non_negative_i64_to_u64),
+        codex_fast_enabled: bundle.route.codex_fast_enabled,
         kiro_request_validation_enabled: bundle.route.kiro_request_validation_enabled,
         kiro_cache_estimation_enabled: bundle.route.kiro_cache_estimation_enabled,
         kiro_zero_cache_debug_enabled: bundle.route.kiro_zero_cache_debug_enabled,
@@ -5079,7 +5090,7 @@ fn decode_kiro_candidate_credit_summary_row(
 fn decode_kiro_admin_key_row(row: PgRow) -> anyhow::Result<AdminKey> {
     let bundle = decode_key_bundle(&row)?;
     let mut key = admin_key_from_bundle(&bundle);
-    key.kiro_candidate_credit_summary = Some(decode_kiro_candidate_credit_summary_row(&row, 33));
+    key.kiro_candidate_credit_summary = Some(decode_kiro_candidate_credit_summary_row(&row, 34));
     Ok(key)
 }
 
@@ -6008,7 +6019,8 @@ impl AdminKeyStore for PostgresControlRepository {
                 r.route_strategy, r.fixed_account_name, r.auto_account_names_json::text,
                 r.account_group_id, r.model_name_map_json::text,
                 r.request_max_concurrency, r.request_min_start_interval_ms,
-                r.kiro_request_validation_enabled, r.kiro_cache_estimation_enabled,
+                r.codex_fast_enabled, r.kiro_request_validation_enabled,
+                r.kiro_cache_estimation_enabled,
                 r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
                 r.kiro_remote_media_resolution_enabled,
                 r.kiro_cache_policy_override_json::text,
@@ -6095,6 +6107,7 @@ impl AdminKeyStore for PostgresControlRepository {
             request_min_start_interval_ms: key
                 .request_min_start_interval_ms
                 .map(|value| value as i64),
+            codex_fast_enabled: true,
             kiro_request_validation_enabled: true,
             kiro_cache_estimation_enabled: true,
             kiro_zero_cache_debug_enabled: false,
@@ -6170,6 +6183,9 @@ impl AdminKeyStore for PostgresControlRepository {
         }
         if let Some(value) = patch.request_min_start_interval_ms {
             bundle.route.request_min_start_interval_ms = value.map(|value| value as i64);
+        }
+        if let Some(value) = patch.codex_fast_enabled {
+            bundle.route.codex_fast_enabled = value;
         }
         if let Some(value) = patch.kiro_request_validation_enabled {
             bundle.route.kiro_request_validation_enabled = value;
@@ -6980,6 +6996,7 @@ impl AdminCodexAccountStore for PostgresControlRepository {
             auth_json: record.auth_json,
             map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
             auth_refresh_enabled: settings.auth_refresh_enabled,
+            codex_fast_enabled: true,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
             account_request_max_concurrency: settings.request_max_concurrency,
@@ -7685,6 +7702,7 @@ impl ProviderRouteStore for PostgresControlRepository {
                 auth_json: String::new(),
                 map_gpt53_codex_to_spark: view.map_gpt53_codex_to_spark,
                 auth_refresh_enabled: view.auth_refresh_enabled,
+                codex_fast_enabled: snapshot.codex_fast_enabled,
                 request_max_concurrency: snapshot.request_max_concurrency,
                 request_min_start_interval_ms: snapshot.request_min_start_interval_ms,
                 account_request_max_concurrency: view.request_max_concurrency,
@@ -7756,6 +7774,7 @@ impl ProviderRouteStore for PostgresControlRepository {
             auth_json: auth.auth_json,
             map_gpt53_codex_to_spark: view.map_gpt53_codex_to_spark,
             auth_refresh_enabled: view.auth_refresh_enabled,
+            codex_fast_enabled: true,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
             account_request_max_concurrency: view.request_max_concurrency,
@@ -8919,13 +8938,14 @@ mod tests {
                 "INSERT INTO llm_key_route_config (
                     key_id, route_strategy, fixed_account_name, auto_account_names_json,
                     account_group_id, model_name_map_json, request_max_concurrency,
-                    request_min_start_interval_ms, kiro_request_validation_enabled,
-                    kiro_cache_estimation_enabled, kiro_zero_cache_debug_enabled,
-                    kiro_full_request_logging_enabled, kiro_cache_policy_override_json,
+                    request_min_start_interval_ms, codex_fast_enabled,
+                    kiro_request_validation_enabled, kiro_cache_estimation_enabled,
+                    kiro_zero_cache_debug_enabled, kiro_full_request_logging_enabled,
+                    kiro_cache_policy_override_json,
                     kiro_billable_model_multipliers_override_json
                  ) VALUES (
                     'key-1', NULL, NULL, NULL, NULL, NULL, NULL, NULL,
-                    FALSE, FALSE, FALSE, FALSE, NULL, NULL
+                    TRUE, FALSE, FALSE, FALSE, FALSE, NULL, NULL
                  );
                  INSERT INTO llm_key_usage_rollups (
                     key_id, input_uncached_tokens, input_cached_tokens, output_tokens,
@@ -8963,18 +8983,19 @@ mod tests {
                      INSERT INTO llm_key_route_config (
                         key_id, route_strategy, fixed_account_name, auto_account_names_json,
                         account_group_id, model_name_map_json, request_max_concurrency,
-                        request_min_start_interval_ms, kiro_request_validation_enabled,
-                        kiro_cache_estimation_enabled, kiro_zero_cache_debug_enabled,
-                        kiro_full_request_logging_enabled, kiro_cache_policy_override_json,
+                        request_min_start_interval_ms, codex_fast_enabled,
+                        kiro_request_validation_enabled, kiro_cache_estimation_enabled,
+                        kiro_zero_cache_debug_enabled, kiro_full_request_logging_enabled,
+                        kiro_cache_policy_override_json,
                         kiro_billable_model_multipliers_override_json
                      ) VALUES
                         ('kiro-key-new', 'auto', NULL, NULL, NULL, NULL, NULL, NULL, TRUE, TRUE, \
-                 FALSE, FALSE, NULL, NULL),
+                 TRUE, FALSE, FALSE, NULL, NULL),
                         ('kiro-key-mid', 'fixed', 'kiro-a', NULL, 'group-beta', NULL, NULL, NULL, \
-                 TRUE, TRUE, FALSE, FALSE, NULL, NULL),
+                 TRUE, TRUE, TRUE, FALSE, FALSE, NULL, NULL),
                         ('kiro-key-old', 'auto', NULL, '[\"kiro-a\", \"kiro-d\", \
-                 \"kiro-a\"]'::jsonb, NULL, NULL, NULL, NULL, TRUE, TRUE, FALSE, FALSE, NULL, \
-                 NULL);
+                 \"kiro-a\"]'::jsonb, NULL, NULL, NULL, NULL, TRUE, TRUE, TRUE, FALSE, FALSE, \
+                 NULL, NULL);
                      INSERT INTO llm_key_usage_rollups (
                         key_id, input_uncached_tokens, input_cached_tokens, output_tokens,
                         billable_tokens, credit_total, credit_missing_events, last_used_at_ms,

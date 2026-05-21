@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS llm_key_route_config (
     request_min_start_interval_ms INTEGER CHECK (
         request_min_start_interval_ms IS NULL OR request_min_start_interval_ms >= 0
     ),
+    codex_fast_enabled INTEGER NOT NULL DEFAULT 1 CHECK (
+        codex_fast_enabled IN (0, 1)
+    ),
     kiro_request_validation_enabled INTEGER NOT NULL DEFAULT 0 CHECK (
         kiro_request_validation_enabled IN (0, 1)
     ),

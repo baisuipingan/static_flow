@@ -20,6 +20,10 @@ const CODEX_STATUS_TTL: Duration = Duration::from_secs(4 * 60 * 60);
 const PROXY_METADATA_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const NEGATIVE_AUTH_TTL: Duration = Duration::from_secs(5 * 60);
 
+const fn default_true() -> bool {
+    true
+}
+
 /// Shared Valkey configuration for the request-path cache layer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RequestCacheConfig {
@@ -85,6 +89,8 @@ pub(crate) struct CachedCodexRequestSnapshot {
     pub use_all_active_accounts: bool,
     pub request_max_concurrency: Option<u64>,
     pub request_min_start_interval_ms: Option<u64>,
+    #[serde(default = "default_true")]
+    pub codex_fast_enabled: bool,
     pub codex_weight_free: i64,
     pub codex_weight_plus: i64,
     pub codex_weight_pro5x: i64,

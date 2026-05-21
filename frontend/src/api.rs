@@ -6005,6 +6005,8 @@ pub struct AdminLlmGatewayKeyView {
     pub request_max_concurrency: Option<u64>,
     pub request_min_start_interval_ms: Option<u64>,
     #[serde(default = "default_true")]
+    pub codex_fast_enabled: bool,
+    #[serde(default = "default_true")]
     pub kiro_request_validation_enabled: bool,
     #[serde(default = "default_true")]
     pub kiro_cache_estimation_enabled: bool,
@@ -8631,6 +8633,7 @@ pub struct PatchAdminLlmGatewayKeyRequest<'a> {
     pub model_name_map: Option<&'a BTreeMap<String, String>>,
     pub request_max_concurrency: Option<u64>,
     pub request_min_start_interval_ms: Option<u64>,
+    pub codex_fast_enabled: Option<bool>,
     pub kiro_request_validation_enabled: Option<bool>,
     pub kiro_cache_estimation_enabled: Option<bool>,
     pub kiro_zero_cache_debug_enabled: Option<bool>,
@@ -8661,6 +8664,7 @@ pub async fn patch_admin_llm_gateway_key(
             request.model_name_map,
             request.request_max_concurrency,
             request.request_min_start_interval_ms,
+            request.codex_fast_enabled,
             request.kiro_request_validation_enabled,
             request.kiro_cache_estimation_enabled,
             request.kiro_zero_cache_debug_enabled,
@@ -8746,6 +8750,12 @@ pub async fn patch_admin_llm_gateway_key(
             body.insert(
                 "request_min_start_interval_ms".to_string(),
                 serde_json::Value::Number(request_min_start_interval_ms.into()),
+            );
+        }
+        if let Some(codex_fast_enabled) = request.codex_fast_enabled {
+            body.insert(
+                "codex_fast_enabled".to_string(),
+                serde_json::Value::Bool(codex_fast_enabled),
             );
         }
         if let Some(kiro_request_validation_enabled) = request.kiro_request_validation_enabled {

@@ -26,8 +26,8 @@ use llm_access_codex::{
         AnthropicStreamMetadata,
     },
     request::{
-        align_responses_store_with_upstream, apply_gpt53_codex_spark_mapping, external_origin,
-        extract_client_ip_from_headers,
+        align_responses_store_with_upstream, apply_codex_fast_policy,
+        apply_gpt53_codex_spark_mapping, external_origin, extract_client_ip_from_headers,
         extract_last_message_content as extract_codex_last_message_content,
         prepare_gateway_request_from_bytes, resolve_request_url_from_headers,
         serialize_headers_json,
@@ -1383,6 +1383,10 @@ async fn dispatch_codex_proxy(
                 Ok(prepared) => prepared,
                 Err(err) => return (err.status, err.message).into_response(),
             };
+        let prepared = match apply_codex_fast_policy(&prepared, route.codex_fast_enabled) {
+            Ok(prepared) => prepared,
+            Err(err) => return (err.status, err.message).into_response(),
+        };
         let prepared = match align_responses_store_with_upstream(&prepared, &upstream_base) {
             Ok(prepared) => prepared,
             Err(err) => return (err.status, err.message).into_response(),
@@ -7517,6 +7521,7 @@ mod tests {
             auth_json: format!(r#"{{"access_token":"{access_token}"}}"#),
             map_gpt53_codex_to_spark: true,
             auth_refresh_enabled: true,
+            codex_fast_enabled: true,
             request_max_concurrency: None,
             request_min_start_interval_ms: None,
             account_request_max_concurrency: None,
@@ -10695,6 +10700,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn codex_dispatch_strips_fast_service_tier_when_key_disables_fast() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("codex upstream env lock");
+        let captured = Arc::new(CapturedCodexUpstream::default());
+        let app = Router::new()
+            .route("/v1/responses", post(fake_codex_responses))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake upstream");
+        });
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+
+        let store = Arc::new(RecordingControlStore::default());
+        let mut route = codex_route_for_account("codex-a", "upstream-token");
+        route.codex_fast_enabled = false;
+        let state = super::ProviderState::new(
+            store.clone(),
+            Arc::new(StaticRouteStore {
+                codex_route: route,
+                kiro_route: static_kiro_route(),
+            }),
+        );
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::AUTHORIZATION, "Bearer codex-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model": "gpt-5.3-codex",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "service_tier": "fast",
+                        "stream": false
+                    }"#,
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = captured.requests.lock().expect("captured requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body.get("service_tier"), None);
+        drop(requests);
+
+        let events = store.usage_events.lock().expect("usage events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].billable_tokens, 25);
+    }
+
+    #[tokio::test]
+    async fn codex_dispatch_keeps_fast_service_tier_when_key_enables_fast() {
+        let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
+            .lock()
+            .expect("codex upstream env lock");
+        let captured = Arc::new(CapturedCodexUpstream::default());
+        let app = Router::new()
+            .route("/v1/responses", post(fake_codex_responses))
+            .with_state(captured.clone());
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind fake upstream");
+        let upstream_base = format!("http://{}", listener.local_addr().expect("local addr"));
+        tokio::spawn(async move {
+            axum::serve(listener, app)
+                .await
+                .expect("serve fake upstream");
+        });
+        std::env::set_var("CODEX_UPSTREAM_BASE_URL", upstream_base);
+
+        let store = Arc::new(RecordingControlStore::default());
+        let state = super::ProviderState::new(store.clone(), static_codex_route_store());
+        let response = super::provider_entry(
+            state,
+            Request::builder()
+                .method("POST")
+                .uri("/v1/chat/completions")
+                .header(header::AUTHORIZATION, "Bearer codex-secret")
+                .header(header::CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    r#"{
+                        "model": "gpt-5.3-codex",
+                        "messages": [{"role": "user", "content": "hello"}],
+                        "service_tier": "fast",
+                        "stream": false
+                    }"#,
+                ))
+                .expect("request"),
+        )
+        .await;
+
+        std::env::remove_var("CODEX_UPSTREAM_BASE_URL");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let requests = captured.requests.lock().expect("captured requests");
+        assert_eq!(requests.len(), 1);
+        assert_eq!(requests[0].body["service_tier"], "priority");
+        drop(requests);
+
+        let events = store.usage_events.lock().expect("usage events");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].billable_tokens, 50);
+    }
+
+    #[tokio::test]
     async fn codex_dispatch_repairs_chat_tool_call_without_output_and_records_usage() {
         let _guard = crate::CODEX_UPSTREAM_ENV_LOCK
             .lock()
@@ -11266,6 +11387,7 @@ mod tests {
                     auth_json: r#"{"access_token":"upstream-token"}"#.to_string(),
                     map_gpt53_codex_to_spark: true,
                     auth_refresh_enabled: true,
+                    codex_fast_enabled: true,
                     request_max_concurrency: None,
                     request_min_start_interval_ms: None,
                     account_request_max_concurrency: None,
@@ -11331,6 +11453,7 @@ mod tests {
                     auth_json: r#"{"access_token":"upstream-token"}"#.to_string(),
                     map_gpt53_codex_to_spark: true,
                     auth_refresh_enabled: true,
+                    codex_fast_enabled: true,
                     request_max_concurrency: None,
                     request_min_start_interval_ms: None,
                     account_request_max_concurrency: None,
@@ -11647,6 +11770,7 @@ mod tests {
                     auth_json: r#"{"access_token":"upstream-token"}"#.to_string(),
                     map_gpt53_codex_to_spark: true,
                     auth_refresh_enabled: true,
+                    codex_fast_enabled: true,
                     request_max_concurrency: None,
                     request_min_start_interval_ms: None,
                     account_request_max_concurrency: None,
