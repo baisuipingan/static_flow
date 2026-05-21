@@ -53,6 +53,11 @@ const POSTGRES_MIGRATIONS: &[SqlMigration] = &[
         name: "kiro_remote_media_resolution",
         sql: include_str!("../migrations/postgres/0013_kiro_remote_media_resolution.sql"),
     },
+    SqlMigration {
+        version: 14,
+        name: "codex_fast_toggle",
+        sql: include_str!("../migrations/postgres/0014_codex_fast_toggle.sql"),
+    },
 ];
 
 /// Return target DuckDB migrations in execution order.
@@ -193,5 +198,18 @@ mod tests {
         assert!(migration
             .sql
             .contains("kiro_remote_media_resolution_enabled"));
+    }
+
+    #[test]
+    fn postgres_migrations_include_codex_fast_toggle() {
+        let migrations = super::postgres_migrations();
+        let migration = migrations
+            .iter()
+            .find(|migration| migration.name == "codex_fast_toggle")
+            .expect("codex fast migration exists");
+
+        assert_eq!(migration.version, 14);
+        assert!(migration.sql.contains("codex_fast_enabled"));
+        assert!(migration.sql.contains("ADD COLUMN IF NOT EXISTS"));
     }
 }

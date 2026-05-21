@@ -14,7 +14,8 @@ use llm_access_core::{
     store::{
         self as core_store, default_proxy_bindings, AdminAccountContributionRequest,
         AdminAccountContributionRequestsPage, AdminAccountGroup, AdminAccountGroupOption,
-        AdminAccountGroupPatch, AdminAccountGroupStore, AdminCodexAccount, AdminCodexAccountPatch,
+        AdminAccountGroupPatch, AdminAccountGroupStore, AdminCodexAccount,
+        AdminCodexAccountPageQuery, AdminCodexAccountPatch, AdminCodexAccountSortMode,
         AdminCodexAccountStore, AdminCodexAccountsPage, AdminCodexImportJobDetail,
         AdminCodexImportJobItem, AdminCodexImportJobItemResult, AdminCodexImportJobSummary,
         AdminConfigStore, AdminKey, AdminKeyPageQuery, AdminKeyPatch, AdminKeySortMode,
@@ -415,6 +416,12 @@ struct CodexAdminAccountListRow {
     last_refresh_at_ms: Option<i64>,
     last_error: Option<String>,
     access_token: Option<String>,
+    plan_type: Option<String>,
+    primary_remaining_percent: Option<f64>,
+    secondary_remaining_percent: Option<f64>,
+    last_usage_checked_at_ms: Option<i64>,
+    last_usage_success_at_ms: Option<i64>,
+    usage_error_message: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -2882,7 +2889,13 @@ impl PostgresControlRepository {
                         auth_json #>> '{tokens,accessToken}',
                         auth_json ->> 'access_token',
                         auth_json ->> 'accessToken'
-                    )
+                    ),
+                    NULL::text,
+                    NULL::double precision,
+                    NULL::double precision,
+                    NULL::bigint,
+                    NULL::bigint,
+                    NULL::text
                  FROM llm_codex_accounts
                  ORDER BY created_at_ms DESC, account_name DESC",
                 &[],
@@ -2976,7 +2989,13 @@ impl PostgresControlRepository {
                         auth_json #>> '{tokens,accessToken}',
                         auth_json ->> 'access_token',
                         auth_json ->> 'accessToken'
-                    )
+                    ),
+                    NULL::text,
+                    NULL::double precision,
+                    NULL::double precision,
+                    NULL::bigint,
+                    NULL::bigint,
+                    NULL::text
                  FROM llm_codex_accounts
                  ORDER BY created_at_ms DESC, account_name DESC
                  LIMIT $1 OFFSET $2",
@@ -2984,6 +3003,220 @@ impl PostgresControlRepository {
             )
             .await
             .context("list postgres codex admin account rows page")?;
+        Ok((
+            rows.into_iter()
+                .map(decode_codex_admin_account_list_row)
+                .collect(),
+            total,
+        ))
+    }
+
+    async fn list_codex_admin_account_rows_filtered_page(
+        &self,
+        query: &AdminCodexAccountPageQuery,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<(Vec<CodexAdminAccountListRow>, usize)> {
+        self.ensure_connection_alive()?;
+        let search = query
+            .search
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+            .map(|value| format!("%{}%", value.to_ascii_lowercase()));
+        let base_cte = "
+            WITH status_snapshot AS (
+                SELECT snapshot_json
+                FROM llm_codex_status_cache
+                WHERE id = 'default'
+            ),
+            status_accounts AS (
+                SELECT
+                    NULLIF(BTRIM(account ->> 'name'), '') AS account_name,
+                    COALESCE(NULLIF(BTRIM(account ->> 'status'), ''), 'unknown') AS status,
+                    NULLIF(BTRIM(account ->> 'plan_type'), '') AS plan_type,
+                    CASE
+                        WHEN jsonb_typeof(account -> 'primary_remaining_percent') = 'number'
+                        THEN (account ->> 'primary_remaining_percent')::double precision
+                        ELSE NULL
+                    END AS primary_remaining_percent,
+                    CASE
+                        WHEN jsonb_typeof(account -> 'secondary_remaining_percent') = 'number'
+                        THEN (account ->> 'secondary_remaining_percent')::double precision
+                        ELSE NULL
+                    END AS secondary_remaining_percent,
+                    CASE
+                        WHEN jsonb_typeof(account -> 'last_usage_checked_at') = 'number'
+                        THEN (account ->> 'last_usage_checked_at')::bigint
+                        ELSE NULL
+                    END AS last_usage_checked_at_ms,
+                    CASE
+                        WHEN jsonb_typeof(account -> 'last_usage_success_at') = 'number'
+                        THEN (account ->> 'last_usage_success_at')::bigint
+                        ELSE NULL
+                    END AS last_usage_success_at_ms,
+                    NULLIF(BTRIM(account ->> 'usage_error_message'), '') AS usage_error_message
+                FROM status_snapshot snapshot
+                CROSS JOIN LATERAL jsonb_array_elements(
+                    COALESCE(snapshot.snapshot_json -> 'accounts', '[]'::jsonb)
+                ) account
+            ),
+            account_rows AS (
+                SELECT
+                    a.account_name,
+                    a.account_id,
+                    a.status,
+                    COALESCE(
+                        CASE
+                            WHEN jsonb_typeof(a.settings_json -> 'map_gpt53_codex_to_spark')
+                                = 'boolean'
+                            THEN (a.settings_json ->> 'map_gpt53_codex_to_spark')::boolean
+                        END,
+                        false
+                    ) AS map_gpt53_codex_to_spark,
+                    COALESCE(
+                        CASE
+                            WHEN jsonb_typeof(a.settings_json -> 'auth_refresh_enabled')
+                                = 'boolean'
+                            THEN (a.settings_json ->> 'auth_refresh_enabled')::boolean
+                        END,
+                        true
+                    ) AS auth_refresh_enabled,
+                    NULLIF(BTRIM(a.settings_json ->> 'route_weight_tier'), '') AS \
+                        route_weight_tier,
+                    COALESCE(NULLIF(BTRIM(a.settings_json ->> 'proxy_mode'), ''), 'inherit')
+                        AS proxy_mode,
+                    NULLIF(BTRIM(a.settings_json ->> 'proxy_config_id'), '') AS proxy_config_id,
+                    CASE
+                        WHEN jsonb_typeof(a.settings_json -> 'request_max_concurrency') = 'number'
+                        THEN (a.settings_json ->> 'request_max_concurrency')::bigint
+                        ELSE NULL
+                    END AS request_max_concurrency,
+                    CASE
+                        WHEN jsonb_typeof(a.settings_json -> 'request_min_start_interval_ms')
+                            = 'number'
+                        THEN (a.settings_json ->> 'request_min_start_interval_ms')::bigint
+                        ELSE NULL
+                    END AS request_min_start_interval_ms,
+                    a.last_refresh_at_ms,
+                    a.last_error,
+                    COALESCE(
+                        a.auth_json #>> '{tokens,access_token}',
+                        a.auth_json #>> '{tokens,accessToken}',
+                        a.auth_json ->> 'access_token',
+                        a.auth_json ->> 'accessToken'
+                    ) AS access_token,
+                    CASE
+                        WHEN a.status = 'active' AND COALESCE(sa.status, '') = 'active'
+                        THEN sa.plan_type
+                        ELSE NULL
+                    END AS plan_type,
+                    CASE
+                        WHEN a.status = 'active' AND COALESCE(sa.status, '') = 'active'
+                        THEN sa.primary_remaining_percent
+                        ELSE NULL
+                    END AS primary_remaining_percent,
+                    CASE
+                        WHEN a.status = 'active' AND COALESCE(sa.status, '') = 'active'
+                        THEN sa.secondary_remaining_percent
+                        ELSE NULL
+                    END AS secondary_remaining_percent,
+                    CASE
+                        WHEN a.status = 'active' AND COALESCE(sa.status, '') = 'active'
+                        THEN sa.last_usage_checked_at_ms
+                        ELSE NULL
+                    END AS last_usage_checked_at_ms,
+                    CASE
+                        WHEN a.status = 'active' AND COALESCE(sa.status, '') = 'active'
+                        THEN sa.last_usage_success_at_ms
+                        ELSE NULL
+                    END AS last_usage_success_at_ms,
+                    CASE
+                        WHEN a.status = 'active' AND COALESCE(sa.status, '') = 'active'
+                        THEN sa.usage_error_message
+                        ELSE NULL
+                    END AS usage_error_message,
+                    a.created_at_ms
+                FROM llm_codex_accounts a
+                LEFT JOIN status_accounts sa ON sa.account_name = a.account_name
+            )";
+        let filter_sql = "
+            WHERE ($1::text IS NULL
+                   OR lower(account_name) LIKE $1
+                   OR lower(status) LIKE $1
+                   OR lower(COALESCE(plan_type, '')) LIKE $1
+                   OR lower(COALESCE(account_id, '')) LIKE $1
+                   OR lower(COALESCE(route_weight_tier, '')) LIKE $1)
+              AND ($2::boolean = FALSE OR status <> 'disabled')
+              AND ($3::boolean = FALSE
+                   OR status = 'disabled'
+                   OR last_error IS NOT NULL
+                   OR usage_error_message IS NOT NULL)";
+        let total_sql = format!(
+            "{base_cte}
+             SELECT COUNT(*)
+             FROM account_rows
+             {filter_sql}"
+        );
+        let total = self
+            .client
+            .query_one(total_sql.as_str(), &[&search, &query.active_only, &query.unhealthy_only])
+            .await
+            .context("count postgres filtered codex admin account rows")?
+            .get::<_, i64>(0)
+            .max(0) as usize;
+        let order_by = match query.sort {
+            AdminCodexAccountSortMode::Newest => "created_at_ms DESC, account_name DESC",
+            AdminCodexAccountSortMode::PrimaryAsc => {
+                "COALESCE(primary_remaining_percent, 100.0) ASC, account_name DESC"
+            },
+            AdminCodexAccountSortMode::PrimaryDesc => {
+                "COALESCE(primary_remaining_percent, 100.0) DESC, account_name DESC"
+            },
+            AdminCodexAccountSortMode::SecondaryAsc => {
+                "COALESCE(secondary_remaining_percent, 100.0) ASC, account_name DESC"
+            },
+            AdminCodexAccountSortMode::SecondaryDesc => {
+                "COALESCE(secondary_remaining_percent, 100.0) DESC, account_name DESC"
+            },
+        };
+        let rows_sql = format!(
+            "{base_cte}
+             SELECT
+                account_name,
+                account_id,
+                status,
+                map_gpt53_codex_to_spark,
+                auth_refresh_enabled,
+                route_weight_tier,
+                proxy_mode,
+                proxy_config_id,
+                request_max_concurrency,
+                request_min_start_interval_ms,
+                last_refresh_at_ms,
+                last_error,
+                access_token,
+                plan_type,
+                primary_remaining_percent,
+                secondary_remaining_percent,
+                last_usage_checked_at_ms,
+                last_usage_success_at_ms,
+                usage_error_message
+             FROM account_rows
+             {filter_sql}
+             ORDER BY {order_by}
+             LIMIT $4 OFFSET $5"
+        );
+        let rows = self
+            .client
+            .query(rows_sql.as_str(), &[
+                &search,
+                &query.active_only,
+                &query.unhealthy_only,
+                &(page.limit.max(1) as i64),
+                &(page.offset as i64),
+            ])
+            .await
+            .context("list postgres filtered codex admin account rows page")?;
         Ok((
             rows.into_iter()
                 .map(decode_codex_admin_account_list_row)
@@ -4100,13 +4333,13 @@ impl PostgresControlRepository {
             name: row.account_name.clone(),
             status: row.status.clone(),
             account_id: row.account_id.clone(),
-            plan_type: None,
+            plan_type: row.plan_type.clone(),
             route_weight_tier: settings
                 .route_weight_tier
                 .clone()
                 .unwrap_or_else(|| "auto".to_string()),
-            primary_remaining_percent: None,
-            secondary_remaining_percent: None,
+            primary_remaining_percent: row.primary_remaining_percent,
+            secondary_remaining_percent: row.secondary_remaining_percent,
             map_gpt53_codex_to_spark: settings.map_gpt53_codex_to_spark,
             auto_refresh_enabled: settings.auth_refresh_enabled,
             request_max_concurrency: settings.request_max_concurrency,
@@ -4121,9 +4354,9 @@ impl PostgresControlRepository {
                 row.access_token.as_deref(),
             ),
             auth_refresh_error_message: row.last_error.clone(),
-            last_usage_checked_at: None,
-            last_usage_success_at: None,
-            usage_error_message: None,
+            last_usage_checked_at: row.last_usage_checked_at_ms,
+            last_usage_success_at: row.last_usage_success_at_ms,
+            usage_error_message: row.usage_error_message.clone(),
         }
     }
 
@@ -5194,6 +5427,12 @@ fn decode_codex_admin_account_list_row(row: PgRow) -> CodexAdminAccountListRow {
         last_refresh_at_ms: row.get(10),
         last_error: row.get(11),
         access_token: row.get(12),
+        plan_type: row.get(13),
+        primary_remaining_percent: row.get(14),
+        secondary_remaining_percent: row.get(15),
+        last_usage_checked_at_ms: row.get(16),
+        last_usage_success_at_ms: row.get(17),
+        usage_error_message: row.get(18),
     }
 }
 
@@ -6765,6 +7004,37 @@ impl AdminCodexAccountStore for PostgresControlRepository {
             offset: page.offset,
         };
         let (rows, total) = self.list_codex_admin_account_rows_page(page).await?;
+        let context = self.load_codex_admin_account_view_context().await?;
+        let accounts = rows
+            .iter()
+            .map(|row| self.admin_codex_account_from_list_row_with_context(row, &context))
+            .collect::<Vec<_>>();
+        let summary = self.admin_codex_accounts_summary().await?;
+        Ok(AdminCodexAccountsPage {
+            has_more: page.has_more(accounts.len(), total),
+            accounts,
+            summary,
+            total,
+            limit: page.limit,
+            offset: page.offset,
+        })
+    }
+
+    async fn list_admin_codex_accounts_filtered_page(
+        &self,
+        query: &AdminCodexAccountPageQuery,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminCodexAccountsPage> {
+        if query == &AdminCodexAccountPageQuery::default() {
+            return self.list_admin_codex_accounts_page(page).await;
+        }
+        let page = AdminPageRequest {
+            limit: page.limit.max(1),
+            offset: page.offset,
+        };
+        let (rows, total) = self
+            .list_codex_admin_account_rows_filtered_page(query, page)
+            .await?;
         let context = self.load_codex_admin_account_view_context().await?;
         let accounts = rows
             .iter()
@@ -8860,6 +9130,7 @@ mod tests {
     use llm_access_core::{
         provider::{ProtocolFamily, ProviderType, RouteStrategy},
         store::{
+            AdminCodexAccountPageQuery, AdminCodexAccountSortMode, AdminCodexAccountStore,
             AdminConfigStore, AdminKeyStore, AdminProxyConfigPatch, AdminProxyStore,
             AdminReviewQueueStore, ControlStore, NewAdminProxyConfig,
             NewPublicAccountContributionRequest, PublicSubmissionStore, PublicUsageStore,
@@ -9044,6 +9315,92 @@ mod tests {
             ))
             .await
             .context("seed postgres kiro key page fixture")?;
+        client.close().await;
+        Ok(())
+    }
+
+    async fn seed_test_codex_account_page_fixture(database_url: &str) -> anyhow::Result<()> {
+        let client = SqlxClient::connect(database_url)
+            .await
+            .context("connect postgres test database")?;
+        client
+            .batch_execute(
+                r#"
+                INSERT INTO llm_codex_accounts (
+                    account_name, account_id, email, status, auth_json, settings_json,
+                    last_refresh_at_ms, last_error, created_at_ms, updated_at_ms
+                ) VALUES
+                    (
+                        'codex-new', 'acct-new', NULL, 'active',
+                        '{"access_token":"token-new"}'::jsonb,
+                        '{"auth_refresh_enabled":true,"map_gpt53_codex_to_spark":false,
+                          "route_weight_tier":"auto","proxy_mode":"inherit"}'::jsonb,
+                        290, NULL, 300, 300
+                    ),
+                    (
+                        'codex-mid', 'acct-mid', NULL, 'disabled',
+                        '{"access_token":"token-mid"}'::jsonb,
+                        '{"auth_refresh_enabled":true,"map_gpt53_codex_to_spark":false,
+                          "route_weight_tier":"free","proxy_mode":"inherit"}'::jsonb,
+                        190, NULL, 200, 200
+                    ),
+                    (
+                        'codex-old', 'acct-old', NULL, 'active',
+                        '{"access_token":"token-old"}'::jsonb,
+                        '{"auth_refresh_enabled":true,"map_gpt53_codex_to_spark":false,
+                          "route_weight_tier":"plus","proxy_mode":"inherit"}'::jsonb,
+                        90, 'refresh failed', 100, 100
+                    );
+                INSERT INTO llm_codex_status_cache (id, snapshot_json, updated_at_ms)
+                VALUES (
+                    'default',
+                    '{
+                        "status":"ready",
+                        "refresh_interval_seconds":300,
+                        "last_checked_at":400,
+                        "last_success_at":400,
+                        "source_url":"https://chatgpt.com/backend-api/codex/models",
+                        "error_message":null,
+                        "accounts":[
+                            {
+                                "name":"codex-new",
+                                "status":"active",
+                                "plan_type":"Pro",
+                                "primary_remaining_percent":70.0,
+                                "secondary_remaining_percent":80.0,
+                                "last_usage_checked_at":400,
+                                "last_usage_success_at":400,
+                                "usage_error_message":null
+                            },
+                            {
+                                "name":"codex-mid",
+                                "status":"active",
+                                "plan_type":"Pro",
+                                "primary_remaining_percent":55.0,
+                                "secondary_remaining_percent":60.0,
+                                "last_usage_checked_at":400,
+                                "last_usage_success_at":400,
+                                "usage_error_message":null
+                            },
+                            {
+                                "name":"codex-old",
+                                "status":"active",
+                                "plan_type":"Plus",
+                                "primary_remaining_percent":20.0,
+                                "secondary_remaining_percent":10.0,
+                                "last_usage_checked_at":400,
+                                "last_usage_success_at":400,
+                                "usage_error_message":null
+                            }
+                        ],
+                        "buckets":[]
+                    }'::jsonb,
+                    400
+                );
+                "#,
+            )
+            .await
+            .context("seed postgres codex account page fixture")?;
         client.close().await;
         Ok(())
     }
@@ -9662,5 +10019,88 @@ mod tests {
         assert_eq!(oldest_summary.missing_balance_count, 0);
         assert_eq!(oldest_summary.total_limit, 400.0);
         assert_eq!(oldest_summary.total_remaining, 130.0);
+    }
+
+    #[tokio::test]
+    async fn postgres_repository_lists_filtered_codex_account_pages() {
+        let Ok(database_url) = std::env::var("TEST_POSTGRES_URL") else {
+            eprintln!("skipping postgres integration test: TEST_POSTGRES_URL is not set");
+            return;
+        };
+        let _guard = test_db_guard().await;
+        reset_test_db(&database_url)
+            .await
+            .expect("reset postgres test database");
+        seed_test_codex_account_page_fixture(&database_url)
+            .await
+            .expect("seed postgres codex account page fixture");
+        let repo = super::PostgresControlRepository::connect(&database_url, None)
+            .await
+            .expect("connect postgres repository");
+
+        let primary_sorted = repo
+            .list_admin_codex_accounts_filtered_page(
+                &AdminCodexAccountPageQuery {
+                    sort: AdminCodexAccountSortMode::PrimaryAsc,
+                    ..AdminCodexAccountPageQuery::default()
+                },
+                llm_access_core::store::AdminPageRequest {
+                    limit: 2,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("list codex accounts sorted by primary remaining");
+        assert_eq!(primary_sorted.total, 3);
+        assert!(primary_sorted.has_more);
+        assert_eq!(
+            primary_sorted
+                .accounts
+                .iter()
+                .map(|account| account.name.as_str())
+                .collect::<Vec<_>>(),
+            ["codex-old", "codex-new"]
+        );
+        assert_eq!(primary_sorted.accounts[0].plan_type.as_deref(), Some("Plus"));
+        assert_eq!(primary_sorted.accounts[0].primary_remaining_percent, Some(20.0));
+
+        let unhealthy_only = repo
+            .list_admin_codex_accounts_filtered_page(
+                &AdminCodexAccountPageQuery {
+                    unhealthy_only: true,
+                    ..AdminCodexAccountPageQuery::default()
+                },
+                llm_access_core::store::AdminPageRequest {
+                    limit: 8,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("list unhealthy codex accounts");
+        assert_eq!(unhealthy_only.total, 2);
+        assert_eq!(
+            unhealthy_only
+                .accounts
+                .iter()
+                .map(|account| account.name.as_str())
+                .collect::<Vec<_>>(),
+            ["codex-mid", "codex-old"]
+        );
+
+        let searched = repo
+            .list_admin_codex_accounts_filtered_page(
+                &AdminCodexAccountPageQuery {
+                    search: Some("plus".to_string()),
+                    ..AdminCodexAccountPageQuery::default()
+                },
+                llm_access_core::store::AdminPageRequest {
+                    limit: 8,
+                    offset: 0,
+                },
+            )
+            .await
+            .expect("search codex accounts by plan type");
+        assert_eq!(searched.total, 1);
+        assert_eq!(searched.accounts[0].name, "codex-old");
     }
 }

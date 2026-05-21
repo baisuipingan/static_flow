@@ -1570,56 +1570,24 @@ pub(crate) async fn list_llm_gateway_accounts(
         },
     };
     let filter = admin_codex_account_page_query(&query);
-    let response_page = if codex_account_page_query_is_default(&filter) {
-        let page = match state
-            .admin_codex_account_store
-            .list_admin_codex_accounts_page(page_request)
-            .await
-        {
-            Ok(page) => page,
-            Err(_) => return internal_error("Failed to list llm gateway accounts").into_response(),
-        };
-        AdminAccountsResponse {
-            accounts: apply_cached_codex_status_to_admin_accounts(page.accounts, status),
-            summary: page.summary,
-            total: page.total,
-            limit: page.limit,
-            offset: page.offset,
-            has_more: page.has_more,
-            generated_at: now_ms(),
-        }
-    } else {
-        let accounts = match state
-            .admin_codex_account_store
-            .list_admin_codex_accounts()
-            .await
-        {
-            Ok(accounts) => accounts,
-            Err(_) => return internal_error("Failed to list llm gateway accounts").into_response(),
-        };
-        let summary = summarize_admin_accounts(&accounts);
-        let accounts = apply_cached_codex_status_to_admin_accounts(accounts, status);
-        admin_codex_accounts_response_from_filtered(accounts, summary, &filter, page_request)
+    let page = match state
+        .admin_codex_account_store
+        .list_admin_codex_accounts_filtered_page(&filter, page_request)
+        .await
+    {
+        Ok(page) => page,
+        Err(_) => return internal_error("Failed to list llm gateway accounts").into_response(),
     };
-    Json(response_page).into_response()
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
-enum AdminCodexAccountSortMode {
-    #[default]
-    Newest,
-    PrimaryAsc,
-    PrimaryDesc,
-    SecondaryAsc,
-    SecondaryDesc,
-}
-
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
-struct AdminCodexAccountPageQueryView {
-    search: Option<String>,
-    active_only: bool,
-    unhealthy_only: bool,
-    sort: AdminCodexAccountSortMode,
+    Json(AdminAccountsResponse {
+        accounts: apply_cached_codex_status_to_admin_accounts(page.accounts, status),
+        summary: page.summary,
+        total: page.total,
+        limit: page.limit,
+        offset: page.offset,
+        has_more: page.has_more,
+        generated_at: now_ms(),
+    })
+    .into_response()
 }
 
 fn admin_key_page_query(query: &AdminKeyListQuery) -> core_store::AdminKeyPageQuery {
@@ -1638,154 +1606,18 @@ fn admin_key_page_query(query: &AdminKeyListQuery) -> core_store::AdminKeyPageQu
 
 fn admin_codex_account_page_query(
     query: &AdminCodexAccountListQuery,
-) -> AdminCodexAccountPageQueryView {
-    AdminCodexAccountPageQueryView {
+) -> core_store::AdminCodexAccountPageQuery {
+    core_store::AdminCodexAccountPageQuery {
         search: query.q.clone(),
         active_only: query.active_only.unwrap_or(false),
         unhealthy_only: query.unhealthy_only.unwrap_or(false),
         sort: match query.sort.as_deref() {
-            Some("primary_asc") => AdminCodexAccountSortMode::PrimaryAsc,
-            Some("primary_desc") => AdminCodexAccountSortMode::PrimaryDesc,
-            Some("secondary_asc") => AdminCodexAccountSortMode::SecondaryAsc,
-            Some("secondary_desc") => AdminCodexAccountSortMode::SecondaryDesc,
-            _ => AdminCodexAccountSortMode::Newest,
+            Some("primary_asc") => core_store::AdminCodexAccountSortMode::PrimaryAsc,
+            Some("primary_desc") => core_store::AdminCodexAccountSortMode::PrimaryDesc,
+            Some("secondary_asc") => core_store::AdminCodexAccountSortMode::SecondaryAsc,
+            Some("secondary_desc") => core_store::AdminCodexAccountSortMode::SecondaryDesc,
+            _ => core_store::AdminCodexAccountSortMode::Newest,
         },
-    }
-}
-
-fn codex_account_page_query_is_default(query: &AdminCodexAccountPageQueryView) -> bool {
-    query
-        .search
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .is_none()
-        && !query.active_only
-        && !query.unhealthy_only
-        && matches!(query.sort, AdminCodexAccountSortMode::Newest)
-}
-
-fn summarize_admin_accounts(
-    accounts: &[core_store::AdminCodexAccount],
-) -> core_store::AdminAccountsSummary {
-    let mut summary = core_store::AdminAccountsSummary::default();
-    for account in accounts {
-        summary.total += 1;
-        match account.status.as_str() {
-            KEY_STATUS_ACTIVE => summary.active_count += 1,
-            KEY_STATUS_DISABLED => summary.disabled_count += 1,
-            "unavailable" => summary.unavailable_count += 1,
-            _ => {},
-        }
-    }
-    summary
-}
-
-fn admin_codex_account_matches_query(
-    account: &core_store::AdminCodexAccount,
-    query: &AdminCodexAccountPageQueryView,
-) -> bool {
-    if query.active_only && account.status == KEY_STATUS_DISABLED {
-        return false;
-    }
-    if query.unhealthy_only
-        && account.status != KEY_STATUS_DISABLED
-        && account.auth_refresh_error_message.is_none()
-        && account.usage_error_message.is_none()
-    {
-        return false;
-    }
-    let Some(search) = query
-        .search
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-    else {
-        return true;
-    };
-    let search = search.to_ascii_lowercase();
-    account.name.to_ascii_lowercase().contains(&search)
-        || account.status.to_ascii_lowercase().contains(&search)
-        || account
-            .plan_type
-            .as_deref()
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .contains(&search)
-        || account
-            .account_id
-            .as_deref()
-            .unwrap_or("")
-            .to_ascii_lowercase()
-            .contains(&search)
-        || account
-            .route_weight_tier
-            .to_ascii_lowercase()
-            .contains(&search)
-}
-
-fn codex_account_primary_pct(account: &core_store::AdminCodexAccount) -> f64 {
-    account.primary_remaining_percent.unwrap_or(100.0)
-}
-
-fn codex_account_secondary_pct(account: &core_store::AdminCodexAccount) -> f64 {
-    account.secondary_remaining_percent.unwrap_or(100.0)
-}
-
-fn sort_admin_codex_accounts(
-    accounts: &mut [core_store::AdminCodexAccount],
-    sort: AdminCodexAccountSortMode,
-) {
-    match sort {
-        AdminCodexAccountSortMode::Newest => {},
-        AdminCodexAccountSortMode::PrimaryAsc => accounts.sort_by(|a, b| {
-            codex_account_primary_pct(a)
-                .partial_cmp(&codex_account_primary_pct(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.name.cmp(&a.name))
-        }),
-        AdminCodexAccountSortMode::PrimaryDesc => accounts.sort_by(|a, b| {
-            codex_account_primary_pct(b)
-                .partial_cmp(&codex_account_primary_pct(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.name.cmp(&a.name))
-        }),
-        AdminCodexAccountSortMode::SecondaryAsc => accounts.sort_by(|a, b| {
-            codex_account_secondary_pct(a)
-                .partial_cmp(&codex_account_secondary_pct(b))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.name.cmp(&a.name))
-        }),
-        AdminCodexAccountSortMode::SecondaryDesc => accounts.sort_by(|a, b| {
-            codex_account_secondary_pct(b)
-                .partial_cmp(&codex_account_secondary_pct(a))
-                .unwrap_or(std::cmp::Ordering::Equal)
-                .then_with(|| b.name.cmp(&a.name))
-        }),
-    }
-}
-
-fn admin_codex_accounts_response_from_filtered(
-    mut accounts: Vec<core_store::AdminCodexAccount>,
-    summary: core_store::AdminAccountsSummary,
-    query: &AdminCodexAccountPageQueryView,
-    page: core_store::AdminPageRequest,
-) -> AdminAccountsResponse {
-    accounts.retain(|account| admin_codex_account_matches_query(account, query));
-    sort_admin_codex_accounts(&mut accounts, query.sort);
-    let total = accounts.len();
-    let start = page.offset.min(total);
-    let end = start.saturating_add(page.limit).min(total);
-    let accounts = accounts[start..end].to_vec();
-    let page_len = accounts.len();
-    AdminAccountsResponse {
-        accounts,
-        summary,
-        total,
-        limit: page.limit,
-        offset: page.offset,
-        has_more: page.has_more(page_len, total),
-        generated_at: now_ms(),
     }
 }
 
@@ -3132,6 +2964,12 @@ fn account_contribution_issue_email_policy(
     AccountContributionIssueEmailPolicy::Send
 }
 
+fn should_issue_account_contribution_access_artifacts(
+    request: &core_store::AdminAccountContributionRequest,
+) -> bool {
+    !request.requester_email.trim().is_empty()
+}
+
 pub(crate) async fn approve_and_issue_llm_gateway_account_contribution_request(
     State(state): State<HttpState>,
     headers: HeaderMap,
@@ -3193,7 +3031,9 @@ pub(crate) async fn approve_and_issue_llm_gateway_account_contribution_request(
     } else {
         None
     };
-    let (account_group, key) = if current.issued_key_id.is_none() {
+    let (account_group, key) = if current.issued_key_id.is_none()
+        && should_issue_account_contribution_access_artifacts(&current)
+    {
         let group_id = generate_id("llm-group");
         let name = format!("contrib-{}", current.request_id);
         let secret = generate_secret();
@@ -7206,5 +7046,19 @@ mod tests {
             account_contribution_issue_email_policy(&request, true),
             AccountContributionIssueEmailPolicy::Send
         );
+    }
+
+    #[test]
+    fn account_contribution_access_artifacts_skip_blank_recipient() {
+        let request = sample_account_contribution_request("   ");
+
+        assert!(!should_issue_account_contribution_access_artifacts(&request));
+    }
+
+    #[test]
+    fn account_contribution_access_artifacts_keep_email_backed_issue_flow() {
+        let request = sample_account_contribution_request("user@example.com");
+
+        assert!(should_issue_account_contribution_access_artifacts(&request));
     }
 }

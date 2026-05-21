@@ -2379,6 +2379,8 @@ pub fn admin_llm_gateway_page() -> Html {
     let account_groups_page = use_state(|| 1_usize);
     let account_groups_page_limit = use_state(|| DEFAULT_ADMIN_GROUP_PAGE_SIZE);
     let account_groups_search = use_state(String::new);
+    let account_group_candidate_accounts = use_state(Vec::<AccountSummaryView>::new);
+    let account_group_candidate_loading = use_state(|| false);
     let usage_events = use_state(Vec::<AdminLlmGatewayUsageEventView>::new);
     let usage_total = use_state(|| 0_usize);
     let usage_totals = use_state(AdminUsageTotalsView::default);
@@ -2864,6 +2866,8 @@ pub fn admin_llm_gateway_page() -> Html {
         let account_route_weight_tier_inputs = account_route_weight_tier_inputs.clone();
         let account_request_max_inputs = account_request_max_inputs.clone();
         let account_request_min_inputs = account_request_min_inputs.clone();
+        let account_group_candidate_accounts = account_group_candidate_accounts.clone();
+        let account_group_candidate_loading = account_group_candidate_loading.clone();
         let keys_search = keys_search.clone();
         let keys_sort_mode = keys_sort_mode.clone();
         let keys_show_active_only = keys_show_active_only.clone();
@@ -2925,6 +2929,8 @@ pub fn admin_llm_gateway_page() -> Html {
             let account_route_weight_tier_inputs = account_route_weight_tier_inputs.clone();
             let account_request_max_inputs = account_request_max_inputs.clone();
             let account_request_min_inputs = account_request_min_inputs.clone();
+            let account_group_candidate_accounts = account_group_candidate_accounts.clone();
+            let account_group_candidate_loading = account_group_candidate_loading.clone();
             let keys_search = keys_search.clone();
             let keys_sort_mode = keys_sort_mode.clone();
             let keys_show_active_only = keys_show_active_only.clone();
@@ -3031,8 +3037,6 @@ pub fn admin_llm_gateway_page() -> Html {
                             )
                             .await?,
                         )
-                    } else if active_tab_value == TAB_GROUPS {
-                        Some(fetch_admin_llm_gateway_accounts().await?)
                     } else {
                         None
                     };
@@ -3222,6 +3226,17 @@ pub fn admin_llm_gateway_page() -> Html {
                             account_route_weight_tier_inputs.set(next_route_weight_tier_inputs);
                             account_request_max_inputs.set(next_request_max_inputs);
                             account_request_min_inputs.set(next_request_min_inputs);
+                        } else if active_tab_value != TAB_GROUPS {
+                            accounts_total.set(0);
+                            accounts.set(Vec::new());
+                            account_proxy_inputs.set(BTreeMap::new());
+                            account_route_weight_tier_inputs.set(BTreeMap::new());
+                            account_request_max_inputs.set(BTreeMap::new());
+                            account_request_min_inputs.set(BTreeMap::new());
+                        }
+                        if active_tab_value != TAB_GROUPS {
+                            account_group_candidate_accounts.set(Vec::new());
+                            account_group_candidate_loading.set(false);
                         }
                         if let Some(import_jobs) = import_jobs {
                             recent_import_jobs.set(import_jobs);
@@ -3238,6 +3253,28 @@ pub fn admin_llm_gateway_page() -> Html {
                     Err(err) => load_error.set(Some(err)),
                 }
                 loading.set(false);
+            });
+        })
+    };
+
+    let load_account_group_candidates = {
+        let account_group_candidate_accounts = account_group_candidate_accounts.clone();
+        let account_group_candidate_loading = account_group_candidate_loading.clone();
+        let load_error = load_error.clone();
+        Callback::from(move |_| {
+            account_group_candidate_loading.set(true);
+            let account_group_candidate_accounts = account_group_candidate_accounts.clone();
+            let account_group_candidate_loading = account_group_candidate_loading.clone();
+            let load_error = load_error.clone();
+            wasm_bindgen_futures::spawn_local(async move {
+                match fetch_admin_llm_gateway_accounts().await {
+                    Ok(resp) => {
+                        account_group_candidate_accounts.set(resp.accounts);
+                        load_error.set(None);
+                    },
+                    Err(err) => load_error.set(Some(err)),
+                }
+                account_group_candidate_loading.set(false);
             });
         })
     };
@@ -3903,6 +3940,18 @@ pub fn admin_llm_gateway_page() -> Html {
                 names.dedup();
             }
             create_account_group_account_names.set(names);
+        })
+    };
+
+    let on_toggle_account_group_form = {
+        let account_group_form_expanded = account_group_form_expanded.clone();
+        let load_account_group_candidates = load_account_group_candidates.clone();
+        Callback::from(move |_| {
+            let next_expanded = !*account_group_form_expanded;
+            account_group_form_expanded.set(next_expanded);
+            if next_expanded {
+                load_account_group_candidates.emit(());
+            }
         })
     };
 
@@ -7455,10 +7504,7 @@ pub fn admin_llm_gateway_page() -> Html {
                             <button
                                 type="button"
                                 class={classes!("btn-terminal")}
-                                onclick={{
-                                    let account_group_form_expanded = account_group_form_expanded.clone();
-                                    Callback::from(move |_| account_group_form_expanded.set(!*account_group_form_expanded))
-                                }}
+                                onclick={on_toggle_account_group_form.clone()}
                             >
                                 { if *account_group_form_expanded { "收起 ▲" } else { "展开 ▼" } }
                             </button>
@@ -7483,13 +7529,17 @@ pub fn admin_llm_gateway_page() -> Html {
                                 </label>
                                 <div class={classes!("space-y-2")}>
                                     <div class={classes!("text-sm", "text-[var(--muted)]")}>{ "成员账号" }</div>
-                                    if accounts.is_empty() {
+                                    if *account_group_candidate_loading {
+                                        <div class={classes!("rounded-lg", "border", "border-dashed", "border-[var(--border)]", "px-3", "py-3", "text-xs", "text-[var(--muted)]")}>
+                                            { "正在加载账号候选..." }
+                                        </div>
+                                    } else if account_group_candidate_accounts.is_empty() {
                                         <div class={classes!("rounded-lg", "border", "border-dashed", "border-[var(--border)]", "px-3", "py-3", "text-xs", "text-[var(--muted)]")}>
                                             { "当前没有可加入账号组的账号。" }
                                         </div>
                                     } else {
                                         <div class={classes!("grid", "gap-2", "xl:grid-cols-2")}>
-                                            { for accounts.iter().map(|account| {
+                                            { for account_group_candidate_accounts.iter().map(|account| {
                                                 let checked = create_account_group_account_names.iter().any(|name| name == &account.name);
                                                 let account_name = account.name.clone();
                                                 let on_toggle_create_account_group_member =

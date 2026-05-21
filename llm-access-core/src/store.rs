@@ -1109,6 +1109,134 @@ pub struct AdminAccountsSummary {
     pub unavailable_count: usize,
 }
 
+/// Admin Codex account list query shared by paginated inventory screens.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct AdminCodexAccountPageQuery {
+    /// Optional case-insensitive search query.
+    pub search: Option<String>,
+    /// Whether disabled rows should be excluded.
+    pub active_only: bool,
+    /// Whether only unhealthy rows should be returned.
+    pub unhealthy_only: bool,
+    /// Sort mode applied before pagination.
+    pub sort: AdminCodexAccountSortMode,
+}
+
+/// Supported admin Codex account list sort modes.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AdminCodexAccountSortMode {
+    /// Default created-at descending order.
+    #[default]
+    Newest,
+    /// Primary remaining percentage ascending.
+    PrimaryAsc,
+    /// Primary remaining percentage descending.
+    PrimaryDesc,
+    /// Secondary remaining percentage ascending.
+    SecondaryAsc,
+    /// Secondary remaining percentage descending.
+    SecondaryDesc,
+}
+
+fn summarize_admin_accounts(accounts: &[AdminCodexAccount]) -> AdminAccountsSummary {
+    let mut summary = AdminAccountsSummary::default();
+    for account in accounts {
+        summary.total += 1;
+        match account.status.as_str() {
+            KEY_STATUS_ACTIVE => summary.active_count += 1,
+            KEY_STATUS_DISABLED => summary.disabled_count += 1,
+            "unavailable" => summary.unavailable_count += 1,
+            _ => {},
+        }
+    }
+    summary
+}
+
+fn admin_codex_account_matches_query(
+    account: &AdminCodexAccount,
+    query: &AdminCodexAccountPageQuery,
+) -> bool {
+    if query.active_only && account.status == KEY_STATUS_DISABLED {
+        return false;
+    }
+    if query.unhealthy_only
+        && account.status != KEY_STATUS_DISABLED
+        && account.auth_refresh_error_message.is_none()
+        && account.usage_error_message.is_none()
+    {
+        return false;
+    }
+    let Some(search) = query
+        .search
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return true;
+    };
+    let search = search.to_ascii_lowercase();
+    account.name.to_ascii_lowercase().contains(&search)
+        || account.status.to_ascii_lowercase().contains(&search)
+        || account
+            .plan_type
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains(&search)
+        || account
+            .account_id
+            .as_deref()
+            .unwrap_or("")
+            .to_ascii_lowercase()
+            .contains(&search)
+        || account
+            .route_weight_tier
+            .to_ascii_lowercase()
+            .contains(&search)
+}
+
+fn codex_account_primary_pct(account: &AdminCodexAccount) -> f64 {
+    account.primary_remaining_percent.unwrap_or(100.0)
+}
+
+fn codex_account_secondary_pct(account: &AdminCodexAccount) -> f64 {
+    account.secondary_remaining_percent.unwrap_or(100.0)
+}
+
+fn apply_admin_codex_account_query(
+    accounts: &mut Vec<AdminCodexAccount>,
+    query: &AdminCodexAccountPageQuery,
+) {
+    accounts.retain(|account| admin_codex_account_matches_query(account, query));
+    match query.sort {
+        AdminCodexAccountSortMode::Newest => {},
+        AdminCodexAccountSortMode::PrimaryAsc => accounts.sort_by(|a, b| {
+            codex_account_primary_pct(a)
+                .partial_cmp(&codex_account_primary_pct(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.name.cmp(&a.name))
+        }),
+        AdminCodexAccountSortMode::PrimaryDesc => accounts.sort_by(|a, b| {
+            codex_account_primary_pct(b)
+                .partial_cmp(&codex_account_primary_pct(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.name.cmp(&a.name))
+        }),
+        AdminCodexAccountSortMode::SecondaryAsc => accounts.sort_by(|a, b| {
+            codex_account_secondary_pct(a)
+                .partial_cmp(&codex_account_secondary_pct(b))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.name.cmp(&a.name))
+        }),
+        AdminCodexAccountSortMode::SecondaryDesc => accounts.sort_by(|a, b| {
+            codex_account_secondary_pct(b)
+                .partial_cmp(&codex_account_secondary_pct(a))
+                .unwrap_or(std::cmp::Ordering::Equal)
+                .then_with(|| b.name.cmp(&a.name))
+        }),
+    }
+}
+
 /// Minimal Codex account projection used by background status refresh.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct CodexStatusRefreshTarget {
@@ -2662,6 +2790,30 @@ pub trait AdminCodexAccountStore: Send + Sync {
         page: AdminPageRequest,
     ) -> anyhow::Result<AdminCodexAccountsPage>;
 
+    /// List one filtered page of imported Codex accounts.
+    async fn list_admin_codex_accounts_filtered_page(
+        &self,
+        query: &AdminCodexAccountPageQuery,
+        page: AdminPageRequest,
+    ) -> anyhow::Result<AdminCodexAccountsPage> {
+        let mut accounts = self.list_admin_codex_accounts().await?;
+        let summary = summarize_admin_accounts(&accounts);
+        apply_admin_codex_account_query(&mut accounts, query);
+        let total = accounts.len();
+        let start = page.offset.min(total);
+        let end = start.saturating_add(page.limit).min(total);
+        let accounts = accounts[start..end].to_vec();
+        let page_len = accounts.len();
+        Ok(AdminCodexAccountsPage {
+            has_more: page.has_more(page_len, total),
+            accounts,
+            summary,
+            total,
+            limit: page.limit,
+            offset: page.offset,
+        })
+    }
+
     /// List the minimal Codex account fields needed by background status
     /// refresh.
     async fn list_codex_status_refresh_targets(
@@ -3974,6 +4126,39 @@ pub trait UsageEventSink: Send + Sync {
 mod tests {
     use std::collections::BTreeMap;
 
+    fn sample_admin_codex_account(
+        name: &str,
+        status: &str,
+        plan_type: Option<&str>,
+        primary_remaining_percent: Option<f64>,
+        auth_refresh_error_message: Option<&str>,
+    ) -> super::AdminCodexAccount {
+        super::AdminCodexAccount {
+            name: name.to_string(),
+            status: status.to_string(),
+            account_id: Some(format!("acct-{name}")),
+            plan_type: plan_type.map(str::to_string),
+            route_weight_tier: "auto".to_string(),
+            primary_remaining_percent,
+            secondary_remaining_percent: None,
+            map_gpt53_codex_to_spark: false,
+            auto_refresh_enabled: true,
+            request_max_concurrency: None,
+            request_min_start_interval_ms: None,
+            proxy_mode: "inherit".to_string(),
+            proxy_config_id: None,
+            effective_proxy_source: "binding".to_string(),
+            effective_proxy_url: None,
+            effective_proxy_config_name: None,
+            last_refresh: None,
+            access_token_expires_at: None,
+            auth_refresh_error_message: auth_refresh_error_message.map(str::to_string),
+            last_usage_checked_at: None,
+            last_usage_success_at: None,
+            usage_error_message: None,
+        }
+    }
+
     #[test]
     fn compute_kiro_billable_tokens_applies_family_multiplier() {
         let multipliers = BTreeMap::from([
@@ -4012,5 +4197,75 @@ mod tests {
         assert_eq!(config.kiro_prefix_cache_entry_ttl_seconds, 2 * 60 * 60);
         assert_eq!(config.kiro_conversation_anchor_max_entries, 4_096);
         assert_eq!(config.kiro_conversation_anchor_ttl_seconds, 6 * 60 * 60);
+    }
+
+    #[test]
+    fn admin_codex_account_query_supports_search_sort_and_unhealthy_filters() {
+        let mut accounts = vec![
+            sample_admin_codex_account("codex-new", "active", Some("Pro"), Some(70.0), None),
+            sample_admin_codex_account("codex-mid", "disabled", None, None, None),
+            sample_admin_codex_account(
+                "codex-old",
+                "active",
+                Some("Plus"),
+                Some(20.0),
+                Some("refresh failed"),
+            ),
+        ];
+
+        super::apply_admin_codex_account_query(&mut accounts, &super::AdminCodexAccountPageQuery {
+            sort: super::AdminCodexAccountSortMode::PrimaryAsc,
+            ..super::AdminCodexAccountPageQuery::default()
+        });
+        assert_eq!(
+            accounts
+                .iter()
+                .map(|account| account.name.as_str())
+                .collect::<Vec<_>>(),
+            ["codex-old", "codex-new", "codex-mid"]
+        );
+
+        let mut searched = vec![
+            sample_admin_codex_account("codex-new", "active", Some("Pro"), Some(70.0), None),
+            sample_admin_codex_account(
+                "codex-old",
+                "active",
+                Some("Plus"),
+                Some(20.0),
+                Some("refresh failed"),
+            ),
+        ];
+        super::apply_admin_codex_account_query(&mut searched, &super::AdminCodexAccountPageQuery {
+            search: Some("plus".to_string()),
+            ..super::AdminCodexAccountPageQuery::default()
+        });
+        assert_eq!(searched.len(), 1);
+        assert_eq!(searched[0].name, "codex-old");
+
+        let mut unhealthy = vec![
+            sample_admin_codex_account("codex-new", "active", Some("Pro"), Some(70.0), None),
+            sample_admin_codex_account("codex-mid", "disabled", None, None, None),
+            sample_admin_codex_account(
+                "codex-old",
+                "active",
+                Some("Plus"),
+                Some(20.0),
+                Some("refresh failed"),
+            ),
+        ];
+        super::apply_admin_codex_account_query(
+            &mut unhealthy,
+            &super::AdminCodexAccountPageQuery {
+                unhealthy_only: true,
+                ..super::AdminCodexAccountPageQuery::default()
+            },
+        );
+        assert_eq!(
+            unhealthy
+                .iter()
+                .map(|account| account.name.as_str())
+                .collect::<Vec<_>>(),
+            ["codex-mid", "codex-old"]
+        );
     }
 }
