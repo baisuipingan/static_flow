@@ -9,7 +9,7 @@ use redis::AsyncCommands;
 use serde::{de::DeserializeOwned, Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::sqlite::RuntimeConfigRecord;
+use crate::records::RuntimeConfigRecord;
 
 const AUTH_CACHE_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 const RUNTIME_CONFIG_TTL: Duration = Duration::from_secs(6 * 60 * 60);
@@ -535,7 +535,7 @@ mod tests {
     #[test]
     fn cached_runtime_config_lookup_round_trips_as_json() {
         let payload = super::CachedRuntimeConfigLookup {
-            record: Some(crate::sqlite::RuntimeConfigRecord::default()),
+            record: Some(crate::records::RuntimeConfigRecord::default()),
         };
 
         let json = serde_json::to_string(&payload).expect("serialize runtime config payload");

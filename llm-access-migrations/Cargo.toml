@@ -9,6 +9,5 @@ workspace = true
 
 [dependencies]
 anyhow = { workspace = true }
-rusqlite = { version = "0.37", features = ["bundled"] }
 sqlx-core = { workspace = true }
 sqlx-postgres = { workspace = true }

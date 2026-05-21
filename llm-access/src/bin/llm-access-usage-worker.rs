@@ -27,14 +27,13 @@ fn run() -> anyhow::Result<()> {
 
     use anyhow::Context;
     use llm_access::{
-        config::{resolve_request_cache_config, CliCommand, ControlStoreConfig},
+        config::{resolve_request_cache_config, CliCommand},
         usage_worker::{router, ClusterUsageWorker, EdgeUsageWorker, UsageWorker},
     };
     use llm_access_core::store::AdminConfigStore;
     use llm_access_store::{
         duckdb::{DuckDbUsageConnectionConfig, DuckDbUsageRepository, TieredDuckDbUsageConfig},
         postgres::PostgresControlRepository,
-        repository::SqliteControlRepository,
     };
 
     let args = std::env::args_os().collect::<Vec<OsString>>();
@@ -52,26 +51,14 @@ fn run() -> anyhow::Result<()> {
     let cluster_state = runtime
         .block_on(llm_access::cluster::ClusterRuntimeState::from_storage_config(&storage))?;
     let control: Arc<dyn AdminConfigStore> = runtime.block_on(async {
-        match &storage.control_store {
-            ControlStoreConfig::Sqlite {
-                path,
-            } => Ok::<Arc<dyn AdminConfigStore>, anyhow::Error>(Arc::new(
-                SqliteControlRepository::open_path(path)?,
-            )
-                as Arc<dyn AdminConfigStore>),
-            ControlStoreConfig::Postgres {
-                database_url_env,
-            } => {
-                let database_url = std::env::var(database_url_env).with_context(|| {
-                    format!("missing control database env `{database_url_env}`")
-                })?;
-                let request_cache = resolve_request_cache_config(&storage)?;
-                Ok::<Arc<dyn AdminConfigStore>, anyhow::Error>(Arc::new(
-                    PostgresControlRepository::connect(&database_url, request_cache).await?,
-                )
-                    as Arc<dyn AdminConfigStore>)
-            },
-        }
+        let database_url =
+            std::env::var(&storage.control_store.database_url_env).with_context(|| {
+                format!("missing control database env `{}`", storage.control_store.database_url_env)
+            })?;
+        let request_cache = resolve_request_cache_config(&storage)?;
+        Ok::<Arc<dyn AdminConfigStore>, anyhow::Error>(Arc::new(
+            PostgresControlRepository::connect(&database_url, request_cache).await?,
+        ) as Arc<dyn AdminConfigStore>)
     })?;
     let runtime_config = runtime.block_on(control.get_admin_runtime_config())?;
     let bind_addr = if explicit_bind {

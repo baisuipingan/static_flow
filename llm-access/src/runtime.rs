@@ -27,10 +27,7 @@ use llm_access_core::store::{
 };
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use llm_access_core::usage::UsageEvent;
-use llm_access_store::{
-    postgres::{PostgresControlRepository, ProxyConfigScope},
-    repository::SqliteControlRepository,
-};
+use llm_access_store::postgres::{PostgresControlRepository, ProxyConfigScope};
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use tokio::{
     sync::{mpsc, watch, Mutex},
@@ -41,7 +38,7 @@ use tokio::{
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
 use crate::usage_journal::JournalUsageEventSink;
 use crate::{
-    config::{resolve_request_cache_config, ControlStoreConfig, StorageConfig},
+    config::{resolve_request_cache_config, StorageConfig},
     geoip::GeoIpResolver,
 };
 
@@ -253,40 +250,21 @@ impl LlmAccessRuntime {
         let geoip = GeoIpResolver::from_env()?;
         geoip.warmup().await;
         let email_notifier = crate::email::EmailNotifier::from_env()?.map(Arc::new);
-        match &config.control_store {
-            ControlStoreConfig::Sqlite {
-                path,
-            } => {
-                let repository = Arc::new(SqliteControlRepository::open_path(path)?);
-                Self::from_open_repository(
-                    config,
-                    cluster_state.clone(),
-                    geoip,
-                    email_notifier,
-                    repository,
-                )
-                .await
-            },
-            ControlStoreConfig::Postgres {
-                database_url_env,
-            } => {
-                let database_url = std::env::var(database_url_env).with_context(|| {
-                    format!("missing control database env `{database_url_env}`")
-                })?;
-                let request_cache = resolve_request_cache_config(config)?;
-                let proxy_scope = postgres_proxy_config_scope(config);
-                let repository = Arc::new(
-                    PostgresControlRepository::connect_with_proxy_scope(
-                        &database_url,
-                        request_cache,
-                        proxy_scope,
-                    )
-                    .await?,
-                );
-                Self::from_open_repository(config, cluster_state, geoip, email_notifier, repository)
-                    .await
-            },
-        }
+        let database_url =
+            std::env::var(&config.control_store.database_url_env).with_context(|| {
+                format!("missing control database env `{}`", config.control_store.database_url_env)
+            })?;
+        let request_cache = resolve_request_cache_config(config)?;
+        let proxy_scope = postgres_proxy_config_scope(config);
+        let repository = Arc::new(
+            PostgresControlRepository::connect_with_proxy_scope(
+                &database_url,
+                request_cache,
+                proxy_scope,
+            )
+            .await?,
+        );
+        Self::from_open_repository(config, cluster_state, geoip, email_notifier, repository).await
     }
 
     async fn from_open_repository<R>(
@@ -1455,8 +1433,8 @@ mod tests {
         crate::config::StorageConfig {
             state_root: root.clone(),
             node_identity: None,
-            control_store: crate::config::ControlStoreConfig::Sqlite {
-                path: root.join("control/llm-access.sqlite3"),
+            control_store: crate::config::ControlStoreConfig {
+                database_url_env: "LLM_ACCESS_CONTROL_DATABASE_URL".to_string(),
             },
             request_cache: None,
             duckdb: root.join("analytics/usage.duckdb"),
@@ -1514,33 +1492,6 @@ mod tests {
             "usage journal dir `/mnt/llm-access-usage/usage-journal` must stay on local disk"
         ));
 
-        std::fs::remove_dir_all(&root).expect("cleanup");
-    }
-
-    #[tokio::test]
-    async fn opens_runtime_control_store_from_sqlite_path() {
-        let config = temp_storage_config("runtime-open");
-        let root = config.state_root.clone();
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).expect("create root");
-        llm_access_store::initialize_sqlite_target_path(
-            config
-                .control_store
-                .sqlite_path()
-                .expect("sqlite control path must exist for sqlite test config"),
-        )
-        .expect("initialize sqlite");
-
-        let runtime = super::LlmAccessRuntime::from_storage_config(&config)
-            .await
-            .expect("open runtime storage");
-        let key = runtime
-            .control_store()
-            .authenticate_bearer_secret("missing")
-            .await
-            .expect("query store");
-
-        assert!(key.is_none());
         std::fs::remove_dir_all(&root).expect("cleanup");
     }
 

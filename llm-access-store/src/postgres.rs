@@ -50,11 +50,11 @@ use sqlx_postgres::{PgArguments, PgPool, PgPoolOptions, PgRow as SqlxPgRow, Post
 use tokio::sync::{Mutex, RwLock};
 
 use crate::{
-    request_cache::{RequestCache, RequestCacheConfig},
-    sqlite::{
+    records::{
         CodexAccountRecord, KeyBundle, KeyRecord, KeyRouteConfig, KeyUsageRollup,
         KiroAccountRecord, RuntimeConfigRecord,
     },
+    request_cache::{RequestCache, RequestCacheConfig},
 };
 
 trait SqlxBindParam {
