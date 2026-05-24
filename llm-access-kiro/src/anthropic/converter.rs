@@ -111,6 +111,7 @@ const STRUCTURED_OUTPUT_TOOL_DESCRIPTION: &str =
 const KIRO_MAX_CURRENT_MESSAGE_IMAGES: usize = 10;
 const KIRO_MAX_CONVERSATION_DOCUMENTS: usize = 5;
 const EMPTY_TOOL_RESULT_PLACEHOLDER: &str = "(empty result)";
+const EMPTY_DOCUMENT_PLACEHOLDER: &str = "(document attached)";
 
 /// Maps an Anthropic model name (e.g. `"claude-sonnet-4-6"`) to the
 /// canonical Kiro model identifier. Returns `None` for unrecognized models.
@@ -1845,49 +1846,130 @@ fn kiro_document_from_block(
 fn extract_tool_result_attachments(
     content: &Option<serde_json::Value>,
 ) -> Result<(Vec<KiroImage>, Vec<KiroDocument>), ConversionError> {
+    if let Some(parsed_content) = parse_stringified_tool_result_content(content) {
+        return extract_tool_result_attachments_from_value(&parsed_content);
+    }
+    match content {
+        Some(value) => extract_tool_result_attachments_from_value(value),
+        None => Ok((Vec::new(), Vec::new())),
+    }
+}
+
+fn extract_tool_result_attachments_from_value(
+    value: &serde_json::Value,
+) -> Result<(Vec<KiroImage>, Vec<KiroDocument>), ConversionError> {
     let mut images = Vec::new();
     let mut documents = Vec::new();
-    let Some(serde_json::Value::Array(items)) = content else {
-        return Ok((images, documents));
-    };
 
-    for item in items {
-        let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) else {
-            continue;
-        };
-        match block.block_type.as_str() {
-            "image" => {
-                if let Some(source) = block.source {
-                    if let Some(format) = get_image_format(&source.media_type) {
-                        images.push(KiroImage::from_base64(format, source.data));
-                    }
+    match value {
+        serde_json::Value::Array(items) => {
+            for item in items {
+                let Ok(block) = serde_json::from_value::<ContentBlock>(item.clone()) else {
+                    continue;
+                };
+                match block.block_type.as_str() {
+                    "image" => {
+                        if let Some(source) = block.source {
+                            if let Some(format) = get_image_format(&source.media_type) {
+                                images.push(KiroImage::from_base64(format, source.data));
+                            }
+                        }
+                    },
+                    "document" => {
+                        if let Some(source) = block.source {
+                            if let Some(document) = kiro_document_from_block(block.name, source)? {
+                                documents.push(document);
+                            }
+                        }
+                    },
+                    _ => {},
                 }
-            },
-            "document" => {
-                if let Some(source) = block.source {
-                    if let Some(document) = kiro_document_from_block(block.name, source)? {
-                        documents.push(document);
+            }
+        },
+        serde_json::Value::Object(_) if looks_like_tool_result_content_block(value) => {
+            let Ok(block) = serde_json::from_value::<ContentBlock>(value.clone()) else {
+                return Ok((images, documents));
+            };
+            match block.block_type.as_str() {
+                "image" => {
+                    if let Some(source) = block.source {
+                        if let Some(format) = get_image_format(&source.media_type) {
+                            images.push(KiroImage::from_base64(format, source.data));
+                        }
                     }
-                }
-            },
-            _ => {},
-        }
+                },
+                "document" => {
+                    if let Some(source) = block.source {
+                        if let Some(document) = kiro_document_from_block(block.name, source)? {
+                            documents.push(document);
+                        }
+                    }
+                },
+                _ => {},
+            }
+        },
+        _ => {},
     }
 
     Ok((images, documents))
 }
 
 pub fn extract_tool_result_content(content: &Option<serde_json::Value>) -> String {
+    if let Some(parsed_content) = parse_stringified_tool_result_content(content) {
+        return extract_tool_result_content_from_value(&parsed_content);
+    }
     match content {
-        Some(serde_json::Value::String(text)) => text.clone(),
-        Some(serde_json::Value::Array(items)) => items
+        Some(value) => extract_tool_result_content_from_value(value),
+        None => String::new(),
+    }
+}
+
+fn extract_tool_result_content_from_value(value: &serde_json::Value) -> String {
+    match value {
+        serde_json::Value::String(text) => text.clone(),
+        serde_json::Value::Array(items) => items
             .iter()
             .filter_map(|item| item.get("text").and_then(|value| value.as_str()))
             .collect::<Vec<_>>()
             .join("\n"),
-        Some(value) => value.to_string(),
-        None => String::new(),
+        serde_json::Value::Object(object) if looks_like_tool_result_content_block(value) => object
+            .get("text")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        other => other.to_string(),
     }
+}
+
+fn parse_stringified_tool_result_content(
+    content: &Option<serde_json::Value>,
+) -> Option<serde_json::Value> {
+    let serde_json::Value::String(text) = content.as_ref()? else {
+        return None;
+    };
+    let trimmed = text.trim();
+    if trimmed.is_empty() || !(trimmed.starts_with('[') || trimmed.starts_with('{')) {
+        return None;
+    }
+    let parsed = serde_json::from_str::<serde_json::Value>(trimmed).ok()?;
+    match &parsed {
+        serde_json::Value::Array(items)
+            if !items.is_empty() && items.iter().all(looks_like_tool_result_content_block) =>
+        {
+            Some(parsed)
+        },
+        serde_json::Value::Object(_) if looks_like_tool_result_content_block(&parsed) => {
+            Some(parsed)
+        },
+        _ => None,
+    }
+}
+
+fn looks_like_tool_result_content_block(value: &serde_json::Value) -> bool {
+    matches!(
+        value.get("type").and_then(serde_json::Value::as_str),
+        Some("text" | "image" | "document")
+    )
 }
 
 // Validates that every tool_result in the current message has a matching
@@ -1981,8 +2063,9 @@ fn prune_orphaned_history_tool_results(history: &mut Vec<Message>) {
 
                 let has_content = !message.user_input_message.content.trim().is_empty();
                 let has_images = !message.user_input_message.images.is_empty();
+                let has_documents = !message.user_input_message.documents.is_empty();
                 let has_tool_results = !context.tool_results.is_empty();
-                if has_content || has_images || has_tool_results {
+                if has_content || has_images || has_documents || has_tool_results {
                     retained.push(Message::User(message));
                 }
             },
@@ -2384,7 +2467,22 @@ fn dedupe_history_and_current_documents(
             KIRO_MAX_CONVERSATION_DOCUMENTS
         )));
     }
+    for message in history.iter_mut() {
+        if let Message::User(user_message) = message {
+            ensure_document_content_placeholder(
+                &mut user_message.user_input_message.content,
+                &user_message.user_input_message.documents,
+            );
+        }
+    }
+    ensure_document_content_placeholder(&mut current.content, &current.documents);
     Ok(())
+}
+
+fn ensure_document_content_placeholder(content: &mut String, documents: &[KiroDocument]) {
+    if content.trim().is_empty() && !documents.is_empty() {
+        *content = EMPTY_DOCUMENT_PLACEHOLDER.to_string();
+    }
 }
 
 fn convert_assistant_message(
@@ -4007,6 +4105,48 @@ mod tests {
     }
 
     #[test]
+    fn convert_request_preserves_document_only_history_turns() {
+        let req = base_request(vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "document",
+                        "name": "report.pdf",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": SAMPLE_PDF_BASE64
+                        }
+                    }
+                ]),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!("I have the document."),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Continue"),
+            },
+        ]);
+
+        let result = convert_request(&req).expect("document-only history turn should survive");
+
+        assert_eq!(result.conversation_state.history.len(), 2);
+        let Message::User(history_user_message) = &result.conversation_state.history[0] else {
+            panic!("expected first history message to be user");
+        };
+        let history_user = serde_json::to_value(&history_user_message.user_input_message)
+            .expect("serialize history user");
+
+        assert_eq!(history_user["content"], "(document attached)");
+        assert_eq!(history_user["documents"].as_array().map(Vec::len), Some(1));
+        assert_eq!(history_user["documents"][0]["name"], "report");
+        assert_eq!(history_user["documents"][0]["format"], "pdf");
+    }
+
+    #[test]
     fn convert_request_dedupes_document_names_across_history_and_current_turn() {
         let req = base_request(vec![
             AnthropicMessage {
@@ -4208,6 +4348,60 @@ mod tests {
                 .map(Vec::len),
             Some(1)
         );
+        assert_eq!(
+            current["userInputMessageContext"]["toolResults"][0]["content"][0]["text"],
+            "(empty result)"
+        );
+    }
+
+    #[test]
+    fn convert_request_extracts_images_from_stringified_tool_result_content() {
+        let req = base_request(vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Read the screenshot"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "read_image",
+                        "input": {"path": "/tmp/screenshot.png"}
+                    }
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": serde_json::json!([
+                            {
+                                "type": "image",
+                                "source": {
+                                    "type": "base64",
+                                    "media_type": "image/png",
+                                    "data": "aGVsbG8="
+                                }
+                            }
+                        ])
+                        .to_string()
+                    }
+                ]),
+            },
+        ]);
+
+        let result = convert_request(&req)
+            .expect("stringified tool_result image content should become current images");
+        let current =
+            serde_json::to_value(&result.conversation_state.current_message.user_input_message)
+                .expect("serialize current message");
+
+        assert_eq!(current["images"].as_array().map(Vec::len), Some(1));
+        assert_eq!(current["images"][0]["format"], "png");
         assert_eq!(
             current["userInputMessageContext"]["toolResults"][0]["content"][0]["text"],
             "(empty result)"
@@ -4438,6 +4632,58 @@ mod tests {
             generate_document_name("text/plain", "plain document body")
         );
         assert_eq!(current["documents"][0]["format"], "txt");
+    }
+
+    #[test]
+    fn convert_request_adds_placeholder_text_for_document_only_current_turn() {
+        let req = base_request(vec![
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!("Read the document"),
+            },
+            AnthropicMessage {
+                role: "assistant".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_use",
+                        "id": "tool-1",
+                        "name": "read_document",
+                        "input": {"path": "/tmp/report.pdf"}
+                    }
+                ]),
+            },
+            AnthropicMessage {
+                role: "user".to_string(),
+                content: serde_json::json!([
+                    {
+                        "type": "tool_result",
+                        "tool_use_id": "tool-1",
+                        "content": "document captured"
+                    },
+                    {
+                        "type": "document",
+                        "name": "report.pdf",
+                        "source": {
+                            "type": "base64",
+                            "media_type": "application/pdf",
+                            "data": SAMPLE_PDF_BASE64
+                        }
+                    }
+                ]),
+            },
+        ]);
+
+        let result = convert_request(&req).expect("document-only current turn should pass");
+        let current =
+            serde_json::to_value(&result.conversation_state.current_message.user_input_message)
+                .expect("serialize current message");
+
+        assert_eq!(current["content"], "(document attached)");
+        assert_eq!(current["documents"].as_array().map(Vec::len), Some(1));
+        assert_eq!(
+            current["userInputMessageContext"]["toolResults"][0]["content"][0]["text"],
+            "document captured"
+        );
     }
 
     #[test]

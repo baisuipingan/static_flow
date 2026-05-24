@@ -108,6 +108,10 @@ pub struct UsageEvent {
     pub upstream_request_body_json: Option<String>,
     /// Canonical full request body for diagnostic events.
     pub full_request_json: Option<String>,
+    /// Best-effort error message surfaced for failed requests.
+    pub error_message: Option<String>,
+    /// Raw error response body surfaced for failed requests.
+    pub error_body: Option<String>,
     /// Provider timing fields.
     pub timing: UsageTiming,
     /// Downstream stream outcome fields.

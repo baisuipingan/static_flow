@@ -1591,6 +1591,8 @@ mod tests {
             client_request_body_json: None,
             upstream_request_body_json: None,
             full_request_json: None,
+            error_message: None,
+            error_body: None,
             timing: llm_access_core::usage::UsageTiming {
                 latency_ms: Some(20),
                 ..llm_access_core::usage::UsageTiming::default()

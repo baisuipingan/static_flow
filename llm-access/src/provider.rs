@@ -141,6 +141,8 @@ struct ProviderUsageMetadata {
     client_request_body_json: Option<Bytes>,
     upstream_request_body_json: Option<Bytes>,
     full_request_json: Option<Bytes>,
+    error_message: Option<String>,
+    error_body: Option<String>,
 }
 
 impl ProviderUsageMetadata {
@@ -178,6 +180,8 @@ impl ProviderUsageMetadata {
             client_request_body_json: None,
             upstream_request_body_json: None,
             full_request_json: None,
+            error_message: None,
+            error_body: None,
         }
     }
 
@@ -295,6 +299,32 @@ fn capture_upstream_request_body_json(meta: &mut ProviderUsageMetadata, body: &[
     if meta.upstream_request_body_json.is_none() {
         meta.upstream_request_body_json = Some(Bytes::copy_from_slice(body));
     }
+}
+
+fn capture_error_message(meta: &mut ProviderUsageMetadata, message: &str) {
+    if meta.error_message.is_some() {
+        return;
+    }
+    let trimmed = message.trim();
+    if !trimmed.is_empty() {
+        meta.error_message = Some(trimmed.to_string());
+    }
+}
+
+fn capture_error_body(meta: &mut ProviderUsageMetadata, body: &str) {
+    if meta.error_body.is_some() {
+        return;
+    }
+    let trimmed = body.trim();
+    if !trimmed.is_empty() {
+        meta.error_body = Some(trimmed.to_string());
+    }
+}
+
+fn capture_error_bytes(meta: &mut ProviderUsageMetadata, bytes: &Bytes) {
+    capture_error_message(meta, &summarize_error_bytes(bytes));
+    let body = String::from_utf8_lossy(bytes.as_ref());
+    capture_error_body(meta, &body);
 }
 
 fn capture_codex_dispatch_request_json(
@@ -1242,6 +1272,12 @@ async fn dispatch_codex_proxy(
     let body = match to_bytes(request.into_body(), MAX_PROVIDER_PROXY_BODY_BYTES).await {
         Ok(body) => body,
         Err(_) => {
+            let message = "request body is too large";
+            capture_error_message(&mut usage_meta, message);
+            capture_error_body(
+                &mut usage_meta,
+                &codex_surface_error_body(&gateway_path, StatusCode::BAD_REQUEST, message),
+            );
             record_codex_preflight_failure(CodexPreflightFailureRecord {
                 control_store: control_store.as_ref(),
                 key: &key,
@@ -1282,6 +1318,11 @@ async fn dispatch_codex_proxy(
                 status = %err.status,
                 error_message = %err.message,
                 "codex request rejected before upstream dispatch"
+            );
+            capture_error_message(&mut usage_meta, &err.message);
+            capture_error_body(
+                &mut usage_meta,
+                &codex_surface_error_body(&gateway_path, err.status, &err.message),
             );
             record_codex_preflight_failure(CodexPreflightFailureRecord {
                 control_store: control_store.as_ref(),
@@ -1772,6 +1813,10 @@ async fn adapt_codex_upstream_response(
                     "codex forced-SSE upstream request failed before response.completed"
                 );
                 capture_codex_prepared_request_json(&mut usage_meta, &prepared);
+                capture_error_message(&mut usage_meta, &err.message);
+                if let Some(body) = err.body.as_deref() {
+                    capture_error_body(&mut usage_meta, body);
+                }
                 if let Err(record_err) = record_codex_usage(
                     control_store.as_ref(),
                     &key,
@@ -1924,6 +1969,7 @@ async fn adapt_codex_upstream_response_from_parts(
     let usage = if status.is_success() {
         extract_usage_from_bytes(effective_success_bytes).unwrap_or_else(missing_codex_usage)
     } else {
+        capture_error_bytes(&mut usage_meta, &bytes);
         missing_codex_usage()
     };
     if let Err(err) = record_codex_usage(
@@ -1943,7 +1989,7 @@ async fn adapt_codex_upstream_response_from_parts(
     if !status.is_success()
         && prepared.response_adapter == GatewayResponseAdapter::AnthropicMessages
     {
-        let message = summarize_codex_upstream_error_bytes(&bytes);
+        let message = summarize_error_bytes(&bytes);
         let body = json!({
             "error": {
                 "type": codex_error_type_for_status(status),
@@ -2954,8 +3000,14 @@ async fn dispatch_kiro_proxy(
     }
     if routes[0].remote_media_resolution_enabled {
         if let Err(err) = resolve_kiro_remote_media_sources(&mut payload).await {
+            let message = err.to_string();
             let response =
-                kiro_json_error(StatusCode::BAD_REQUEST, "invalid_request_error", &err.to_string());
+                kiro_json_error(StatusCode::BAD_REQUEST, "invalid_request_error", &message);
+            capture_error_message(&mut usage_meta, &message);
+            capture_error_body(
+                &mut usage_meta,
+                &anthropic_json_error_body("invalid_request_error", &message),
+            );
             capture_client_request_body_json(&mut usage_meta, &body);
             record_kiro_preflight_failure(KiroPreflightFailureRecord {
                 control_store: control_store.as_ref(),
@@ -3019,7 +3071,13 @@ async fn dispatch_kiro_proxy(
     let normalized = match normalize_request(&payload) {
         Ok(normalized) => normalized,
         Err(err) => {
+            let message = err.to_string();
             let response = kiro_conversion_error_response(err);
+            capture_error_message(&mut usage_meta, &message);
+            capture_error_body(
+                &mut usage_meta,
+                &anthropic_json_error_body("invalid_request_error", &message),
+            );
             capture_client_request_body_json(&mut usage_meta, &body);
             record_kiro_preflight_failure(KiroPreflightFailureRecord {
                 control_store: control_store.as_ref(),
@@ -3044,7 +3102,13 @@ async fn dispatch_kiro_proxy(
     ) {
         Ok(conversion) => conversion,
         Err(err) => {
+            let message = err.to_string();
             let response = kiro_conversion_error_response(err);
+            capture_error_message(&mut usage_meta, &message);
+            capture_error_body(
+                &mut usage_meta,
+                &anthropic_json_error_body("invalid_request_error", &message),
+            );
             capture_client_request_body_json(&mut usage_meta, &body);
             record_kiro_preflight_failure(KiroPreflightFailureRecord {
                 control_store: control_store.as_ref(),
@@ -3216,6 +3280,7 @@ async fn dispatch_kiro_proxy(
                 let status = failure.status;
                 capture_client_request_body_json(&mut usage_meta, &body);
                 capture_upstream_request_body_json(&mut usage_meta, &request_body);
+                capture_error_bytes(&mut usage_meta, &failure.body);
                 usage_meta.mark_stream_finish();
                 let error_response = failure.into_response();
                 let usage = build_kiro_usage_summary(
@@ -3254,8 +3319,16 @@ async fn dispatch_kiro_proxy(
         };
         if !response.status().is_success() {
             let status = response.status();
+            let content_type = response
+                .headers()
+                .get(reqwest::header::CONTENT_TYPE)
+                .and_then(|value| value.to_str().ok())
+                .unwrap_or("application/json")
+                .to_string();
+            let bytes = response.bytes().await.unwrap_or_else(|_| Bytes::new());
             capture_client_request_body_json(&mut usage_meta, &body);
             capture_upstream_request_body_json(&mut usage_meta, &request_body);
+            capture_error_bytes(&mut usage_meta, &bytes);
             usage_meta.mark_stream_finish();
             let usage = build_kiro_usage_summary(
                 &effective_model,
@@ -3288,7 +3361,7 @@ async fn dispatch_kiro_proxy(
                 )
                     .into_response();
             }
-            return pass_through_kiro_error_response(response).await;
+            return kiro_upstream_error_response(status, &content_type, bytes);
         }
         let response_ctx = KiroResponseContext {
             key,
@@ -4457,15 +4530,7 @@ async fn non_stream_kiro_response(
         })
 }
 
-async fn pass_through_kiro_error_response(response: reqwest::Response) -> Response {
-    let status = response.status();
-    let content_type = response
-        .headers()
-        .get(reqwest::header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("application/json")
-        .to_string();
-    let bytes = response.bytes().await.unwrap_or_else(|_| Bytes::new());
+fn kiro_upstream_error_response(status: StatusCode, content_type: &str, bytes: Bytes) -> Response {
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, content_type)
@@ -4706,17 +4771,22 @@ fn kiro_error_reason(body: &str) -> Option<String> {
         .map(str::to_string)
 }
 
-fn anthropic_json_error(status: StatusCode, error_type: &str, message: &str) -> Response {
-    let body = serde_json::json!({
+fn anthropic_json_error_body(error_type: &str, message: &str) -> String {
+    serde_json::json!({
         "error": {
             "type": error_type,
             "message": message,
         }
-    });
+    })
+    .to_string()
+}
+
+fn anthropic_json_error(status: StatusCode, error_type: &str, message: &str) -> Response {
+    let body = anthropic_json_error_body(error_type, message);
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body.to_string()))
+        .body(Body::from(body))
         .unwrap_or_else(|_| {
             (StatusCode::INTERNAL_SERVER_ERROR, "failed to build error").into_response()
         })
@@ -4734,19 +4804,24 @@ fn codex_error_type_for_status(status: StatusCode) -> &'static str {
     }
 }
 
-fn codex_json_error(status: StatusCode, message: &str) -> Response {
-    let body = json!({
+fn codex_json_error_body(status: StatusCode, message: &str) -> String {
+    json!({
         "error": {
             "message": message,
             "type": codex_error_type_for_status(status),
             "param": Value::Null,
             "code": Value::Null,
         }
-    });
+    })
+    .to_string()
+}
+
+fn codex_json_error(status: StatusCode, message: &str) -> Response {
+    let body = codex_json_error_body(status, message);
     Response::builder()
         .status(status)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(Body::from(body.to_string()))
+        .body(Body::from(body))
         .unwrap_or_else(|_| {
             (StatusCode::INTERNAL_SERVER_ERROR, "failed to build error").into_response()
         })
@@ -4754,6 +4829,14 @@ fn codex_json_error(status: StatusCode, message: &str) -> Response {
 
 fn codex_endpoint_prefers_anthropic_errors(endpoint: &str) -> bool {
     endpoint == "/v1/messages" || endpoint.starts_with("/v1/messages?")
+}
+
+fn codex_surface_error_body(endpoint: &str, status: StatusCode, message: &str) -> String {
+    if codex_endpoint_prefers_anthropic_errors(endpoint) {
+        anthropic_json_error_body(codex_error_type_for_status(status), message)
+    } else {
+        codex_json_error_body(status, message)
+    }
 }
 
 fn codex_surface_error_response(endpoint: &str, status: StatusCode, message: &str) -> Response {
@@ -4786,7 +4869,7 @@ fn extract_error_message_from_json_value(value: &Value) -> Option<String> {
         .map(ToString::to_string)
 }
 
-fn summarize_codex_upstream_error_bytes(bytes: &Bytes) -> String {
+fn summarize_error_bytes(bytes: &Bytes) -> String {
     if let Ok(value) = serde_json::from_slice::<Value>(bytes.as_ref()) {
         if let Some(message) = extract_error_message_from_json_value(&value)
             .map(|message| message.trim().to_string())
@@ -5267,6 +5350,8 @@ async fn record_kiro_usage(record: KiroUsageRecord<'_>) -> anyhow::Result<()> {
         client_request_body_json,
         upstream_request_body_json,
         full_request_json,
+        error_message: record.meta.error_message.clone(),
+        error_body: record.meta.error_body.clone(),
         timing: record.meta.to_timing(),
         stream: record.meta.to_stream_details(),
     };
@@ -5334,6 +5419,8 @@ async fn record_kiro_websearch_usage(record: KiroWebsearchUsageRecord<'_>) -> an
                     .or_else(|| captured_body_json(&record.meta.client_request_body_json))
             })
             .flatten(),
+        error_message: record.meta.error_message.clone(),
+        error_body: record.meta.error_body.clone(),
         timing: record.meta.to_timing(),
         stream: record.meta.to_stream_details(),
     };
@@ -5924,6 +6011,7 @@ struct CompletedCodexSse {
 struct CompletedCodexSseError {
     status: StatusCode,
     message: String,
+    body: Option<String>,
 }
 
 #[derive(Default)]
@@ -6030,6 +6118,7 @@ impl CompletedCodexSseAccumulator {
             return Err(CompletedCodexSseError {
                 status: StatusCode::BAD_GATEWAY,
                 message: "codex upstream SSE stream did not include response.completed".to_string(),
+                body: None,
             });
         };
         self.patch_empty_completed_output(&mut response);
@@ -6087,6 +6176,7 @@ fn completed_codex_sse_error_from_value(value: &Value) -> CompletedCodexSseError
     CompletedCodexSseError {
         status,
         message,
+        body: Some(value.to_string()),
     }
 }
 
@@ -6104,6 +6194,7 @@ fn completed_response_from_sse_bytes(
             .map_err(|message| CompletedCodexSseError {
                 status: StatusCode::BAD_GATEWAY,
                 message: message.to_string(),
+                body: None,
             })?;
     }
     accumulator.finish()
@@ -6185,6 +6276,8 @@ async fn record_codex_preflight_failure(record: CodexPreflightFailureRecord<'_>)
         client_request_body_json: captured_body_json(&record.meta.client_request_body_json),
         upstream_request_body_json: captured_body_json(&record.meta.upstream_request_body_json),
         full_request_json: captured_body_json(&record.meta.full_request_json),
+        error_message: record.meta.error_message.clone(),
+        error_body: record.meta.error_body.clone(),
         timing: record.meta.to_timing(),
         stream: record.meta.to_stream_details(),
     };
@@ -6258,6 +6351,8 @@ async fn record_codex_usage(
                     .or_else(|| captured_body_json(&meta.client_request_body_json))
             })
             .flatten(),
+        error_message: meta.error_message.clone(),
+        error_body: meta.error_body.clone(),
         timing: meta.to_timing(),
         stream: meta.to_stream_details(),
     };
@@ -12379,6 +12474,14 @@ mod tests {
             client_request_body_json: Some(captured_json_bytes(r#"{"client":true}"#)),
             upstream_request_body_json: Some(captured_json_bytes(r#"{"mcp":true}"#)),
             full_request_json: Some(captured_json_bytes(r#"{"full":true}"#)),
+            error_message: Some(
+                "400 Bedrock error message: A text block must be included when using documents."
+                    .to_string(),
+            ),
+            error_body: Some(
+                r#"{"error":{"message":"A text block must be included when using documents."}}"#
+                    .to_string(),
+            ),
         };
 
         let route = static_kiro_route();
@@ -12448,6 +12551,14 @@ mod tests {
             client_request_body_json: Some(captured_json_bytes(r#"{"client":true}"#)),
             upstream_request_body_json: Some(captured_json_bytes(r#"{"mcp":true}"#)),
             full_request_json: Some(captured_json_bytes(r#"{"full":true}"#)),
+            error_message: Some(
+                "400 Bedrock error message: A text block must be included when using documents."
+                    .to_string(),
+            ),
+            error_body: Some(
+                r#"{"error":{"message":"A text block must be included when using documents."}}"#
+                    .to_string(),
+            ),
         };
 
         let route = static_kiro_route();
@@ -12477,6 +12588,14 @@ mod tests {
         assert_eq!(events[0].client_request_body_json.as_deref(), Some(r#"{"client":true}"#));
         assert_eq!(events[0].upstream_request_body_json.as_deref(), Some(r#"{"mcp":true}"#));
         assert_eq!(events[0].full_request_json.as_deref(), Some(r#"{"full":true}"#));
+        assert_eq!(
+            events[0].error_message.as_deref(),
+            Some("400 Bedrock error message: A text block must be included when using documents.")
+        );
+        assert_eq!(
+            events[0].error_body.as_deref(),
+            Some(r#"{"error":{"message":"A text block must be included when using documents."}}"#)
+        );
     }
 
     #[tokio::test]
@@ -12525,6 +12644,8 @@ mod tests {
             client_request_body_json: Some(captured_json_bytes(r#"{"client":true}"#)),
             upstream_request_body_json: Some(captured_json_bytes(r#"{"upstream":true}"#)),
             full_request_json: Some(captured_json_bytes(r#"{"full":true}"#)),
+            error_message: None,
+            error_body: None,
         };
 
         super::record_kiro_usage(super::KiroUsageRecord {
@@ -12582,6 +12703,8 @@ mod tests {
             client_request_body_json: None,
             upstream_request_body_json: None,
             full_request_json: None,
+            error_message: None,
+            error_body: None,
         };
 
         meta.observe_stream_write(12, Some("message_start"));

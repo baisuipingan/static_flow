@@ -6257,6 +6257,8 @@ pub struct AdminLlmGatewayUsageEventDetailView {
     pub client_request_body_json: Option<String>,
     pub upstream_request_body_json: Option<String>,
     pub full_request_json: Option<String>,
+    pub error_message: Option<String>,
+    pub error_body: Option<String>,
     pub created_at: i64,
 }
 

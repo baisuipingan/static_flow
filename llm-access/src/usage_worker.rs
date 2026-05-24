@@ -1269,6 +1269,8 @@ mod tests {
             client_request_body_json: Some("{\"model\":\"m\"}".to_string()),
             upstream_request_body_json: Some("{\"upstream\":true}".to_string()),
             full_request_json: Some("{\"model\":\"m\"}".to_string()),
+            error_message: None,
+            error_body: None,
             timing: UsageTiming::default(),
             stream: UsageStreamDetails::default(),
         }

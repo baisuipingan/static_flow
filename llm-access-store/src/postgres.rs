@@ -9709,6 +9709,8 @@ mod tests {
             client_request_body_json: None,
             upstream_request_body_json: None,
             full_request_json: None,
+            error_message: None,
+            error_body: None,
             timing: llm_access_core::usage::UsageTiming {
                 latency_ms: Some(120),
                 ..Default::default()
@@ -9810,6 +9812,8 @@ mod tests {
                 client_request_body_json: None,
                 upstream_request_body_json: None,
                 full_request_json: None,
+                error_message: None,
+                error_body: None,
                 timing: llm_access_core::usage::UsageTiming::default(),
                 stream: llm_access_core::usage::UsageStreamDetails::default(),
             },
@@ -9846,6 +9850,8 @@ mod tests {
                 client_request_body_json: None,
                 upstream_request_body_json: None,
                 full_request_json: None,
+                error_message: None,
+                error_body: None,
                 timing: llm_access_core::usage::UsageTiming::default(),
                 stream: llm_access_core::usage::UsageStreamDetails::default(),
             },
@@ -9914,6 +9920,8 @@ mod tests {
             client_request_body_json: None,
             upstream_request_body_json: None,
             full_request_json: None,
+            error_message: None,
+            error_body: None,
             timing: llm_access_core::usage::UsageTiming {
                 latency_ms: Some(120),
                 ..Default::default()

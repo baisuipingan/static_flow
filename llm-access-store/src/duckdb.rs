@@ -143,6 +143,10 @@ pub struct UsageEventRow {
     pub upstream_request_body_json: Option<String>,
     /// Full request JSON when captured.
     pub full_request_json: Option<String>,
+    /// Best-effort error message surfaced for failed requests.
+    pub error_message: Option<String>,
+    /// Raw error response body surfaced for failed requests.
+    pub error_body: Option<String>,
     /// Whether heavyweight request payload details were externalized.
     pub detail_object_payload_present: bool,
     /// External detail pack object path relative to the configured detail root.
@@ -217,10 +221,13 @@ impl UsageEventRow {
             client_request_body_json: event.client_request_body_json.clone(),
             upstream_request_body_json: event.upstream_request_body_json.clone(),
             full_request_json: event.full_request_json.clone(),
+            error_message: event.error_message.clone(),
+            error_body: event.error_body.clone(),
             detail_object_payload_present: has_external_detail_payloads(
                 event.client_request_body_json.as_deref(),
                 event.upstream_request_body_json.as_deref(),
                 event.full_request_json.as_deref(),
+                event.error_body.as_deref(),
             ),
             detail_object_path: None,
             detail_object_offset: None,
@@ -234,8 +241,9 @@ fn has_external_detail_payloads(
     client_request_body_json: Option<&str>,
     upstream_request_body_json: Option<&str>,
     full_request_json: Option<&str>,
+    error_body: Option<&str>,
 ) -> bool {
-    [client_request_body_json, upstream_request_body_json, full_request_json]
+    [client_request_body_json, upstream_request_body_json, full_request_json, error_body]
         .into_iter()
         .flatten()
         .any(|value| !value.trim().is_empty())
@@ -275,9 +283,10 @@ fn insert_usage_event_detail_sql() -> &'static str {
     "INSERT INTO usage_event_details (
         event_id, request_headers_json, routing_diagnostics_json,
         last_message_content, client_request_body_json,
-        upstream_request_body_json, full_request_json
+        upstream_request_body_json, full_request_json, error_message,
+        error_body
      ) VALUES (
-        ?1, ?2, ?3, ?4, ?5, ?6, ?7
+        ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9
      )
      ON CONFLICT DO NOTHING"
 }
@@ -631,6 +640,18 @@ fn usage_event_detail_select_exprs(
         "full_request_json",
         "CAST(NULL AS VARCHAR)",
     ));
+    exprs.push(usage_event_detail_payload_expr(
+        columns,
+        detail_table_exists,
+        "error_message",
+        "CAST(NULL AS VARCHAR)",
+    ));
+    exprs.push(usage_event_detail_payload_expr(
+        columns,
+        detail_table_exists,
+        "error_body",
+        "CAST(NULL AS VARCHAR)",
+    ));
     exprs.push(usage_event_column_expr(columns, "detail_object_path", "CAST(NULL AS VARCHAR)"));
     exprs.push(usage_event_column_expr(columns, "detail_object_offset", "CAST(NULL AS BIGINT)"));
     exprs.push(usage_event_column_expr(columns, "detail_object_length", "CAST(NULL AS BIGINT)"));
@@ -760,6 +781,8 @@ struct UsageEventDetailRow {
     client_request_body_json: Option<String>,
     upstream_request_body_json: Option<String>,
     full_request_json: Option<String>,
+    error_message: Option<String>,
+    error_body: Option<String>,
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -773,6 +796,8 @@ impl UsageEventDetailRow {
             client_request_body_json: row.client_request_body_json.clone(),
             upstream_request_body_json: row.upstream_request_body_json.clone(),
             full_request_json: row.full_request_json.clone(),
+            error_message: row.error_message.clone(),
+            error_body: row.error_body.clone(),
         }
     }
 
@@ -781,6 +806,7 @@ impl UsageEventDetailRow {
             self.client_request_body_json.as_deref(),
             self.upstream_request_body_json.as_deref(),
             self.full_request_json.as_deref(),
+            self.error_body.as_deref(),
         )
     }
 }
@@ -794,6 +820,8 @@ struct UsageEventDetailBlob {
     client_request_body_json: Option<String>,
     upstream_request_body_json: Option<String>,
     full_request_json: Option<String>,
+    error_message: Option<String>,
+    error_body: Option<String>,
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -806,6 +834,8 @@ impl UsageEventDetailBlob {
             client_request_body_json: row.client_request_body_json.clone(),
             upstream_request_body_json: row.upstream_request_body_json.clone(),
             full_request_json: row.full_request_json.clone(),
+            error_message: row.error_message.clone(),
+            error_body: row.error_body.clone(),
         }
     }
 
@@ -818,6 +848,8 @@ impl UsageEventDetailBlob {
             client_request_body_json: self.client_request_body_json,
             upstream_request_body_json: self.upstream_request_body_json,
             full_request_json: self.full_request_json,
+            error_message: self.error_message,
+            error_body: self.error_body,
         }
     }
 }
@@ -1181,6 +1213,8 @@ fn execute_usage_event_detail_insert(
         row.client_request_body_json.as_deref(),
         row.upstream_request_body_json.as_deref(),
         row.full_request_json.as_deref(),
+        row.error_message.as_deref(),
+        row.error_body.as_deref(),
     ])?;
     Ok(())
 }
@@ -3656,6 +3690,8 @@ fn merge_usage_event_detail_payloads(event: &mut UsageEvent, detail: &UsageEvent
     event.client_request_body_json = detail.client_request_body_json.clone();
     event.upstream_request_body_json = detail.upstream_request_body_json.clone();
     event.full_request_json = detail.full_request_json.clone();
+    event.error_message = detail.error_message.clone();
+    event.error_body = detail.error_body.clone();
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -4177,6 +4213,8 @@ fn decode_usage_event_row(
         client_request_body_json: if include_detail_payload { row.get(42)? } else { None },
         upstream_request_body_json: if include_detail_payload { row.get(43)? } else { None },
         full_request_json: if include_detail_payload { row.get(44)? } else { None },
+        error_message: if include_detail_payload { row.get(45)? } else { None },
+        error_body: if include_detail_payload { row.get(46)? } else { None },
         timing: UsageTiming {
             latency_ms: row.get(25)?,
             routing_wait_ms: row.get(26)?,
@@ -4238,6 +4276,8 @@ mod tests {
             client_request_body_json: Some(r#"{"model":"claude-sonnet-4-5"}"#.to_string()),
             upstream_request_body_json: Some(r#"{"conversationState":{}}"#.to_string()),
             full_request_json: Some(r#"{"model":"claude-sonnet-4-5"}"#.to_string()),
+            error_message: None,
+            error_body: None,
             timing: UsageTiming {
                 latency_ms: Some(55),
                 routing_wait_ms: Some(5),
@@ -4284,6 +4324,8 @@ mod tests {
         expected_summary.client_request_body_json = None;
         expected_summary.upstream_request_body_json = None;
         expected_summary.full_request_json = None;
+        expected_summary.error_message = None;
+        expected_summary.error_body = None;
         assert_usage_event_round_trips(actual, &expected_summary);
     }
 
@@ -4293,6 +4335,8 @@ mod tests {
         expected_summary.client_request_body_json = None;
         expected_summary.upstream_request_body_json = None;
         expected_summary.full_request_json = None;
+        expected_summary.error_message = None;
+        expected_summary.error_body = None;
         assert_usage_event_round_trips(actual, &expected_summary);
     }
 
@@ -4304,6 +4348,8 @@ mod tests {
         assert_eq!(actual.client_request_body_json, expected.client_request_body_json);
         assert_eq!(actual.upstream_request_body_json, expected.upstream_request_body_json);
         assert_eq!(actual.full_request_json, expected.full_request_json);
+        assert_eq!(actual.error_message, expected.error_message);
+        assert_eq!(actual.error_body, expected.error_body);
     }
 
     #[cfg(feature = "duckdb-runtime")]
@@ -5063,6 +5109,48 @@ mod tests {
             .await
             .expect("get detail after false detail payload flag")
             .expect("event exists");
+        assert_usage_event_detail_payloads(&detail, &event);
+
+        std::fs::remove_dir_all(&root).expect("cleanup duckdb test directory");
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
+    #[tokio::test]
+    async fn duckdb_repository_round_trips_error_payloads_in_usage_detail() {
+        let root = std::env::temp_dir()
+            .join(format!("llm-access-duckdb-test-{}-error-detail", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create duckdb test directory");
+        let repo = super::DuckDbUsageRepository::open_tiered(super::TieredDuckDbUsageConfig {
+            active_dir: root.join("active"),
+            archive_dir: root.join("archive"),
+            catalog_dir: root.join("catalog"),
+            rollover_bytes: u64::MAX,
+            details_dir: Some(details_store_dir(&root)),
+        })
+        .expect("open tiered duckdb usage db");
+        let mut event = test_usage_event();
+        event.client_request_body_json = None;
+        event.upstream_request_body_json = None;
+        event.full_request_json = None;
+        event.error_message = Some(
+            "400 Bedrock error message: A text block must be included when using documents."
+                .to_string(),
+        );
+        event.error_body = Some(
+            r#"{"error":{"message":"A text block must be included when using documents."}}"#
+                .to_string(),
+        );
+
+        repo.append_usage_event(&event)
+            .await
+            .expect("append duckdb usage event");
+
+        let detail = repo
+            .get_usage_event(&event.event_id)
+            .await
+            .expect("get usage event detail")
+            .expect("usage event detail exists");
         assert_usage_event_detail_payloads(&detail, &event);
 
         std::fs::remove_dir_all(&root).expect("cleanup duckdb test directory");

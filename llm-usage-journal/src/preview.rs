@@ -245,6 +245,8 @@ mod tests {
             client_request_body_json: None,
             upstream_request_body_json: None,
             full_request_json: None,
+            error_message: None,
+            error_body: None,
             timing: UsageTiming::default(),
             stream: UsageStreamDetails::default(),
         }

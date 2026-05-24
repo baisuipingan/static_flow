@@ -145,6 +145,10 @@ pub struct JournalUsageEventV1 {
     pub upstream_request_body_json: Option<String>,
     /// Canonical full request body for diagnostic events.
     pub full_request_json: Option<String>,
+    /// Best-effort error message surfaced for failed requests.
+    pub error_message: Option<String>,
+    /// Raw error response body surfaced for failed requests.
+    pub error_body: Option<String>,
     /// Provider timing fields.
     pub timing: UsageTiming,
     /// Downstream stream outcome fields.
@@ -188,6 +192,8 @@ impl JournalUsageEventV1 {
             client_request_body_json: event.client_request_body_json.clone(),
             upstream_request_body_json: event.upstream_request_body_json.clone(),
             full_request_json: event.full_request_json.clone(),
+            error_message: event.error_message.clone(),
+            error_body: event.error_body.clone(),
             timing: event.timing.clone(),
             stream: event.stream.clone(),
         }
@@ -228,6 +234,8 @@ impl JournalUsageEventV1 {
             client_request_body_json: self.client_request_body_json,
             upstream_request_body_json: self.upstream_request_body_json,
             full_request_json: self.full_request_json,
+            error_message: self.error_message,
+            error_body: self.error_body,
             timing: self.timing,
             stream: self.stream,
         }
@@ -304,6 +312,8 @@ mod tests {
             client_request_body_json: Some("{\"model\":\"m\"}".to_string()),
             upstream_request_body_json: Some("{\"upstream\":true}".to_string()),
             full_request_json: Some("{\"model\":\"m\"}".to_string()),
+            error_message: None,
+            error_body: None,
             timing: UsageTiming {
                 latency_ms: Some(123),
                 routing_wait_ms: Some(1),
