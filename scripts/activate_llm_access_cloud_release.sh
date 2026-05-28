@@ -195,16 +195,15 @@ if [[ -e "$STAGED_NEON_ENV" ]]; then
   grep -q '^LLM_ACCESS_CONTROL_DATABASE_URL=' "$STAGED_NEON_ENV" \
     || fail "staged Neon config does not define LLM_ACCESS_CONTROL_DATABASE_URL: $STAGED_NEON_ENV"
   install -d -m 0755 "$(dirname "$NEON_ENV_PATH")"
-  if test -e "$NEON_ENV_PATH"; then
+  if sudo test -e "$NEON_ENV_PATH"; then
     log "backing up shared Neon config to $BACKUP_DIR/neon.env.preinstall"
-    cat "$NEON_ENV_PATH" | sudo tee "$BACKUP_DIR/neon.env.preinstall" >/dev/null
-    sudo chmod 0600 "$BACKUP_DIR/neon.env.preinstall"
+    sudo cp -a "$NEON_ENV_PATH" "$BACKUP_DIR/neon.env.preinstall"
   fi
   log "installing staged Neon config to $NEON_ENV_PATH"
-  install -m 0600 "$STAGED_NEON_ENV" "$NEON_ENV_PATH"
+  sudo install -m 0600 "$STAGED_NEON_ENV" "$NEON_ENV_PATH"
 fi
-test -r "$NEON_ENV_PATH" || fail "missing shared Neon config: $NEON_ENV_PATH"
-grep -q '^LLM_ACCESS_CONTROL_DATABASE_URL=' "$NEON_ENV_PATH" \
+sudo test -r "$NEON_ENV_PATH" || fail "missing shared Neon config: $NEON_ENV_PATH"
+sudo grep -q '^LLM_ACCESS_CONTROL_DATABASE_URL=' "$NEON_ENV_PATH" \
   || fail "shared Neon config does not define LLM_ACCESS_CONTROL_DATABASE_URL: $NEON_ENV_PATH"
 if [[ "$ACTIVATE_TARGET" == "worker" || "$ACTIVATE_TARGET" == "both" ]]; then
   if findmnt -T /mnt/llm-access-usage >/dev/null; then
