@@ -85,8 +85,9 @@ journal production; `llm-access-usage-worker.service` consumes the journal and
 writes tiered DuckDB analytics plus packed usage details. Both units source the
 shared Neon env from `bash -lc` wrappers rather than a systemd
 `EnvironmentFile=` on JuiceFS. Journal files and active DuckDB segments stay on
-VM block storage; sealed DuckDB segments, the segment catalog, and packed
-detail blobs live on the dedicated JuiceFS usage mount.
+VM block storage; sealed DuckDB segments and packed detail blobs live on the
+dedicated JuiceFS usage mount, while the archived-segment catalog stays in
+Neon Postgres.
 The GeoIP MMDB is a rebuildable local cache and should stay on the VM block
 disk, not under `/mnt/llm-access`.
 

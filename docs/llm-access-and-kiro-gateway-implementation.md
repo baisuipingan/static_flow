@@ -83,8 +83,8 @@ public client
 `/mnt/llm-access/control/llm-access.sqlite3` 只保留作回退快照。usage
 analytics 继续使用 tiered DuckDB：active mutable segment 在 AWS VM 本地块
 存储 `/var/lib/staticflow/llm-access/analytics-active`，归档
-segment/catalog/details 在独立的 JuiceFS usage mount
-`/mnt/llm-access-usage`。usage 重明细现在保持 pack 形式，直接落到
+segment/details 在独立的 JuiceFS usage mount `/mnt/llm-access-usage`，
+而窄 segment catalog 常驻 Neon Postgres。usage 重明细现在保持 pack 形式，直接落到
 `/mnt/llm-access-usage/details/packs/<provider>/<yyyy>/<mm>/<dd>/...`，不再由
 worker 直写 R2。
 

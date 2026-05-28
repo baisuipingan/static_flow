@@ -863,7 +863,7 @@ worker 直连可返回但耗时明显高
 
 下一步：
 
-- 检查 `usage-segments.sqlite3` 是否存在 `usage_segment_key_rollups`。
+- 检查 Neon `llm_usage_segment_key_rollups` 是否覆盖目标 key/provider。
 - 统计目标 key/provider 命中的 segment 数。
 - 如果命中 segment 很少但 worker 仍打开大量 archive，说明查询没有走 catalog
   预过滤路径。
