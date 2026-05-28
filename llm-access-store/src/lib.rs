@@ -98,6 +98,10 @@ mod tests {
         assert!(schema.contains("downstream_disconnect BOOLEAN"));
         assert!(schema.contains("final_event_type VARCHAR"));
         assert!(schema.contains("bytes_streamed BIGINT"));
+        assert!(schema.contains("proxy_source_at_event VARCHAR"));
+        assert!(schema.contains("proxy_config_id_at_event VARCHAR"));
+        assert!(schema.contains("proxy_config_name_at_event VARCHAR"));
+        assert!(schema.contains("proxy_url_at_event VARCHAR"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS usage_event_details"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS usage_rollups_hourly"));
         assert!(schema.contains("CREATE TABLE IF NOT EXISTS usage_rollups_daily"));

@@ -291,6 +291,7 @@ fn route_path_for(route: &Route) -> String {
         Route::KiroAccess => config::route_path("/kiro-access"),
         Route::Admin => config::route_path("/admin"),
         Route::AdminLlmGateway => config::route_path("/admin/llm-gateway"),
+        Route::AdminLlmGatewayMonitor => config::route_path("/admin/llm-gateway/monitor"),
         Route::AdminKiroGateway => config::route_path("/admin/kiro-gateway"),
         Route::AdminKiroAccountStatus => config::route_path("/admin/kiro-gateway/accounts"),
         Route::AdminGpt2ApiRs => config::route_path("/admin/gpt2api-rs"),
@@ -506,6 +507,7 @@ pub fn apply_route_seo(route: Option<&Route>) {
         },
         Route::Admin
         | Route::AdminLlmGateway
+        | Route::AdminLlmGatewayMonitor
         | Route::AdminKiroGateway
         | Route::AdminKiroAccountStatus
         | Route::AdminGpt2ApiRs

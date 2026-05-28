@@ -2518,6 +2518,12 @@ pub trait UsageAnalyticsStore: Send + Sync {
         &self,
         query: UsageEventQuery,
     ) -> anyhow::Result<UsageFilterOptions>;
+
+    /// Return one recent operational monitoring snapshot.
+    async fn usage_metrics_snapshot(
+        &self,
+        query: UsageMetricsQuery,
+    ) -> anyhow::Result<UsageMetricsSnapshot>;
 }
 
 /// Distinct values available for usage filter autocomplete.
@@ -2529,6 +2535,151 @@ pub struct UsageFilterOptions {
     pub accounts: Vec<String>,
     /// Distinct endpoint values.
     pub endpoints: Vec<String>,
+}
+
+/// Query for recent operational monitoring metrics.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageMetricsQuery {
+    /// Optional provider filter.
+    pub provider_type: Option<String>,
+    /// Physical usage-event source.
+    pub source: UsageEventSource,
+    /// Inclusive lower timestamp bound in Unix milliseconds.
+    pub start_ms: i64,
+    /// Exclusive upper timestamp bound in Unix milliseconds.
+    pub end_ms: i64,
+    /// Per-section top-N limit.
+    pub top_limit: usize,
+}
+
+/// High-level aggregate over one monitoring window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct UsageMetricsSummary {
+    /// Total requests in the window.
+    pub total_requests: u64,
+    /// Successful HTTP 200 requests.
+    pub ok_requests: u64,
+    /// Non-200 requests.
+    pub non_ok_requests: u64,
+    /// Distinct account count observed in the window.
+    pub distinct_accounts: usize,
+    /// Distinct proxy identities observed in the window.
+    pub distinct_proxies: usize,
+    /// Samples carrying first-token timing.
+    pub first_token_samples: u64,
+    /// Average first-token latency in milliseconds.
+    pub avg_first_token_ms: Option<f64>,
+    /// Maximum first-token latency in milliseconds.
+    pub max_first_token_ms: Option<i64>,
+    /// Average end-to-end latency in milliseconds.
+    pub avg_latency_ms: Option<f64>,
+    /// Average routing wait in milliseconds.
+    pub avg_routing_wait_ms: Option<f64>,
+    /// Requests that experienced at least one quota failover.
+    pub failover_request_count: u64,
+    /// Total quota-failover count across all requests.
+    pub total_quota_failovers: u64,
+    /// Downstream disconnect count.
+    pub downstream_disconnect_count: u64,
+    /// Requests missing regular token usage.
+    pub usage_missing_count: u64,
+    /// Requests missing credit usage.
+    pub credit_usage_missing_count: u64,
+}
+
+/// One grouped monitoring row for accounts or proxies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct UsageMetricsDimensionView {
+    /// Stable grouping key.
+    pub key: String,
+    /// Human-readable label.
+    pub label: String,
+    /// Account name when this row represents an account.
+    pub account_name: Option<String>,
+    /// Proxy config id when known.
+    pub proxy_config_id: Option<String>,
+    /// Proxy config name when known.
+    pub proxy_config_name: Option<String>,
+    /// Proxy URL when known.
+    pub proxy_url: Option<String>,
+    /// Proxy source (`fixed`, `binding`, `none`, ...).
+    pub proxy_source: Option<String>,
+    /// Total requests in this group.
+    pub request_count: u64,
+    /// Successful HTTP 200 requests.
+    pub ok_count: u64,
+    /// Non-200 requests.
+    pub non_ok_count: u64,
+    /// Samples carrying first-token timing.
+    pub first_token_samples: u64,
+    /// Average first-token latency in milliseconds.
+    pub avg_first_token_ms: Option<f64>,
+    /// Maximum first-token latency in milliseconds.
+    pub max_first_token_ms: Option<i64>,
+    /// Samples carrying routing-wait timing.
+    pub routing_wait_samples: u64,
+    /// Average routing-wait latency in milliseconds.
+    pub avg_routing_wait_ms: Option<f64>,
+    /// Maximum routing-wait latency in milliseconds.
+    pub max_routing_wait_ms: Option<i64>,
+    /// Requests that experienced quota failover.
+    pub failover_request_count: u64,
+    /// Sum of quota-failover counts.
+    pub total_quota_failovers: u64,
+    /// Downstream disconnect count.
+    pub downstream_disconnect_count: u64,
+    /// Requests missing regular token usage.
+    pub usage_missing_count: u64,
+    /// Requests missing credit usage.
+    pub credit_usage_missing_count: u64,
+}
+
+/// One non-OK status-code aggregate row.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize, Default)]
+pub struct UsageMetricsStatusCodeView {
+    /// HTTP status code.
+    pub status_code: i32,
+    /// Number of matching requests.
+    pub request_count: u64,
+}
+
+/// Full monitoring snapshot for one recent window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct UsageMetricsSnapshot {
+    /// Generation timestamp in Unix milliseconds.
+    pub generated_at_ms: i64,
+    /// Inclusive lower timestamp bound in Unix milliseconds.
+    pub start_ms: i64,
+    /// Exclusive upper timestamp bound in Unix milliseconds.
+    pub end_ms: i64,
+    /// Effective provider filter.
+    pub provider_type: Option<String>,
+    /// Effective usage source.
+    pub source: UsageEventSource,
+    /// Window-level summary.
+    pub summary: UsageMetricsSummary,
+    /// Highest first-token-latency accounts.
+    pub top_first_token_accounts: Vec<UsageMetricsDimensionView>,
+    /// Highest first-token-latency proxies.
+    pub top_first_token_proxies: Vec<UsageMetricsDimensionView>,
+    /// Largest non-OK account distributions.
+    pub top_non_ok_accounts: Vec<UsageMetricsDimensionView>,
+    /// Largest non-OK proxy distributions.
+    pub top_non_ok_proxies: Vec<UsageMetricsDimensionView>,
+    /// Highest routing-wait accounts.
+    pub top_routing_wait_accounts: Vec<UsageMetricsDimensionView>,
+    /// Highest routing-wait proxies.
+    pub top_routing_wait_proxies: Vec<UsageMetricsDimensionView>,
+    /// Largest quota-failover account distributions.
+    pub top_failover_accounts: Vec<UsageMetricsDimensionView>,
+    /// Largest quota-failover proxy distributions.
+    pub top_failover_proxies: Vec<UsageMetricsDimensionView>,
+    /// Largest downstream-disconnect account distributions.
+    pub top_disconnect_accounts: Vec<UsageMetricsDimensionView>,
+    /// Largest downstream-disconnect proxy distributions.
+    pub top_disconnect_proxies: Vec<UsageMetricsDimensionView>,
+    /// Non-OK status-code distribution.
+    pub non_ok_status_codes: Vec<UsageMetricsStatusCodeView>,
 }
 
 /// Public write queries used by unauthenticated public endpoints.
@@ -3210,6 +3361,20 @@ impl UsageAnalyticsStore for EmptyUsageAnalyticsStore {
         _query: UsageEventQuery,
     ) -> anyhow::Result<UsageFilterOptions> {
         Ok(UsageFilterOptions::default())
+    }
+
+    async fn usage_metrics_snapshot(
+        &self,
+        query: UsageMetricsQuery,
+    ) -> anyhow::Result<UsageMetricsSnapshot> {
+        Ok(UsageMetricsSnapshot {
+            generated_at_ms: 0,
+            start_ms: query.start_ms,
+            end_ms: query.end_ms,
+            provider_type: query.provider_type,
+            source: query.source,
+            ..UsageMetricsSnapshot::default()
+        })
     }
 }
 

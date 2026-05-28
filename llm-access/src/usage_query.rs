@@ -11,7 +11,7 @@ use axum::{
 use llm_access_core::{
     store::{
         UsageAnalyticsStore, UsageChartPoint, UsageEventPage, UsageEventQuery, UsageEventSource,
-        UsageEventStatusKind, DEFAULT_USAGE_ANALYTICS_RETENTION_DAYS,
+        UsageEventStatusKind, UsageMetricsQuery, DEFAULT_USAGE_ANALYTICS_RETENTION_DAYS,
     },
     usage::UsageEvent,
 };
@@ -22,6 +22,9 @@ const MAX_ADMIN_USAGE_LIMIT: usize = 200;
 const DEFAULT_USAGE_CHART_BUCKET_MS: i64 = 60 * 60 * 1000;
 const DEFAULT_USAGE_CHART_BUCKETS: usize = 24;
 const MAX_USAGE_CHART_BUCKETS: usize = 168;
+const DEFAULT_USAGE_METRICS_WINDOW: &str = "1h";
+const DEFAULT_USAGE_METRICS_TOP_LIMIT: usize = 10;
+const MAX_USAGE_METRICS_TOP_LIMIT: usize = 20;
 
 /// Query options for usage list endpoints.
 #[derive(Debug, Clone, Default, Deserialize)]
@@ -48,6 +51,19 @@ pub(crate) struct ListUsageEventsRequest {
     limit: Option<usize>,
     #[serde(default)]
     offset: Option<usize>,
+}
+
+/// Query options for recent usage monitoring metrics.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct UsageMetricsRequest {
+    #[serde(default)]
+    provider_type: Option<String>,
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    window: Option<String>,
+    #[serde(default)]
+    top_limit: Option<usize>,
 }
 
 /// Aggregate totals over the full filtered result set.
@@ -284,6 +300,35 @@ pub(crate) async fn usage_filter_options(
     }
 }
 
+/// Return one recent usage monitoring snapshot.
+pub(crate) async fn usage_metrics_snapshot(
+    State(state): State<UsageQueryState>,
+    Query(request): Query<UsageMetricsRequest>,
+) -> Response {
+    let query = match normalize_usage_metrics_query(request) {
+        Ok(query) => query,
+        Err(message) => {
+            tracing::warn!(message, "invalid usage metrics query");
+            return (StatusCode::BAD_REQUEST, message).into_response();
+        },
+    };
+    match state
+        .usage_analytics_store
+        .usage_metrics_snapshot(query)
+        .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(err) => {
+            tracing::error!(error = ?err, "failed to load usage metrics snapshot");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load usage metrics snapshot: {err:#}"),
+            )
+                .into_response()
+        },
+    }
+}
+
 async fn list_usage_events(
     state: UsageQueryState,
     request: ListUsageEventsRequest,
@@ -429,6 +474,47 @@ fn normalize_usage_query(
     })
 }
 
+fn normalize_usage_metrics_query(
+    request: UsageMetricsRequest,
+) -> Result<UsageMetricsQuery, &'static str> {
+    let source = match request
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => UsageEventSource::from_query_value(value)
+            .ok_or("source must be one of hot, archive, or all")?,
+        None => UsageEventSource::All,
+    };
+    let window = request
+        .window
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or(DEFAULT_USAGE_METRICS_WINDOW);
+    let window_ms = match window {
+        "15m" => 15 * 60 * 1000,
+        "1h" => 60 * 60 * 1000,
+        "6h" => 6 * 60 * 60 * 1000,
+        "24h" => 24 * 60 * 60 * 1000,
+        _ => return Err("window must be one of 15m, 1h, 6h, or 24h"),
+    };
+    let end_ms = now_ms();
+    Ok(UsageMetricsQuery {
+        provider_type: request
+            .provider_type
+            .and_then(|value| normalize_optional_string(&value)),
+        source,
+        start_ms: end_ms.saturating_sub(window_ms),
+        end_ms,
+        top_limit: request
+            .top_limit
+            .unwrap_or(DEFAULT_USAGE_METRICS_TOP_LIMIT)
+            .clamp(1, MAX_USAGE_METRICS_TOP_LIMIT),
+    })
+}
+
 impl From<&UsageEvent> for AdminUsageEventView {
     fn from(value: &UsageEvent) -> Self {
         let latency_ms = usage_latency_ms(value);
@@ -548,7 +634,10 @@ fn now_ms() -> i64 {
 mod tests {
     use llm_access_core::store::{UsageEventPage, UsageEventSource, UsageEventStatusKind};
 
-    use super::{normalize_usage_query, response_from_page, ListUsageEventsRequest};
+    use super::{
+        normalize_usage_metrics_query, normalize_usage_query, response_from_page,
+        ListUsageEventsRequest, UsageMetricsRequest,
+    };
 
     #[test]
     fn normalize_usage_query_accepts_explicit_archive_source() {
@@ -691,5 +780,26 @@ mod tests {
             llm_access_core::store::DEFAULT_USAGE_ANALYTICS_RETENTION_DAYS
         );
         assert_eq!(response.totals.event_count, 0);
+    }
+
+    #[test]
+    fn normalize_usage_metrics_query_defaults_to_recent_all_sources() {
+        let query = normalize_usage_metrics_query(UsageMetricsRequest::default())
+            .expect("default metrics query should normalize");
+
+        assert_eq!(query.source, UsageEventSource::All);
+        assert_eq!(query.top_limit, 10);
+        assert_eq!(query.end_ms.saturating_sub(query.start_ms), 60 * 60 * 1000);
+    }
+
+    #[test]
+    fn normalize_usage_metrics_query_rejects_unknown_window() {
+        let err = normalize_usage_metrics_query(UsageMetricsRequest {
+            window: Some("3d".to_string()),
+            ..UsageMetricsRequest::default()
+        })
+        .expect_err("unknown metrics window should fail");
+
+        assert!(err.contains("window must be one of"));
     }
 }

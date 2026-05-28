@@ -55,11 +55,12 @@ fn run() -> anyhow::Result<()> {
             format!("missing control database env `{}`", storage.control_store.database_url_env)
         })?;
     let request_cache_config = resolve_request_cache_config(&storage)?;
-    let control: Arc<dyn AdminConfigStore> = runtime.block_on(async {
-        Ok::<Arc<dyn AdminConfigStore>, anyhow::Error>(Arc::new(
-            PostgresControlRepository::connect(&database_url, request_cache_config.clone()).await?,
-        ) as Arc<dyn AdminConfigStore>)
+    let control_repo: Arc<PostgresControlRepository> = runtime.block_on(async {
+        PostgresControlRepository::connect(&database_url, request_cache_config.clone())
+            .await
+            .map(Arc::new)
     })?;
+    let control: Arc<dyn AdminConfigStore> = control_repo.clone();
     let runtime_config = runtime.block_on(control.get_admin_runtime_config())?;
     let bind_addr = if explicit_bind {
         bind_addr
@@ -103,6 +104,11 @@ fn run() -> anyhow::Result<()> {
                 runtime_config.usage_journal_consumer_lease_ms,
                 runtime_config.usage_analytics_retention_days,
             )?
+            .with_attribution_resolver(Some(Arc::new(
+                llm_access::usage_worker::UsageEventAttributionResolver::new(Arc::clone(
+                    &control_repo,
+                )),
+            )))
             .with_cluster_state(cluster_state.clone());
             maintenance = Some(PrimaryMaintenanceHandles {
                 duckdb_usage: primary.usage_repository(),

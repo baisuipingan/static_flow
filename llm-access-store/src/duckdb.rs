@@ -26,8 +26,9 @@ use llm_access_core::{
     store::{
         AdminRuntimeConfig, UsageAnalyticsStore, UsageChartPoint, UsageEventPage, UsageEventQuery,
         UsageEventSink, UsageEventSource, UsageEventStatusKind, UsageEventTotals,
-        UsageFilterOptions, DEFAULT_DUCKDB_USAGE_CHECKPOINT_THRESHOLD_MIB,
-        DEFAULT_DUCKDB_USAGE_MEMORY_LIMIT_MIB,
+        UsageFilterOptions, UsageMetricsDimensionView, UsageMetricsQuery, UsageMetricsSnapshot,
+        UsageMetricsStatusCodeView, UsageMetricsSummary,
+        DEFAULT_DUCKDB_USAGE_CHECKPOINT_THRESHOLD_MIB, DEFAULT_DUCKDB_USAGE_MEMORY_LIMIT_MIB,
     },
     usage::{UsageEvent, UsageStreamDetails, UsageTiming},
 };
@@ -146,6 +147,14 @@ pub struct UsageEventRow {
     pub request_headers_json: String,
     /// Last message content preview.
     pub last_message_content: Option<String>,
+    /// Effective proxy source captured at event time.
+    pub proxy_source_at_event: Option<String>,
+    /// Effective proxy config id captured at event time.
+    pub proxy_config_id_at_event: Option<String>,
+    /// Effective proxy config name captured at event time.
+    pub proxy_config_name_at_event: Option<String>,
+    /// Effective proxy URL captured at event time.
+    pub proxy_url_at_event: Option<String>,
     /// Client request body JSON when captured.
     pub client_request_body_json: Option<String>,
     /// Upstream request body JSON when captured.
@@ -227,6 +236,10 @@ impl UsageEventRow {
             ip_region: Some(event.ip_region.clone()),
             request_headers_json: event.request_headers_json.clone(),
             last_message_content: event.last_message_content.clone(),
+            proxy_source_at_event: None,
+            proxy_config_id_at_event: None,
+            proxy_config_name_at_event: None,
+            proxy_url_at_event: None,
             client_request_body_json: event.client_request_body_json.clone(),
             upstream_request_body_json: event.upstream_request_body_json.clone(),
             full_request_json: event.full_request_json.clone(),
@@ -243,6 +256,20 @@ impl UsageEventRow {
             detail_object_length: None,
             detail_object_sha256: None,
         }
+    }
+
+    /// Apply worker-time proxy attribution metadata to one fact row.
+    pub fn with_proxy_attribution(
+        mut self,
+        attribution: Option<&crate::postgres::UsageProxyAttribution>,
+    ) -> Self {
+        if let Some(attribution) = attribution {
+            self.proxy_source_at_event = Some(attribution.proxy_source.clone());
+            self.proxy_config_id_at_event = attribution.proxy_config_id.clone();
+            self.proxy_config_name_at_event = attribution.proxy_config_name.clone();
+            self.proxy_url_at_event = attribution.proxy_url.clone();
+        }
+        self
     }
 }
 
@@ -274,7 +301,9 @@ pub fn insert_usage_event_sql() -> &'static str {
         output_tokens, billable_tokens, credit_usage, usage_missing,
         credit_usage_missing, client_ip, ip_region, request_headers_json,
         routing_diagnostics_json, last_message_content, detail_object_payload_present,
-        detail_object_path, detail_object_offset, detail_object_length, detail_object_sha256
+        detail_object_path, detail_object_offset, detail_object_length, detail_object_sha256,
+        proxy_source_at_event, proxy_config_id_at_event, proxy_config_name_at_event,
+        proxy_url_at_event
      ) VALUES (
         ?1, ?2, ?3, ?4, to_timestamp(?4 / 1000.0),
         CAST(to_timestamp(?4 / 1000.0) AS DATE),
@@ -282,7 +311,7 @@ pub fn insert_usage_event_sql() -> &'static str {
         ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18,
         ?19, ?20, ?21, ?22, ?23, ?24, ?25, ?26, ?27, ?28, ?29, ?30, ?31,
         ?32, ?33, ?34, ?35, ?36, ?37, ?38, ?39, ?40, ?41, ?42, ?43, ?44, ?45, ?46,
-        ?47, ?48, ?49, ?50
+        ?47, ?48, ?49, ?50, ?51, ?52, ?53, ?54
      )
      ON CONFLICT DO NOTHING"
 }
@@ -420,6 +449,10 @@ fn compact_copy_usage_events_sql(columns: &HashSet<String>) -> String {
         compact_source_column_expr(columns, "detail_object_offset", "CAST(NULL AS BIGINT)"),
         compact_source_column_expr(columns, "detail_object_length", "CAST(NULL AS BIGINT)"),
         compact_source_column_expr(columns, "detail_object_sha256", "CAST(NULL AS VARCHAR)"),
+        compact_source_column_expr(columns, "proxy_source_at_event", "CAST(NULL AS VARCHAR)"),
+        compact_source_column_expr(columns, "proxy_config_id_at_event", "CAST(NULL AS VARCHAR)"),
+        compact_source_column_expr(columns, "proxy_config_name_at_event", "CAST(NULL AS VARCHAR)"),
+        compact_source_column_expr(columns, "proxy_url_at_event", "CAST(NULL AS VARCHAR)"),
     ]
     .join(",\n        ");
 
@@ -438,7 +471,9 @@ fn compact_copy_usage_events_sql(columns: &HashSet<String>) -> String {
         output_tokens, billable_tokens, credit_usage, usage_missing,
         credit_usage_missing, client_ip, ip_region, request_headers_json,
         routing_diagnostics_json, last_message_content, detail_object_payload_present,
-        detail_object_path, detail_object_offset, detail_object_length, detail_object_sha256
+        detail_object_path, detail_object_offset, detail_object_length, detail_object_sha256,
+        proxy_source_at_event, proxy_config_id_at_event, proxy_config_name_at_event,
+        proxy_url_at_event
     )
     SELECT
         {select}
@@ -1214,6 +1249,10 @@ fn execute_usage_event_insert(
         row.detail_object_offset,
         row.detail_object_length,
         row.detail_object_sha256.as_deref(),
+        row.proxy_source_at_event.as_deref(),
+        row.proxy_config_id_at_event.as_deref(),
+        row.proxy_config_name_at_event.as_deref(),
+        row.proxy_url_at_event.as_deref(),
     ])?;
     Ok(())
 }
@@ -1717,6 +1756,66 @@ impl DuckDbUsageRepository {
         }
         UsageEventSink::append_usage_events(self, &deduped).await?;
         Ok(deduped.len())
+    }
+
+    /// Append already-enriched fact rows after removing only in-memory
+    /// duplicates from the same call.
+    pub async fn append_usage_event_rows_owned(
+        &self,
+        rows: Vec<UsageEventRow>,
+    ) -> anyhow::Result<()> {
+        if rows.is_empty() {
+            return Ok(());
+        }
+        let inner = Arc::clone(&self.inner);
+        let mut seen = HashSet::new();
+        let deduped = rows
+            .into_iter()
+            .filter(|row| seen.insert(row.event_id.clone()))
+            .collect::<Vec<_>>();
+        if deduped.is_empty() {
+            return Ok(());
+        }
+        match inner.as_ref() {
+            DuckDbUsageRepositoryInner::Single {
+                ..
+            } => {
+                let inner = Arc::clone(&inner);
+                task::spawn_blocking(move || match inner.as_ref() {
+                    DuckDbUsageRepositoryInner::Single {
+                        state,
+                        connection_config,
+                    } => {
+                        let mut state = state
+                            .lock()
+                            .map_err(|_| anyhow!("single duckdb state lock poisoned"))?;
+                        let writer = ensure_single_writer(
+                            &mut state,
+                            connection_config_snapshot(connection_config),
+                        )?;
+                        writer.writer.summary.insert_usage_events(&deduped)
+                    },
+                    _ => unreachable!("single branch expected"),
+                })
+                .await
+                .context("duckdb usage row insert task failed")?
+            },
+            DuckDbUsageRepositoryInner::Tiered {
+                config,
+                state,
+                catalog_backend,
+                connection_config,
+            } => {
+                append_usage_events_to_tiered(
+                    config,
+                    state,
+                    connection_config,
+                    catalog_backend,
+                    &deduped,
+                )
+                .await
+            },
+        }
     }
 }
 
@@ -3971,7 +4070,6 @@ impl UsageEventSink for DuckDbUsageRepository {
         if events.is_empty() {
             return Ok(());
         }
-        let inner = Arc::clone(&self.inner);
         let deduped = dedupe_usage_events_owned(events);
         if deduped.is_empty() {
             return Ok(());
@@ -3980,46 +4078,7 @@ impl UsageEventSink for DuckDbUsageRepository {
             .iter()
             .map(UsageEventRow::from_usage_event)
             .collect::<Vec<_>>();
-        match inner.as_ref() {
-            DuckDbUsageRepositoryInner::Single {
-                ..
-            } => {
-                let inner = Arc::clone(&inner);
-                task::spawn_blocking(move || match inner.as_ref() {
-                    DuckDbUsageRepositoryInner::Single {
-                        state,
-                        connection_config,
-                    } => {
-                        let mut state = state
-                            .lock()
-                            .map_err(|_| anyhow!("single duckdb state lock poisoned"))?;
-                        let writer = ensure_single_writer(
-                            &mut state,
-                            connection_config_snapshot(connection_config),
-                        )?;
-                        writer.writer.summary.insert_usage_events(&rows)
-                    },
-                    _ => unreachable!("single branch expected"),
-                })
-                .await
-                .context("duckdb usage insert task failed")?
-            },
-            DuckDbUsageRepositoryInner::Tiered {
-                config,
-                state,
-                catalog_backend,
-                connection_config,
-            } => {
-                append_usage_events_to_tiered(
-                    config,
-                    state,
-                    connection_config,
-                    catalog_backend,
-                    &rows,
-                )
-                .await
-            },
-        }
+        self.append_usage_event_rows_owned(rows).await
     }
 }
 
@@ -4173,6 +4232,33 @@ impl UsageAnalyticsStore for DuckDbUsageRepository {
         })
         .await
         .context("duckdb usage filter options task failed")?
+    }
+
+    async fn usage_metrics_snapshot(
+        &self,
+        query: UsageMetricsQuery,
+    ) -> anyhow::Result<UsageMetricsSnapshot> {
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || match inner.as_ref() {
+            DuckDbUsageRepositoryInner::Single {
+                state, ..
+            } => {
+                let path = {
+                    let state = state
+                        .lock()
+                        .map_err(|_| anyhow!("single duckdb state lock poisoned"))?;
+                    state.path.clone()
+                };
+                usage_metrics_snapshot_from_path(&path, &query)
+            },
+            DuckDbUsageRepositoryInner::Tiered {
+                state,
+                catalog_backend,
+                ..
+            } => usage_metrics_snapshot_from_tiered(state, catalog_backend.as_ref(), &query),
+        })
+        .await
+        .context("duckdb usage metrics task failed")?
     }
 }
 
@@ -4998,6 +5084,709 @@ fn merge_usage_event_totals(target: &mut UsageEventTotals, added: &UsageEventTot
 }
 
 #[cfg(feature = "duckdb-runtime")]
+#[derive(Default)]
+struct UsageMetricsSummaryAccumulator {
+    total_requests: u64,
+    ok_requests: u64,
+    non_ok_requests: u64,
+    first_token_sum_ms: i64,
+    first_token_samples: u64,
+    max_first_token_ms: Option<i64>,
+    latency_sum_ms: i64,
+    latency_samples: u64,
+    routing_wait_sum_ms: i64,
+    routing_wait_samples: u64,
+    failover_request_count: u64,
+    total_quota_failovers: u64,
+    downstream_disconnect_count: u64,
+    usage_missing_count: u64,
+    credit_usage_missing_count: u64,
+}
+
+#[cfg(feature = "duckdb-runtime")]
+#[derive(Clone, Default)]
+struct UsageMetricsGroupAccumulator {
+    key: String,
+    label: String,
+    account_name: Option<String>,
+    proxy_config_id: Option<String>,
+    proxy_config_name: Option<String>,
+    proxy_url: Option<String>,
+    proxy_source: Option<String>,
+    request_count: u64,
+    ok_count: u64,
+    non_ok_count: u64,
+    first_token_sum_ms: i64,
+    first_token_samples: u64,
+    max_first_token_ms: Option<i64>,
+    routing_wait_sum_ms: i64,
+    routing_wait_samples: u64,
+    max_routing_wait_ms: Option<i64>,
+    failover_request_count: u64,
+    total_quota_failovers: u64,
+    downstream_disconnect_count: u64,
+    usage_missing_count: u64,
+    credit_usage_missing_count: u64,
+}
+
+#[cfg(feature = "duckdb-runtime")]
+#[derive(Default)]
+struct UsageMetricsAccumulator {
+    summary: UsageMetricsSummaryAccumulator,
+    distinct_accounts: BTreeSet<String>,
+    distinct_proxies: BTreeSet<String>,
+    accounts: BTreeMap<String, UsageMetricsGroupAccumulator>,
+    proxies: BTreeMap<String, UsageMetricsGroupAccumulator>,
+    non_ok_status_codes: BTreeMap<i32, u64>,
+}
+
+#[cfg(feature = "duckdb-runtime")]
+struct UsageMetricsObservedRow {
+    account_name: Option<String>,
+    status_code: i32,
+    first_sse_write_ms: Option<i64>,
+    latency_ms: Option<i64>,
+    routing_wait_ms: Option<i64>,
+    quota_failover_count: u64,
+    downstream_disconnect: bool,
+    usage_missing: bool,
+    credit_usage_missing: bool,
+    proxy_source: Option<String>,
+    proxy_config_id: Option<String>,
+    proxy_config_name: Option<String>,
+    proxy_url: Option<String>,
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn normalize_metrics_optional_string(value: Option<String>) -> Option<String> {
+    value
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn average_metric_ms(sum_ms: i64, samples: u64) -> Option<f64> {
+    (samples > 0).then(|| sum_ms as f64 / samples as f64)
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn error_rate(group: &UsageMetricsGroupAccumulator) -> Option<f64> {
+    (group.request_count > 0).then(|| group.non_ok_count as f64 / group.request_count as f64)
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn disconnect_rate(group: &UsageMetricsGroupAccumulator) -> Option<f64> {
+    (group.request_count > 0)
+        .then(|| group.downstream_disconnect_count as f64 / group.request_count as f64)
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn cmp_option_f64_desc(left: Option<f64>, right: Option<f64>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => right
+            .partial_cmp(&left)
+            .unwrap_or(std::cmp::Ordering::Equal),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn cmp_option_i64_desc(left: Option<i64>, right: Option<i64>) -> std::cmp::Ordering {
+    match (left, right) {
+        (Some(left), Some(right)) => right.cmp(&left),
+        (Some(_), None) => std::cmp::Ordering::Less,
+        (None, Some(_)) => std::cmp::Ordering::Greater,
+        (None, None) => std::cmp::Ordering::Equal,
+    }
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn metrics_account_key(account_name: Option<&str>) -> String {
+    account_name
+        .map(|value| format!("account:{value}"))
+        .unwrap_or_else(|| "account:unknown".to_string())
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn metrics_account_label(account_name: Option<&str>) -> String {
+    account_name.unwrap_or("(unknown account)").to_string()
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn metrics_proxy_key(
+    proxy_config_id: Option<&str>,
+    proxy_url: Option<&str>,
+    proxy_source: Option<&str>,
+) -> String {
+    if let Some(value) = proxy_config_id {
+        return format!("proxy:id:{value}");
+    }
+    if let Some(value) = proxy_url {
+        return format!("proxy:url:{value}");
+    }
+    if let Some(value) = proxy_source {
+        return format!("proxy:source:{value}");
+    }
+    "proxy:unknown".to_string()
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn metrics_proxy_label(
+    proxy_config_name: Option<&str>,
+    proxy_url: Option<&str>,
+    proxy_source: Option<&str>,
+) -> String {
+    proxy_config_name
+        .or(proxy_url)
+        .or(proxy_source)
+        .unwrap_or("(unknown proxy)")
+        .to_string()
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn update_usage_metrics_group(
+    group: &mut UsageMetricsGroupAccumulator,
+    row: &UsageMetricsObservedRow,
+    is_ok: bool,
+) {
+    group.request_count = group.request_count.saturating_add(1);
+    if is_ok {
+        group.ok_count = group.ok_count.saturating_add(1);
+    } else {
+        group.non_ok_count = group.non_ok_count.saturating_add(1);
+    }
+    if let Some(value) = row.first_sse_write_ms {
+        group.first_token_sum_ms = group.first_token_sum_ms.saturating_add(value);
+        group.first_token_samples = group.first_token_samples.saturating_add(1);
+        group.max_first_token_ms = Some(group.max_first_token_ms.unwrap_or(value).max(value));
+    }
+    if let Some(value) = row.routing_wait_ms {
+        group.routing_wait_sum_ms = group.routing_wait_sum_ms.saturating_add(value);
+        group.routing_wait_samples = group.routing_wait_samples.saturating_add(1);
+        group.max_routing_wait_ms = Some(group.max_routing_wait_ms.unwrap_or(value).max(value));
+    }
+    if row.quota_failover_count > 0 {
+        group.failover_request_count = group.failover_request_count.saturating_add(1);
+        group.total_quota_failovers = group
+            .total_quota_failovers
+            .saturating_add(row.quota_failover_count);
+    }
+    if row.downstream_disconnect {
+        group.downstream_disconnect_count = group.downstream_disconnect_count.saturating_add(1);
+    }
+    if row.usage_missing {
+        group.usage_missing_count = group.usage_missing_count.saturating_add(1);
+    }
+    if row.credit_usage_missing {
+        group.credit_usage_missing_count = group.credit_usage_missing_count.saturating_add(1);
+    }
+}
+
+#[cfg(feature = "duckdb-runtime")]
+impl UsageMetricsAccumulator {
+    fn observe(&mut self, row: UsageMetricsObservedRow) {
+        let normalized_account_name = normalize_metrics_optional_string(row.account_name.clone());
+        let normalized_proxy_source = normalize_metrics_optional_string(row.proxy_source.clone());
+        let normalized_proxy_config_id =
+            normalize_metrics_optional_string(row.proxy_config_id.clone());
+        let normalized_proxy_config_name =
+            normalize_metrics_optional_string(row.proxy_config_name.clone());
+        let normalized_proxy_url = normalize_metrics_optional_string(row.proxy_url.clone());
+        let is_ok = row.status_code == 200;
+
+        self.summary.total_requests = self.summary.total_requests.saturating_add(1);
+        if is_ok {
+            self.summary.ok_requests = self.summary.ok_requests.saturating_add(1);
+        } else {
+            self.summary.non_ok_requests = self.summary.non_ok_requests.saturating_add(1);
+            self.non_ok_status_codes
+                .entry(row.status_code)
+                .and_modify(|count| *count = count.saturating_add(1))
+                .or_insert(1);
+        }
+        if let Some(value) = row.first_sse_write_ms {
+            self.summary.first_token_sum_ms = self.summary.first_token_sum_ms.saturating_add(value);
+            self.summary.first_token_samples = self.summary.first_token_samples.saturating_add(1);
+            self.summary.max_first_token_ms =
+                Some(self.summary.max_first_token_ms.unwrap_or(value).max(value));
+        }
+        if let Some(value) = row.latency_ms {
+            self.summary.latency_sum_ms = self.summary.latency_sum_ms.saturating_add(value);
+            self.summary.latency_samples = self.summary.latency_samples.saturating_add(1);
+        }
+        if let Some(value) = row.routing_wait_ms {
+            self.summary.routing_wait_sum_ms =
+                self.summary.routing_wait_sum_ms.saturating_add(value);
+            self.summary.routing_wait_samples = self.summary.routing_wait_samples.saturating_add(1);
+        }
+        if row.quota_failover_count > 0 {
+            self.summary.failover_request_count =
+                self.summary.failover_request_count.saturating_add(1);
+            self.summary.total_quota_failovers = self
+                .summary
+                .total_quota_failovers
+                .saturating_add(row.quota_failover_count);
+        }
+        if row.downstream_disconnect {
+            self.summary.downstream_disconnect_count =
+                self.summary.downstream_disconnect_count.saturating_add(1);
+        }
+        if row.usage_missing {
+            self.summary.usage_missing_count = self.summary.usage_missing_count.saturating_add(1);
+        }
+        if row.credit_usage_missing {
+            self.summary.credit_usage_missing_count =
+                self.summary.credit_usage_missing_count.saturating_add(1);
+        }
+
+        let account_key = metrics_account_key(normalized_account_name.as_deref());
+        let account_label = metrics_account_label(normalized_account_name.as_deref());
+        self.distinct_accounts.insert(account_key.clone());
+        let account_group = self.accounts.entry(account_key.clone()).or_insert_with(|| {
+            UsageMetricsGroupAccumulator {
+                key: account_key.clone(),
+                label: account_label.clone(),
+                account_name: normalized_account_name.clone(),
+                ..UsageMetricsGroupAccumulator::default()
+            }
+        });
+        update_usage_metrics_group(account_group, &row, is_ok);
+
+        let proxy_key = metrics_proxy_key(
+            normalized_proxy_config_id.as_deref(),
+            normalized_proxy_url.as_deref(),
+            normalized_proxy_source.as_deref(),
+        );
+        let proxy_label = metrics_proxy_label(
+            normalized_proxy_config_name.as_deref(),
+            normalized_proxy_url.as_deref(),
+            normalized_proxy_source.as_deref(),
+        );
+        self.distinct_proxies.insert(proxy_key.clone());
+        let proxy_group =
+            self.proxies
+                .entry(proxy_key.clone())
+                .or_insert_with(|| UsageMetricsGroupAccumulator {
+                    key: proxy_key.clone(),
+                    label: proxy_label.clone(),
+                    proxy_config_id: normalized_proxy_config_id.clone(),
+                    proxy_config_name: normalized_proxy_config_name.clone(),
+                    proxy_url: normalized_proxy_url.clone(),
+                    proxy_source: normalized_proxy_source.clone(),
+                    ..UsageMetricsGroupAccumulator::default()
+                });
+        if proxy_group.proxy_config_id.is_none() {
+            proxy_group.proxy_config_id = normalized_proxy_config_id.clone();
+        }
+        if proxy_group.proxy_config_name.is_none() {
+            proxy_group.proxy_config_name = normalized_proxy_config_name.clone();
+        }
+        if proxy_group.proxy_url.is_none() {
+            proxy_group.proxy_url = normalized_proxy_url.clone();
+        }
+        if proxy_group.proxy_source.is_none() {
+            proxy_group.proxy_source = normalized_proxy_source.clone();
+        }
+        update_usage_metrics_group(proxy_group, &row, is_ok);
+    }
+
+    fn into_snapshot(self, query: &UsageMetricsQuery) -> UsageMetricsSnapshot {
+        let top_limit = query.top_limit.max(1);
+        let non_ok_status_codes = {
+            let mut rows = self
+                .non_ok_status_codes
+                .into_iter()
+                .map(|(status_code, request_count)| UsageMetricsStatusCodeView {
+                    status_code,
+                    request_count,
+                })
+                .collect::<Vec<_>>();
+            rows.sort_by(|left, right| {
+                right
+                    .request_count
+                    .cmp(&left.request_count)
+                    .then_with(|| left.status_code.cmp(&right.status_code))
+            });
+            rows.truncate(top_limit);
+            rows
+        };
+        UsageMetricsSnapshot {
+            generated_at_ms: now_ms(),
+            start_ms: query.start_ms,
+            end_ms: query.end_ms,
+            provider_type: query.provider_type.clone(),
+            source: query.source,
+            summary: UsageMetricsSummary {
+                total_requests: self.summary.total_requests,
+                ok_requests: self.summary.ok_requests,
+                non_ok_requests: self.summary.non_ok_requests,
+                distinct_accounts: self.distinct_accounts.len(),
+                distinct_proxies: self.distinct_proxies.len(),
+                first_token_samples: self.summary.first_token_samples,
+                avg_first_token_ms: average_metric_ms(
+                    self.summary.first_token_sum_ms,
+                    self.summary.first_token_samples,
+                ),
+                max_first_token_ms: self.summary.max_first_token_ms,
+                avg_latency_ms: average_metric_ms(
+                    self.summary.latency_sum_ms,
+                    self.summary.latency_samples,
+                ),
+                avg_routing_wait_ms: average_metric_ms(
+                    self.summary.routing_wait_sum_ms,
+                    self.summary.routing_wait_samples,
+                ),
+                failover_request_count: self.summary.failover_request_count,
+                total_quota_failovers: self.summary.total_quota_failovers,
+                downstream_disconnect_count: self.summary.downstream_disconnect_count,
+                usage_missing_count: self.summary.usage_missing_count,
+                credit_usage_missing_count: self.summary.credit_usage_missing_count,
+            },
+            top_first_token_accounts: top_usage_metrics_groups(
+                &self.accounts,
+                top_limit,
+                |left, right| {
+                    cmp_option_f64_desc(
+                        average_metric_ms(left.first_token_sum_ms, left.first_token_samples),
+                        average_metric_ms(right.first_token_sum_ms, right.first_token_samples),
+                    )
+                    .then_with(|| {
+                        cmp_option_i64_desc(left.max_first_token_ms, right.max_first_token_ms)
+                    })
+                },
+            ),
+            top_first_token_proxies: top_usage_metrics_groups(
+                &self.proxies,
+                top_limit,
+                |left, right| {
+                    cmp_option_f64_desc(
+                        average_metric_ms(left.first_token_sum_ms, left.first_token_samples),
+                        average_metric_ms(right.first_token_sum_ms, right.first_token_samples),
+                    )
+                    .then_with(|| {
+                        cmp_option_i64_desc(left.max_first_token_ms, right.max_first_token_ms)
+                    })
+                },
+            ),
+            top_non_ok_accounts: top_usage_metrics_groups(
+                &self.accounts,
+                top_limit,
+                |left, right| {
+                    right
+                        .non_ok_count
+                        .cmp(&left.non_ok_count)
+                        .then_with(|| cmp_option_f64_desc(error_rate(left), error_rate(right)))
+                },
+            ),
+            top_non_ok_proxies: top_usage_metrics_groups(
+                &self.proxies,
+                top_limit,
+                |left, right| {
+                    right
+                        .non_ok_count
+                        .cmp(&left.non_ok_count)
+                        .then_with(|| cmp_option_f64_desc(error_rate(left), error_rate(right)))
+                },
+            ),
+            top_routing_wait_accounts: top_usage_metrics_groups(
+                &self.accounts,
+                top_limit,
+                |left, right| {
+                    cmp_option_f64_desc(
+                        average_metric_ms(left.routing_wait_sum_ms, left.routing_wait_samples),
+                        average_metric_ms(right.routing_wait_sum_ms, right.routing_wait_samples),
+                    )
+                    .then_with(|| {
+                        cmp_option_i64_desc(left.max_routing_wait_ms, right.max_routing_wait_ms)
+                    })
+                },
+            ),
+            top_routing_wait_proxies: top_usage_metrics_groups(
+                &self.proxies,
+                top_limit,
+                |left, right| {
+                    cmp_option_f64_desc(
+                        average_metric_ms(left.routing_wait_sum_ms, left.routing_wait_samples),
+                        average_metric_ms(right.routing_wait_sum_ms, right.routing_wait_samples),
+                    )
+                    .then_with(|| {
+                        cmp_option_i64_desc(left.max_routing_wait_ms, right.max_routing_wait_ms)
+                    })
+                },
+            ),
+            top_failover_accounts: top_usage_metrics_groups(
+                &self.accounts,
+                top_limit,
+                |left, right| {
+                    right
+                        .failover_request_count
+                        .cmp(&left.failover_request_count)
+                        .then_with(|| right.total_quota_failovers.cmp(&left.total_quota_failovers))
+                },
+            ),
+            top_failover_proxies: top_usage_metrics_groups(
+                &self.proxies,
+                top_limit,
+                |left, right| {
+                    right
+                        .failover_request_count
+                        .cmp(&left.failover_request_count)
+                        .then_with(|| right.total_quota_failovers.cmp(&left.total_quota_failovers))
+                },
+            ),
+            top_disconnect_accounts: top_usage_metrics_groups(
+                &self.accounts,
+                top_limit,
+                |left, right| {
+                    right
+                        .downstream_disconnect_count
+                        .cmp(&left.downstream_disconnect_count)
+                        .then_with(|| {
+                            cmp_option_f64_desc(disconnect_rate(left), disconnect_rate(right))
+                        })
+                },
+            ),
+            top_disconnect_proxies: top_usage_metrics_groups(
+                &self.proxies,
+                top_limit,
+                |left, right| {
+                    right
+                        .downstream_disconnect_count
+                        .cmp(&left.downstream_disconnect_count)
+                        .then_with(|| {
+                            cmp_option_f64_desc(disconnect_rate(left), disconnect_rate(right))
+                        })
+                },
+            ),
+            non_ok_status_codes,
+        }
+    }
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn usage_metrics_group_view(group: &UsageMetricsGroupAccumulator) -> UsageMetricsDimensionView {
+    UsageMetricsDimensionView {
+        key: group.key.clone(),
+        label: group.label.clone(),
+        account_name: group.account_name.clone(),
+        proxy_config_id: group.proxy_config_id.clone(),
+        proxy_config_name: group.proxy_config_name.clone(),
+        proxy_url: group.proxy_url.clone(),
+        proxy_source: group.proxy_source.clone(),
+        request_count: group.request_count,
+        ok_count: group.ok_count,
+        non_ok_count: group.non_ok_count,
+        first_token_samples: group.first_token_samples,
+        avg_first_token_ms: average_metric_ms(group.first_token_sum_ms, group.first_token_samples),
+        max_first_token_ms: group.max_first_token_ms,
+        routing_wait_samples: group.routing_wait_samples,
+        avg_routing_wait_ms: average_metric_ms(
+            group.routing_wait_sum_ms,
+            group.routing_wait_samples,
+        ),
+        max_routing_wait_ms: group.max_routing_wait_ms,
+        failover_request_count: group.failover_request_count,
+        total_quota_failovers: group.total_quota_failovers,
+        downstream_disconnect_count: group.downstream_disconnect_count,
+        usage_missing_count: group.usage_missing_count,
+        credit_usage_missing_count: group.credit_usage_missing_count,
+    }
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn top_usage_metrics_groups<F>(
+    groups: &BTreeMap<String, UsageMetricsGroupAccumulator>,
+    limit: usize,
+    mut compare: F,
+) -> Vec<UsageMetricsDimensionView>
+where
+    F: FnMut(&UsageMetricsGroupAccumulator, &UsageMetricsGroupAccumulator) -> std::cmp::Ordering,
+{
+    let mut groups = groups.values().collect::<Vec<_>>();
+    groups.sort_by(|left, right| {
+        compare(left, right)
+            .then_with(|| right.request_count.cmp(&left.request_count))
+            .then_with(|| left.label.cmp(&right.label))
+            .then_with(|| left.key.cmp(&right.key))
+    });
+    groups
+        .into_iter()
+        .take(limit)
+        .map(usage_metrics_group_view)
+        .collect()
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn usage_metrics_sql(conn: &duckdb::Connection) -> anyhow::Result<String> {
+    let columns = duckdb_table_columns(conn, "usage_events")?;
+    let select = [
+        usage_event_column_expr(&columns, "account_name", "CAST(NULL AS VARCHAR)"),
+        usage_event_expr(
+            &columns,
+            "status_code",
+            "CAST(e.status_code AS INTEGER)",
+            "CAST(0 AS INTEGER)",
+        ),
+        usage_event_expr(
+            &columns,
+            "first_sse_write_ms",
+            "CAST(e.first_sse_write_ms AS BIGINT)",
+            "CAST(NULL AS BIGINT)",
+        ),
+        usage_event_expr(
+            &columns,
+            "latency_ms",
+            "CAST(e.latency_ms AS BIGINT)",
+            "CAST(NULL AS BIGINT)",
+        ),
+        usage_event_expr(
+            &columns,
+            "routing_wait_ms",
+            "CAST(e.routing_wait_ms AS BIGINT)",
+            "CAST(NULL AS BIGINT)",
+        ),
+        usage_event_expr(
+            &columns,
+            "quota_failover_count",
+            "CAST(e.quota_failover_count AS BIGINT)",
+            "CAST(0 AS BIGINT)",
+        ),
+        usage_event_expr(
+            &columns,
+            "downstream_disconnect",
+            "COALESCE(e.downstream_disconnect, FALSE)",
+            "FALSE",
+        ),
+        usage_event_expr(&columns, "usage_missing", "COALESCE(e.usage_missing, FALSE)", "FALSE"),
+        usage_event_expr(
+            &columns,
+            "credit_usage_missing",
+            "COALESCE(e.credit_usage_missing, FALSE)",
+            "FALSE",
+        ),
+        usage_event_column_expr(&columns, "proxy_source_at_event", "CAST(NULL AS VARCHAR)"),
+        usage_event_column_expr(&columns, "proxy_config_id_at_event", "CAST(NULL AS VARCHAR)"),
+        usage_event_column_expr(&columns, "proxy_config_name_at_event", "CAST(NULL AS VARCHAR)"),
+        usage_event_column_expr(&columns, "proxy_url_at_event", "CAST(NULL AS VARCHAR)"),
+    ]
+    .join(",\n            ");
+    Ok(format!(
+        "SELECT
+            {select}
+         FROM usage_events e
+         WHERE (?1 IS NULL OR e.provider_type = ?1)
+           AND e.created_at_ms >= ?2
+           AND e.created_at_ms < ?3"
+    ))
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn accumulate_usage_metrics_from_conn(
+    accumulator: &mut UsageMetricsAccumulator,
+    conn: &duckdb::Connection,
+    query: &UsageMetricsQuery,
+) -> anyhow::Result<()> {
+    let sql = usage_metrics_sql(conn)?;
+    let mut stmt = conn
+        .prepare(&sql)
+        .context("prepare duckdb usage metrics query")?;
+    let rows = stmt
+        .query_map(
+            duckdb::params![query.provider_type.as_deref(), query.start_ms, query.end_ms],
+            |row| {
+                Ok(UsageMetricsObservedRow {
+                    account_name: normalize_metrics_optional_string(
+                        row.get::<_, Option<String>>(0)?,
+                    ),
+                    status_code: row.get::<_, i32>(1)?,
+                    first_sse_write_ms: row.get::<_, Option<i64>>(2)?,
+                    latency_ms: row.get::<_, Option<i64>>(3)?,
+                    routing_wait_ms: row.get::<_, Option<i64>>(4)?,
+                    quota_failover_count: row.get::<_, i64>(5)?.max(0) as u64,
+                    downstream_disconnect: row.get::<_, bool>(6)?,
+                    usage_missing: row.get::<_, bool>(7)?,
+                    credit_usage_missing: row.get::<_, bool>(8)?,
+                    proxy_source: normalize_metrics_optional_string(
+                        row.get::<_, Option<String>>(9)?,
+                    ),
+                    proxy_config_id: normalize_metrics_optional_string(
+                        row.get::<_, Option<String>>(10)?,
+                    ),
+                    proxy_config_name: normalize_metrics_optional_string(
+                        row.get::<_, Option<String>>(11)?,
+                    ),
+                    proxy_url: normalize_metrics_optional_string(row.get::<_, Option<String>>(12)?),
+                })
+            },
+        )
+        .context("query duckdb usage metrics")?;
+    for row in rows {
+        accumulator.observe(row.context("read duckdb usage metrics row")?);
+    }
+    Ok(())
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn usage_metrics_query_as_segment_filter(query: &UsageMetricsQuery) -> UsageEventQuery {
+    UsageEventQuery {
+        key_id: None,
+        provider_type: query.provider_type.clone(),
+        model: None,
+        account_name: None,
+        endpoint: None,
+        status_code: None,
+        status_kind: None,
+        source: UsageEventSource::Archive,
+        start_ms: Some(query.start_ms),
+        end_ms: Some(query.end_ms),
+        limit: 1,
+        offset: 0,
+    }
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn usage_metrics_snapshot_from_path(
+    path: &Path,
+    query: &UsageMetricsQuery,
+) -> anyhow::Result<UsageMetricsSnapshot> {
+    let conn = DuckDbUsageRepository::open_read_only_conn(path)?;
+    let mut accumulator = UsageMetricsAccumulator::default();
+    accumulate_usage_metrics_from_conn(&mut accumulator, &conn, query)?;
+    Ok(accumulator.into_snapshot(query))
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn usage_metrics_snapshot_from_tiered(
+    state: &Mutex<TieredDuckDbUsageState>,
+    catalog_backend: &TieredUsageCatalogBackend,
+    query: &UsageMetricsQuery,
+) -> anyhow::Result<UsageMetricsSnapshot> {
+    let mut accumulator = UsageMetricsAccumulator::default();
+    if query.source.includes_hot() {
+        let active_path = {
+            let state = state
+                .lock()
+                .map_err(|_| anyhow!("tiered duckdb state lock poisoned"))?;
+            state.active_path.clone()
+        };
+        let conn = DuckDbUsageRepository::open_read_only_conn(&active_path)?;
+        accumulate_usage_metrics_from_conn(&mut accumulator, &conn, query)?;
+    }
+    if query.source.includes_archive() {
+        for segment in archived_segments_for_query(
+            catalog_backend,
+            &usage_metrics_query_as_segment_filter(query),
+        )? {
+            let conn = DuckDbUsageRepository::open_read_only_conn(&segment.archive_path)?;
+            accumulate_usage_metrics_from_conn(&mut accumulator, &conn, query)?;
+        }
+    }
+    Ok(accumulator.into_snapshot(query))
+}
+
+#[cfg(feature = "duckdb-runtime")]
 fn add_usage_chart_points_from_conn(
     points: &mut [UsageChartPoint],
     conn: &duckdb::Connection,
@@ -5214,7 +6003,7 @@ mod tests {
         provider::{ProtocolFamily, ProviderType, RouteStrategy},
         store::{
             UsageAnalyticsStore, UsageEventQuery, UsageEventSink, UsageEventSource,
-            UsageEventStatusKind, UsageFilterOptions,
+            UsageEventStatusKind, UsageFilterOptions, UsageMetricsQuery,
         },
         usage::{UsageEvent, UsageStreamDetails, UsageTiming},
     };
@@ -8140,6 +8929,105 @@ mod tests {
             }
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
         }
+    }
+
+    #[cfg(feature = "duckdb-runtime")]
+    #[tokio::test]
+    async fn usage_metrics_snapshot_tracks_proxy_and_error_hotspots() {
+        let root = std::env::temp_dir()
+            .join(format!("llm-access-duckdb-test-{}-metrics-snapshot", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).expect("create metrics test directory");
+        let db_path = root.join("usage.duckdb");
+        let repo = super::DuckDbUsageRepository::open_path(&db_path).expect("open usage repo");
+
+        let mut ok_event = test_usage_event();
+        ok_event.event_id = "metrics-ok".to_string();
+        ok_event.account_name = Some("acct-fast".to_string());
+        ok_event.created_at_ms = 1_700_000_100_000;
+        ok_event.timing.first_sse_write_ms = Some(120);
+        ok_event.quota_failover_count = 0;
+
+        let mut slow_error_event = test_usage_event();
+        slow_error_event.event_id = "metrics-error".to_string();
+        slow_error_event.account_name = Some("acct-slow".to_string());
+        slow_error_event.created_at_ms = 1_700_000_101_000;
+        slow_error_event.status_code = 524;
+        slow_error_event.timing.first_sse_write_ms = Some(980);
+        slow_error_event.timing.routing_wait_ms = Some(240);
+        slow_error_event.quota_failover_count = 3;
+        slow_error_event.stream.downstream_disconnect = Some(true);
+
+        let ok_row = super::UsageEventRow::from_usage_event(&ok_event).with_proxy_attribution(
+            Some(&crate::postgres::UsageProxyAttribution {
+                provider_type: "kiro".to_string(),
+                account_name: "acct-fast".to_string(),
+                proxy_source: "fixed".to_string(),
+                proxy_config_id: Some("proxy-sg-fast".to_string()),
+                proxy_config_name: Some("sg-fast".to_string()),
+                proxy_url: Some("http://127.0.0.1:11129".to_string()),
+            }),
+        );
+        let slow_error_row = super::UsageEventRow::from_usage_event(&slow_error_event)
+            .with_proxy_attribution(Some(&crate::postgres::UsageProxyAttribution {
+                provider_type: "kiro".to_string(),
+                account_name: "acct-slow".to_string(),
+                proxy_source: "binding".to_string(),
+                proxy_config_id: Some("proxy-us-slow".to_string()),
+                proxy_config_name: Some("us-slow".to_string()),
+                proxy_url: Some("http://127.0.0.1:11118".to_string()),
+            }));
+
+        repo.append_usage_event_rows_owned(vec![ok_row, slow_error_row])
+            .await
+            .expect("append usage rows");
+
+        let snapshot = repo
+            .usage_metrics_snapshot(UsageMetricsQuery {
+                provider_type: Some("kiro".to_string()),
+                source: UsageEventSource::Hot,
+                start_ms: 1_700_000_000_000,
+                end_ms: 1_700_000_200_000,
+                top_limit: 10,
+            })
+            .await
+            .expect("fetch usage metrics snapshot");
+
+        assert_eq!(snapshot.summary.total_requests, 2);
+        assert_eq!(snapshot.summary.non_ok_requests, 1);
+        assert_eq!(snapshot.summary.failover_request_count, 1);
+        assert_eq!(snapshot.summary.total_quota_failovers, 3);
+        assert_eq!(snapshot.summary.downstream_disconnect_count, 1);
+        assert_eq!(
+            snapshot
+                .top_first_token_accounts
+                .first()
+                .map(|row| row.label.as_str()),
+            Some("acct-slow")
+        );
+        assert_eq!(
+            snapshot
+                .top_non_ok_accounts
+                .first()
+                .map(|row| row.label.as_str()),
+            Some("acct-slow")
+        );
+        assert_eq!(
+            snapshot
+                .top_first_token_proxies
+                .first()
+                .and_then(|row| row.proxy_config_name.as_deref()),
+            Some("us-slow")
+        );
+        assert_eq!(
+            snapshot
+                .non_ok_status_codes
+                .first()
+                .map(|row| row.status_code),
+            Some(524)
+        );
+
+        std::fs::remove_dir_all(&root).expect("cleanup metrics test directory");
     }
 
     #[cfg(feature = "duckdb-runtime")]

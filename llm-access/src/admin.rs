@@ -1375,6 +1375,21 @@ pub(crate) async fn get_llm_gateway_usage_filter_options(
     proxy_usage_query(&state, &uri).await
 }
 
+pub(crate) async fn get_llm_gateway_usage_metrics(
+    State(state): State<HttpState>,
+    headers: HeaderMap,
+    OriginalUri(uri): OriginalUri,
+) -> Response {
+    if let Err(response) = ensure_admin_access(&headers) {
+        return response.into_response();
+    }
+    let _permit = match acquire_admin_usage_query_permit(&state) {
+        Ok(permit) => permit,
+        Err(response) => return response.into_response(),
+    };
+    proxy_usage_query(&state, &uri).await
+}
+
 pub(crate) async fn get_llm_gateway_usage_event(
     State(state): State<HttpState>,
     headers: HeaderMap,

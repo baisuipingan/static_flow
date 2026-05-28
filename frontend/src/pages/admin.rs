@@ -2341,6 +2341,10 @@ pub fn admin_page() -> Html {
                             <i class={classes!("fas", "fa-key", "mr-2")} aria-hidden="true"></i>
                             { "LLM Gateway" }
                         </Link<Route>>
+                        <Link<Route> to={Route::AdminLlmGatewayMonitor} classes={classes!("btn-fluent-secondary")}>
+                            <i class={classes!("fas", "fa-chart-line", "mr-2")} aria-hidden="true"></i>
+                            { "Gateway Monitor" }
+                        </Link<Route>>
                         <Link<Route> to={Route::AdminKiroGateway} classes={classes!("btn-fluent-secondary")}>
                             <i class={classes!("fas", "fa-bolt", "mr-2")} aria-hidden="true"></i>
                             { "Kiro Gateway" }

@@ -1,6 +1,7 @@
 //! Journal consumer worker for llm-access usage analytics.
 
 use std::{
+    collections::BTreeMap,
     fs,
     path::{Path, PathBuf},
     sync::{Arc, RwLock},
@@ -16,8 +17,14 @@ use axum::{
     routing::{get, post},
     Json, Router,
 };
-use llm_access_core::store::{UsageEventSink, DEFAULT_USAGE_ANALYTICS_RETENTION_DAYS};
-use llm_access_store::duckdb::DuckDbUsageRepository;
+use llm_access_core::{
+    store::{UsageEventSink, DEFAULT_USAGE_ANALYTICS_RETENTION_DAYS},
+    usage::UsageEvent,
+};
+use llm_access_store::{
+    duckdb::{DuckDbUsageRepository, UsageEventRow},
+    postgres::{PostgresControlRepository, UsageProxyAttribution},
+};
 use llm_usage_journal::{JournalConsumerState, JournalReader, WorkerProgressSnapshot};
 use sha2::{Digest, Sha256};
 use uuid::Uuid;
@@ -26,7 +33,7 @@ use crate::{
     process_memory::{read_current_process_memory_stats, ProcessMemoryStats},
     usage_query::{
         get_kiro_usage_event, get_llm_usage_event, list_kiro_usage_events, list_llm_usage_events,
-        usage_chart_points, usage_filter_options, UsageQueryState,
+        usage_chart_points, usage_filter_options, usage_metrics_snapshot, UsageQueryState,
     },
 };
 
@@ -61,9 +68,76 @@ pub struct UsageWorker {
     journal_root: PathBuf,
     state: JournalConsumerState,
     duckdb_usage: Arc<DuckDbUsageRepository>,
+    attribution_resolver: Option<Arc<UsageEventAttributionResolver>>,
     consumer_lease_ms: u64,
     usage_analytics_retention_days: Arc<RwLock<u64>>,
     cluster_state: Option<Arc<crate::cluster::ClusterRuntimeState>>,
+}
+
+/// Resolve per-account proxy attribution while consuming usage events.
+#[derive(Clone)]
+pub struct UsageEventAttributionResolver {
+    control: Arc<PostgresControlRepository>,
+}
+
+impl UsageEventAttributionResolver {
+    /// Build one resolver backed by the shared Postgres control repository.
+    pub fn new(control: Arc<PostgresControlRepository>) -> Self {
+        Self {
+            control,
+        }
+    }
+
+    /// Convert freshly decoded usage events into persisted rows with proxy
+    /// metadata.
+    pub async fn build_usage_rows(
+        &self,
+        events: Vec<UsageEvent>,
+    ) -> anyhow::Result<Vec<UsageEventRow>> {
+        if events.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut attribution_by_account =
+            BTreeMap::<(String, String), Option<UsageProxyAttribution>>::new();
+        for event in &events {
+            let Some(account_name) = event
+                .account_name
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            else {
+                continue;
+            };
+            attribution_by_account
+                .entry((event.provider_type.as_storage_str().to_string(), account_name.to_string()))
+                .or_insert(None);
+        }
+        for ((provider_type, account_name), slot) in &mut attribution_by_account {
+            *slot = self
+                .control
+                .resolve_usage_proxy_attribution(provider_type, account_name)
+                .await?;
+        }
+        Ok(events
+            .into_iter()
+            .map(|event| {
+                let attribution = event
+                    .account_name
+                    .as_deref()
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .and_then(|account_name| {
+                        attribution_by_account
+                            .get(&(
+                                event.provider_type.as_storage_str().to_string(),
+                                account_name.to_string(),
+                            ))
+                            .and_then(|value| value.as_ref())
+                    });
+                UsageEventRow::from_usage_event(&event).with_proxy_attribution(attribution)
+            })
+            .collect())
+    }
 }
 
 /// Build the usage worker HTTP router.
@@ -79,6 +153,7 @@ struct PrimaryWorkerHttpState {
     journal_root: PathBuf,
     query: UsageQueryState,
     duckdb_usage: Arc<DuckDbUsageRepository>,
+    attribution_resolver: Option<Arc<UsageEventAttributionResolver>>,
     cluster_state: Option<Arc<crate::cluster::ClusterRuntimeState>>,
 }
 
@@ -125,12 +200,14 @@ fn primary_worker_router(worker: &UsageWorker) -> Router {
         .route("/admin/kiro-gateway/usage/:event_id", get(get_kiro_usage_event))
         .route("/admin/llm-access/usage/chart", get(usage_chart_points))
         .route("/admin/llm-gateway/usage/filter-options", get(usage_filter_options))
+        .route("/admin/llm-gateway/usage/metrics", get(usage_metrics_snapshot))
         .route("/admin/llm-access/usage-worker/status", get(primary_worker_status))
         .route("/internal/usage-journal/import", post(primary_import_relay_file))
         .with_state(PrimaryWorkerHttpState {
             journal_root: worker.journal_root.clone(),
             query: query_state,
             duckdb_usage: worker.duckdb_usage.clone(),
+            attribution_resolver: worker.attribution_resolver.clone(),
             cluster_state: worker.cluster_state.clone(),
         })
 }
@@ -143,6 +220,7 @@ fn edge_worker_router(worker: &EdgeUsageWorker) -> Router {
         .route("/admin/kiro-gateway/usage/:event_id", get(edge_proxy_usage_query))
         .route("/admin/llm-access/usage/chart", get(edge_proxy_usage_query))
         .route("/admin/llm-gateway/usage/filter-options", get(edge_proxy_usage_query))
+        .route("/admin/llm-gateway/usage/metrics", get(edge_proxy_usage_query))
         .route("/admin/llm-access/usage-worker/status", get(edge_worker_status))
         .route("/internal/usage-journal/import", post(edge_reject_import_relay_file))
         .with_state(EdgeWorkerHttpState {
@@ -303,6 +381,7 @@ async fn primary_import_relay_file(
     match import_relayed_journal_bytes(
         &state.journal_root,
         Arc::clone(&state.duckdb_usage),
+        state.attribution_resolver.clone(),
         source_node_id,
         file_sequence,
         body,
@@ -468,6 +547,7 @@ impl UsageWorker {
             journal_root,
             state,
             duckdb_usage,
+            attribution_resolver: None,
             consumer_lease_ms: consumer_lease_ms.max(1),
             usage_analytics_retention_days: Arc::new(RwLock::new(
                 usage_analytics_retention_days.max(1),
@@ -482,6 +562,15 @@ impl UsageWorker {
         cluster_state: Option<Arc<crate::cluster::ClusterRuntimeState>>,
     ) -> Self {
         self.cluster_state = cluster_state;
+        self
+    }
+
+    /// Attach an optional consumption-time proxy-attribution resolver.
+    pub fn with_attribution_resolver(
+        mut self,
+        attribution_resolver: Option<Arc<UsageEventAttributionResolver>>,
+    ) -> Self {
+        self.attribution_resolver = attribution_resolver;
         self
     }
 
@@ -509,6 +598,14 @@ impl UsageWorker {
     /// Return the shared DuckDB usage repository used by the worker.
     pub fn usage_repository(&self) -> Arc<DuckDbUsageRepository> {
         Arc::clone(&self.duckdb_usage)
+    }
+
+    async fn append_events(&self, events: Vec<UsageEvent>) -> anyhow::Result<()> {
+        if let Some(resolver) = &self.attribution_resolver {
+            let rows = resolver.build_usage_rows(events).await?;
+            return self.duckdb_usage.append_usage_event_rows_owned(rows).await;
+        }
+        self.duckdb_usage.append_usage_events_owned(events).await
     }
 
     /// Run storage maintenance for the current retention horizon.
@@ -603,7 +700,7 @@ impl UsageWorker {
                 .map(|event| event.into_usage_event())
                 .collect::<Vec<_>>();
             let event_count = events.len() as u64;
-            self.duckdb_usage.append_usage_events_owned(events).await?;
+            self.append_events(events).await?;
             processed_events = processed_events.saturating_add(event_count);
             let now = now_ms();
             let should_persist_progress = processed_blocks == 1
@@ -807,6 +904,7 @@ fn relaying_progress(claim: &ClaimedJournalFile) -> WorkerProgressSnapshot {
 async fn import_relayed_journal_bytes(
     journal_root: &Path,
     duckdb_usage: Arc<DuckDbUsageRepository>,
+    attribution_resolver: Option<Arc<UsageEventAttributionResolver>>,
     source_node_id: &str,
     file_sequence: u64,
     body: Bytes,
@@ -847,7 +945,12 @@ async fn import_relayed_journal_bytes(
                 .map(|event| event.into_usage_event())
                 .collect::<Vec<_>>();
             event_count = event_count.saturating_add(events.len() as u64);
-            duckdb_usage.append_usage_events_owned(events).await?;
+            if let Some(resolver) = &attribution_resolver {
+                let rows = resolver.build_usage_rows(events).await?;
+                duckdb_usage.append_usage_event_rows_owned(rows).await?;
+            } else {
+                duckdb_usage.append_usage_events_owned(events).await?;
+            }
         }
         let report = stream.finish()?;
         JournalConsumerState::open(journal_root)?.record_relay_consumed_file(

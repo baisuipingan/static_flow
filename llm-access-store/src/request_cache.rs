@@ -18,6 +18,7 @@ const ACCOUNT_VIEW_TTL: Duration = Duration::from_secs(4 * 60 * 60);
 const ACCOUNT_AUTH_TTL: Duration = Duration::from_secs(4 * 60 * 60);
 const CODEX_STATUS_TTL: Duration = Duration::from_secs(4 * 60 * 60);
 const PROXY_METADATA_TTL: Duration = Duration::from_secs(6 * 60 * 60);
+const USAGE_PROXY_ATTRIBUTION_TTL: Duration = Duration::from_secs(30 * 60);
 const USAGE_CATALOG_LOOKUP_TTL: Duration = Duration::from_secs(15 * 60);
 const USAGE_CATALOG_EVENT_LOCATOR_TTL: Duration = Duration::from_secs(30 * 60);
 const NEGATIVE_AUTH_TTL: Duration = Duration::from_secs(5 * 60);
@@ -79,6 +80,23 @@ pub(crate) struct CachedProxyBindingLookup {
     #[serde(default)]
     pub generation: i64,
     pub binding: AdminProxyBinding,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CachedUsageProxyAttributionView {
+    pub provider_type: String,
+    pub account_name: String,
+    pub proxy_source: String,
+    pub proxy_config_id: Option<String>,
+    pub proxy_config_name: Option<String>,
+    pub proxy_url: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct CachedUsageProxyAttributionLookup {
+    #[serde(default)]
+    pub generation: i64,
+    pub attribution: Option<CachedUsageProxyAttributionView>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -248,6 +266,15 @@ impl RequestCache {
         format!("{}:gen:dispatch:{provider}", self.key_prefix)
     }
 
+    pub(crate) fn usage_proxy_attribution_key(
+        &self,
+        provider: &str,
+        account_name: &str,
+        scope: &str,
+    ) -> String {
+        format!("{}:usage:proxy:scope:{scope}:{provider}:{account_name}", self.key_prefix)
+    }
+
     pub(crate) fn usage_catalog_generation_key(&self) -> String {
         format!("{}:{}:gen", self.key_prefix, Self::USAGE_CATALOG_CACHE_NAMESPACE)
     }
@@ -341,6 +368,20 @@ impl RequestCache {
         deterministic_jitter_ttl(
             &self.usage_catalog_rollups_key(),
             USAGE_CATALOG_LOOKUP_TTL,
+            0.8,
+            1.2,
+        )
+    }
+
+    pub(crate) fn usage_proxy_attribution_ttl(
+        &self,
+        provider: &str,
+        account_name: &str,
+        scope: &str,
+    ) -> Duration {
+        deterministic_jitter_ttl(
+            &self.usage_proxy_attribution_key(provider, account_name, scope),
+            USAGE_PROXY_ATTRIBUTION_TTL,
             0.8,
             1.2,
         )
@@ -631,6 +672,10 @@ mod tests {
         assert_eq!(
             cache.dispatch_generation_key("kiro"),
             "llma:test:gen:dispatch:kiro".to_string()
+        );
+        assert_eq!(
+            cache.usage_proxy_attribution_key("codex", "acct-1", "edge-a"),
+            "llma:test:usage:proxy:scope:edge-a:codex:acct-1".to_string()
         );
         assert_eq!(
             cache.usage_catalog_generation_key(),

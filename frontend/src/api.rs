@@ -6287,6 +6287,81 @@ pub struct AdminLlmGatewayUsageFilterOptionsResponse {
     pub endpoints: Vec<String>,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct AdminLlmGatewayUsageMetricsSummaryView {
+    pub total_requests: u64,
+    pub ok_requests: u64,
+    pub non_ok_requests: u64,
+    pub distinct_accounts: usize,
+    pub distinct_proxies: usize,
+    pub first_token_samples: u64,
+    pub avg_first_token_ms: Option<f64>,
+    pub max_first_token_ms: Option<i64>,
+    pub avg_latency_ms: Option<f64>,
+    pub avg_routing_wait_ms: Option<f64>,
+    pub failover_request_count: u64,
+    pub total_quota_failovers: u64,
+    pub downstream_disconnect_count: u64,
+    pub usage_missing_count: u64,
+    pub credit_usage_missing_count: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct AdminLlmGatewayUsageMetricsDimensionView {
+    pub key: String,
+    pub label: String,
+    pub account_name: Option<String>,
+    pub proxy_config_id: Option<String>,
+    pub proxy_config_name: Option<String>,
+    pub proxy_url: Option<String>,
+    pub proxy_source: Option<String>,
+    pub request_count: u64,
+    pub ok_count: u64,
+    pub non_ok_count: u64,
+    pub first_token_samples: u64,
+    pub avg_first_token_ms: Option<f64>,
+    pub max_first_token_ms: Option<i64>,
+    pub routing_wait_samples: u64,
+    pub avg_routing_wait_ms: Option<f64>,
+    pub max_routing_wait_ms: Option<i64>,
+    pub failover_request_count: u64,
+    pub total_quota_failovers: u64,
+    pub downstream_disconnect_count: u64,
+    pub usage_missing_count: u64,
+    pub credit_usage_missing_count: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct AdminLlmGatewayUsageMetricsStatusCodeView {
+    pub status_code: i32,
+    pub request_count: u64,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Default)]
+#[serde(default)]
+pub struct AdminLlmGatewayUsageMetricsResponse {
+    pub generated_at_ms: i64,
+    pub start_ms: i64,
+    pub end_ms: i64,
+    pub provider_type: Option<String>,
+    pub source: String,
+    pub summary: AdminLlmGatewayUsageMetricsSummaryView,
+    pub top_first_token_accounts: Vec<AdminLlmGatewayUsageMetricsDimensionView>,
+    pub top_first_token_proxies: Vec<AdminLlmGatewayUsageMetricsDimensionView>,
+    pub top_non_ok_accounts: Vec<AdminLlmGatewayUsageMetricsDimensionView>,
+    pub top_non_ok_proxies: Vec<AdminLlmGatewayUsageMetricsDimensionView>,
+    pub top_routing_wait_accounts: Vec<AdminLlmGatewayUsageMetricsDimensionView>,
+    pub top_routing_wait_proxies: Vec<AdminLlmGatewayUsageMetricsDimensionView>,
+    pub top_failover_accounts: Vec<AdminLlmGatewayUsageMetricsDimensionView>,
+    pub top_failover_proxies: Vec<AdminLlmGatewayUsageMetricsDimensionView>,
+    pub top_disconnect_accounts: Vec<AdminLlmGatewayUsageMetricsDimensionView>,
+    pub top_disconnect_proxies: Vec<AdminLlmGatewayUsageMetricsDimensionView>,
+    pub non_ok_status_codes: Vec<AdminLlmGatewayUsageMetricsStatusCodeView>,
+}
+
 #[derive(Debug, Serialize, Deserialize, Clone, Copy, PartialEq, Eq, Default)]
 #[serde(default)]
 pub struct AdminUsageTotalsView {
@@ -6451,6 +6526,15 @@ pub struct AdminLlmGatewayUsageEventsQuery {
     pub status_kind: Option<String>,
     pub limit: Option<usize>,
     pub offset: Option<usize>,
+}
+
+#[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
+#[serde(default)]
+pub struct AdminLlmGatewayUsageMetricsQuery {
+    pub provider_type: Option<String>,
+    pub source: Option<String>,
+    pub window: Option<String>,
+    pub top_limit: Option<usize>,
 }
 
 /// Public acknowledgement returned after a token wish is queued.
@@ -9258,6 +9342,65 @@ pub async fn fetch_admin_llm_gateway_usage_filter_options(
             api_get(&format!("{url}?{}", params.join("&")))
         };
         let response = request
+            .send()
+            .await
+            .map_err(|e| format!("Network error: {:?}", e))?;
+        if !response.ok() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(format!("Failed: {text}"));
+        }
+        response
+            .json()
+            .await
+            .map_err(|e| format!("Parse error: {:?}", e))
+    }
+}
+
+pub async fn fetch_admin_llm_gateway_usage_metrics(
+    query: &AdminLlmGatewayUsageMetricsQuery,
+) -> Result<AdminLlmGatewayUsageMetricsResponse, String> {
+    #[cfg(feature = "mock")]
+    {
+        let _ = query;
+        Ok(AdminLlmGatewayUsageMetricsResponse::default())
+    }
+
+    #[cfg(not(feature = "mock"))]
+    {
+        let mut url = format!("{}/admin/llm-gateway/usage/metrics", admin_base());
+        let mut params = Vec::new();
+        if let Some(provider_type) = query
+            .provider_type
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            params.push(format!("provider_type={}", urlencoding::encode(provider_type)));
+        }
+        if let Some(source) = query
+            .source
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            params.push(format!("source={}", urlencoding::encode(source)));
+        }
+        if let Some(window) = query
+            .window
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            params.push(format!("window={}", urlencoding::encode(window)));
+        }
+        if let Some(top_limit) = query.top_limit {
+            params.push(format!("top_limit={top_limit}"));
+        }
+        if !params.is_empty() {
+            url.push('?');
+            url.push_str(&params.join("&"));
+        }
+        let response = api_get(&url)
             .send()
             .await
             .map_err(|e| format!("Network error: {:?}", e))?;

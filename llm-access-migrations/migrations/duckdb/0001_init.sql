@@ -51,7 +51,11 @@ CREATE TABLE IF NOT EXISTS usage_events (
     detail_object_path VARCHAR,
     detail_object_offset BIGINT,
     detail_object_length BIGINT,
-    detail_object_sha256 VARCHAR
+    detail_object_sha256 VARCHAR,
+    proxy_source_at_event VARCHAR,
+    proxy_config_id_at_event VARCHAR,
+    proxy_config_name_at_event VARCHAR,
+    proxy_url_at_event VARCHAR
 );
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS request_method VARCHAR DEFAULT 'POST';
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS request_url VARCHAR DEFAULT '';
@@ -71,6 +75,10 @@ ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS detail_object_path VARCHAR;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS detail_object_offset BIGINT;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS detail_object_length BIGINT;
 ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS detail_object_sha256 VARCHAR;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS proxy_source_at_event VARCHAR;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS proxy_config_id_at_event VARCHAR;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS proxy_config_name_at_event VARCHAR;
+ALTER TABLE usage_events ADD COLUMN IF NOT EXISTS proxy_url_at_event VARCHAR;
 
 CREATE TABLE IF NOT EXISTS usage_event_details (
     event_id VARCHAR PRIMARY KEY,
