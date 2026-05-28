@@ -40,6 +40,7 @@ use crate::usage_journal::JournalUsageEventSink;
 use crate::{
     config::{resolve_request_cache_config, StorageConfig},
     geoip::GeoIpResolver,
+    kiro_latency::KiroLatencyRanker,
 };
 
 #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
@@ -65,6 +66,7 @@ pub struct LlmAccessRuntime {
     public_submission_store: Arc<dyn PublicSubmissionStore>,
     public_status_store: Arc<dyn PublicStatusStore>,
     email_notifier: Option<Arc<crate::email::EmailNotifier>>,
+    kiro_latency_ranker: Arc<KiroLatencyRanker>,
     #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
     usage_journal_sink: Option<Arc<JournalUsageEventSink>>,
     usage_journal_dir: Option<PathBuf>,
@@ -92,6 +94,7 @@ struct LlmAccessStores {
     public_submission_store: Arc<dyn PublicSubmissionStore>,
     public_status_store: Arc<dyn PublicStatusStore>,
     email_notifier: Option<Arc<crate::email::EmailNotifier>>,
+    kiro_latency_ranker: Arc<KiroLatencyRanker>,
     #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
     usage_journal_sink: Option<Arc<JournalUsageEventSink>>,
     usage_journal_dir: Option<PathBuf>,
@@ -206,6 +209,7 @@ impl LlmAccessRuntime {
             public_submission_store: Arc::new(EmptyPublicSubmissionStore),
             public_status_store: Arc::new(EmptyPublicStatusStore),
             email_notifier: None,
+            kiro_latency_ranker: Arc::new(KiroLatencyRanker::default()),
             #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
             usage_journal_sink: None,
             usage_journal_dir: None,
@@ -234,6 +238,7 @@ impl LlmAccessRuntime {
             public_submission_store: stores.public_submission_store,
             public_status_store: stores.public_status_store,
             email_notifier: stores.email_notifier,
+            kiro_latency_ranker: stores.kiro_latency_ranker,
             #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
             usage_journal_sink: stores.usage_journal_sink,
             usage_journal_dir: stores.usage_journal_dir,
@@ -359,6 +364,7 @@ impl LlmAccessRuntime {
             public_submission_store,
             public_status_store,
             email_notifier,
+            kiro_latency_ranker: Arc::new(KiroLatencyRanker::default()),
             #[cfg(any(feature = "duckdb-runtime", feature = "duckdb-bundled"))]
             usage_journal_sink: Some(journal_usage_for_status),
             usage_journal_dir: Some(config.usage_journal_dir.clone()),
@@ -390,6 +396,11 @@ impl LlmAccessRuntime {
     /// Admin config store used by local admin endpoints.
     pub fn admin_config_store(&self) -> Arc<dyn AdminConfigStore> {
         Arc::clone(&self.admin_config_store)
+    }
+
+    /// In-memory Kiro latency ranking cache used by provider dispatch.
+    pub(crate) fn kiro_latency_ranker(&self) -> Arc<KiroLatencyRanker> {
+        Arc::clone(&self.kiro_latency_ranker)
     }
 
     /// Admin key store used by local admin endpoints.

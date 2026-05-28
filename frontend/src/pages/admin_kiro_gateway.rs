@@ -1507,6 +1507,7 @@ fn kiro_key_editor_card(props: &KiroKeyEditorCardProps) -> Html {
         use_state(|| props.key_item.kiro_full_request_logging_enabled);
     let kiro_remote_media_resolution_enabled =
         use_state(|| props.key_item.kiro_remote_media_resolution_enabled);
+    let kiro_latency_routing_enabled = use_state(|| props.key_item.kiro_latency_routing_enabled);
     let policy_override_enabled = use_state(|| initial_override_enabled);
     let key_policy_form = use_state(|| initial_effective_policy_form.clone());
     let key_policy_effective_baseline = use_state(|| initial_effective_policy_form.clone());
@@ -1537,6 +1538,7 @@ fn kiro_key_editor_card(props: &KiroKeyEditorCardProps) -> Html {
         let kiro_zero_cache_debug_enabled = kiro_zero_cache_debug_enabled.clone();
         let kiro_full_request_logging_enabled = kiro_full_request_logging_enabled.clone();
         let kiro_remote_media_resolution_enabled = kiro_remote_media_resolution_enabled.clone();
+        let kiro_latency_routing_enabled = kiro_latency_routing_enabled.clone();
         let policy_override_enabled = policy_override_enabled.clone();
         let key_policy_form = key_policy_form.clone();
         let key_policy_effective_baseline = key_policy_effective_baseline.clone();
@@ -1568,6 +1570,7 @@ fn kiro_key_editor_card(props: &KiroKeyEditorCardProps) -> Html {
             kiro_zero_cache_debug_enabled.set(key_item.kiro_zero_cache_debug_enabled);
             kiro_full_request_logging_enabled.set(key_item.kiro_full_request_logging_enabled);
             kiro_remote_media_resolution_enabled.set(key_item.kiro_remote_media_resolution_enabled);
+            kiro_latency_routing_enabled.set(key_item.kiro_latency_routing_enabled);
             policy_override_enabled.set(initial_override_enabled);
             key_policy_form.set(initial_effective_policy_form.clone());
             key_policy_effective_baseline.set(initial_effective_policy_form.clone());
@@ -1604,6 +1607,7 @@ fn kiro_key_editor_card(props: &KiroKeyEditorCardProps) -> Html {
         let kiro_zero_cache_debug_enabled = kiro_zero_cache_debug_enabled.clone();
         let kiro_full_request_logging_enabled = kiro_full_request_logging_enabled.clone();
         let kiro_remote_media_resolution_enabled = kiro_remote_media_resolution_enabled.clone();
+        let kiro_latency_routing_enabled = kiro_latency_routing_enabled.clone();
         let policy_override_enabled = policy_override_enabled.clone();
         let key_policy_form = key_policy_form.clone();
         let billable_multiplier_override_enabled = billable_multiplier_override_enabled.clone();
@@ -1632,6 +1636,7 @@ fn kiro_key_editor_card(props: &KiroKeyEditorCardProps) -> Html {
             let kiro_zero_cache_debug_enabled_value = *kiro_zero_cache_debug_enabled;
             let kiro_full_request_logging_enabled_value = *kiro_full_request_logging_enabled;
             let kiro_remote_media_resolution_enabled_value = *kiro_remote_media_resolution_enabled;
+            let kiro_latency_routing_enabled_value = *kiro_latency_routing_enabled;
             let policy_override_enabled_value = *policy_override_enabled;
             let key_policy_form_value = (*key_policy_form).clone();
             let billable_multiplier_override_enabled_value = *billable_multiplier_override_enabled;
@@ -1711,6 +1716,7 @@ fn kiro_key_editor_card(props: &KiroKeyEditorCardProps) -> Html {
                     kiro_remote_media_resolution_enabled: Some(
                         kiro_remote_media_resolution_enabled_value,
                     ),
+                    kiro_latency_routing_enabled: Some(kiro_latency_routing_enabled_value),
                     kiro_cache_policy_override_json: policy_override_json
                         .as_ref()
                         .map(|value| value.as_deref()),
@@ -1751,6 +1757,7 @@ fn kiro_key_editor_card(props: &KiroKeyEditorCardProps) -> Html {
         let kiro_zero_cache_debug_enabled = kiro_zero_cache_debug_enabled.clone();
         let kiro_full_request_logging_enabled = kiro_full_request_logging_enabled.clone();
         let kiro_remote_media_resolution_enabled = kiro_remote_media_resolution_enabled.clone();
+        let kiro_latency_routing_enabled = kiro_latency_routing_enabled.clone();
         let saving = saving.clone();
         let feedback = feedback.clone();
         let on_flash = props.on_flash.clone();
@@ -1767,6 +1774,7 @@ fn kiro_key_editor_card(props: &KiroKeyEditorCardProps) -> Html {
             let kiro_zero_cache_debug_enabled_value = *kiro_zero_cache_debug_enabled;
             let kiro_full_request_logging_enabled_value = *kiro_full_request_logging_enabled;
             let kiro_remote_media_resolution_enabled_value = *kiro_remote_media_resolution_enabled;
+            let kiro_latency_routing_enabled_value = *kiro_latency_routing_enabled;
             let saving = saving.clone();
             let feedback = feedback.clone();
             let on_flash = on_flash.clone();
@@ -1805,6 +1813,7 @@ fn kiro_key_editor_card(props: &KiroKeyEditorCardProps) -> Html {
                     kiro_remote_media_resolution_enabled: Some(
                         kiro_remote_media_resolution_enabled_value,
                     ),
+                    kiro_latency_routing_enabled: Some(kiro_latency_routing_enabled_value),
                     kiro_cache_policy_override_json: None,
                     kiro_billable_model_multipliers_override_json: None,
                     request_max_concurrency_unlimited: false,
@@ -2153,6 +2162,26 @@ fn kiro_key_editor_card(props: &KiroKeyEditorCardProps) -> Html {
                         <strong>{ "URL 媒体代拉" }</strong>
                         <span class={classes!("block", "mt-1", "text-xs", "text-[var(--muted)]")}>
                             { "默认关闭，保持 kiro-gateway 行为。开启后才会把 Anthropic image/document 的 source.type=url 在服务端拉取并转成 base64；关闭时 URL 媒体不会作为附件进入 Kiro，需要图片内容请传 base64/data URL。" }
+                        </span>
+                    </span>
+                </label>
+                <label class={classes!("md:col-span-2", "flex", "cursor-pointer", "items-start", "gap-3", "rounded-lg", "border", "border-[var(--border)]", "bg-[var(--surface-alt)]", "px-3", "py-3", "text-sm")}>
+                    <input
+                        type="checkbox"
+                        checked={*kiro_latency_routing_enabled}
+                        onchange={{
+                            let kiro_latency_routing_enabled =
+                                kiro_latency_routing_enabled.clone();
+                            Callback::from(move |event: Event| {
+                                let input: HtmlInputElement = event.target_unchecked_into();
+                                kiro_latency_routing_enabled.set(input.checked());
+                            })
+                        }}
+                    />
+                    <span>
+                        <strong>{ "首字延迟自适应选号" }</strong>
+                        <span class={classes!("block", "mt-1", "text-xs", "text-[var(--muted)]")}>
+                            { "开启时，API 会使用最近 1 小时 Kiro 账号和代理的首字延迟快照调整候选顺序；快照过期或 worker 不可用时会自动回到原始排序。" }
                         </span>
                     </span>
                 </label>

@@ -85,7 +85,7 @@ use serde_json::{json, Value};
 
 use crate::{
     activity::RequestActivityTracker, codex_refresh, geoip::GeoIpResolver, kiro_headers,
-    kiro_refresh,
+    kiro_latency::KiroLatencyRanker, kiro_refresh,
 };
 
 const MAX_PROVIDER_PROXY_BODY_BYTES: usize = 32 * 1024 * 1024;
@@ -383,6 +383,7 @@ pub struct ProviderState {
     request_limiter: Arc<RequestLimiter>,
     codex_account_cooldowns: Arc<CodexAccountCooldowns>,
     kiro_request_scheduler: Arc<KiroRequestScheduler>,
+    kiro_latency_ranker: Arc<KiroLatencyRanker>,
     request_activity: Arc<RequestActivityTracker>,
 }
 
@@ -398,6 +399,7 @@ pub struct ProviderDispatchDeps {
     request_limiter: Arc<RequestLimiter>,
     codex_account_cooldowns: Arc<CodexAccountCooldowns>,
     kiro_request_scheduler: Arc<KiroRequestScheduler>,
+    kiro_latency_ranker: Arc<KiroLatencyRanker>,
 }
 
 impl ProviderState {
@@ -432,6 +434,24 @@ impl ProviderState {
         request_activity: Arc<RequestActivityTracker>,
         geoip: GeoIpResolver,
     ) -> Self {
+        Self::new_with_config_store_activity_and_latency(
+            control_store,
+            route_store,
+            admin_config_store,
+            request_activity,
+            geoip,
+            Arc::new(KiroLatencyRanker::default()),
+        )
+    }
+
+    pub(crate) fn new_with_config_store_activity_and_latency(
+        control_store: Arc<dyn ControlStore>,
+        route_store: Arc<dyn ProviderRouteStore>,
+        admin_config_store: Arc<dyn AdminConfigStore>,
+        request_activity: Arc<RequestActivityTracker>,
+        geoip: GeoIpResolver,
+        kiro_latency_ranker: Arc<KiroLatencyRanker>,
+    ) -> Self {
         Self::with_dispatcher_and_config_store(
             control_store,
             route_store,
@@ -439,6 +459,7 @@ impl ProviderState {
             Arc::new(DefaultProviderDispatcher),
             request_activity,
             geoip,
+            kiro_latency_ranker,
         )
     }
 
@@ -455,6 +476,7 @@ impl ProviderState {
             dispatcher,
             Arc::new(RequestActivityTracker::new()),
             GeoIpResolver::disabled(),
+            Arc::new(KiroLatencyRanker::default()),
         )
     }
 
@@ -465,6 +487,7 @@ impl ProviderState {
         dispatcher: Arc<dyn ProviderDispatcher>,
         request_activity: Arc<RequestActivityTracker>,
         geoip: GeoIpResolver,
+        kiro_latency_ranker: Arc<KiroLatencyRanker>,
     ) -> Self {
         Self {
             control_store,
@@ -476,6 +499,7 @@ impl ProviderState {
             request_limiter: Arc::new(RequestLimiter::default()),
             codex_account_cooldowns: Arc::new(CodexAccountCooldowns::default()),
             kiro_request_scheduler: KiroRequestScheduler::new(),
+            kiro_latency_ranker,
             request_activity,
         }
     }
@@ -535,6 +559,7 @@ impl ProviderState {
             request_limiter: Arc::clone(&self.request_limiter),
             codex_account_cooldowns: Arc::clone(&self.codex_account_cooldowns),
             kiro_request_scheduler: Arc::clone(&self.kiro_request_scheduler),
+            kiro_latency_ranker: Arc::clone(&self.kiro_latency_ranker),
         }
     }
 }
@@ -969,6 +994,7 @@ async fn select_kiro_route_with_account_permit(
     scheduler: &Arc<KiroRequestScheduler>,
     routes: &[ProviderKiroRoute],
     failed_accounts: &HashSet<String>,
+    latency_ranker: &KiroLatencyRanker,
 ) -> Result<(ProviderKiroRoute, KiroRequestLease), Response> {
     if routes.is_empty() {
         return Err(kiro_json_error(
@@ -981,7 +1007,8 @@ async fn select_kiro_route_with_account_permit(
     loop {
         let mut saw_limit = false;
         let mut shortest_wait: Option<Duration> = None;
-        for route in selection_ordered_kiro_routes(routes, scheduler) {
+        for route in selection_ordered_kiro_routes(routes, scheduler, latency_ranker, now_millis())
+        {
             if failed_accounts.contains(&route.account_name) {
                 continue;
             }
@@ -1112,12 +1139,15 @@ async fn hydrate_kiro_route_for_dispatch(
 fn selection_ordered_kiro_routes<'a>(
     routes: &'a [ProviderKiroRoute],
     scheduler: &KiroRequestScheduler,
+    latency_ranker: &KiroLatencyRanker,
+    now_ms: i64,
 ) -> Vec<&'a ProviderKiroRoute> {
     #[derive(Clone, Copy)]
     struct Candidate<'a> {
         route: &'a ProviderKiroRoute,
         proxy_in_cooldown: bool,
         last_started_at: Option<Instant>,
+        latency_score_ms: Option<f64>,
         remaining: f64,
     }
 
@@ -1133,6 +1163,7 @@ fn selection_ordered_kiro_routes<'a>(
                     .as_deref()
                     .is_some_and(|key| proxy_cooldowns.contains_key(key)),
                 last_started_at: last_started_snapshot.get(&route.routing_identity).copied(),
+                latency_score_ms: latency_ranker.route_score_ms(route, now_ms),
                 remaining: route.cached_remaining_credits.unwrap_or(-1.0),
             }
         })
@@ -1142,6 +1173,17 @@ fn selection_ordered_kiro_routes<'a>(
             (false, true) => return std::cmp::Ordering::Less,
             (true, false) => return std::cmp::Ordering::Greater,
             _ => {},
+        }
+        match (left.latency_score_ms, right.latency_score_ms) {
+            (Some(left_score), Some(right_score)) => {
+                let ordering = left_score.total_cmp(&right_score);
+                if ordering != std::cmp::Ordering::Equal {
+                    return ordering;
+                }
+            },
+            (Some(_), None) => return std::cmp::Ordering::Less,
+            (None, Some(_)) => return std::cmp::Ordering::Greater,
+            (None, None) => {},
         }
         match (left.last_started_at, right.last_started_at) {
             (None, Some(_)) => return std::cmp::Ordering::Less,
@@ -2924,6 +2966,7 @@ async fn dispatch_kiro_proxy(
         kiro_cache_simulator,
         request_limiter,
         kiro_request_scheduler,
+        kiro_latency_ranker,
         ..
     } = deps;
     if request.uri().path() == "/v1/models" {
@@ -3056,6 +3099,7 @@ async fn dispatch_kiro_proxy(
             route_store,
             request_limiter,
             kiro_request_scheduler,
+            kiro_latency_ranker,
             request_input_tokens,
             usage_meta,
         })
@@ -3146,6 +3190,7 @@ async fn dispatch_kiro_proxy(
             &kiro_request_scheduler,
             &routes,
             &failed_accounts,
+            kiro_latency_ranker.as_ref(),
         )
         .await
         {
@@ -3414,6 +3459,7 @@ struct KiroWebsearchDispatch {
     route_store: Arc<dyn ProviderRouteStore>,
     request_limiter: Arc<RequestLimiter>,
     kiro_request_scheduler: Arc<KiroRequestScheduler>,
+    kiro_latency_ranker: Arc<KiroLatencyRanker>,
     request_input_tokens: i32,
     usage_meta: ProviderUsageMetadata,
 }
@@ -3427,6 +3473,7 @@ async fn dispatch_kiro_websearch(input: KiroWebsearchDispatch) -> Response {
         route_store,
         request_limiter,
         kiro_request_scheduler,
+        kiro_latency_ranker,
         request_input_tokens,
         mut usage_meta,
     } = input;
@@ -3466,6 +3513,7 @@ async fn dispatch_kiro_websearch(input: KiroWebsearchDispatch) -> Response {
             &kiro_request_scheduler,
             &routes,
             &failed_accounts,
+            kiro_latency_ranker.as_ref(),
         )
         .await
         {
@@ -7653,6 +7701,7 @@ mod tests {
             zero_cache_debug_enabled: false,
             full_request_logging_enabled: false,
             remote_media_resolution_enabled: false,
+            latency_routing_enabled: true,
             model_name_map_json: "{}".to_string(),
             cache_kmodels_json: llm_access_core::store::default_kiro_cache_kmodels_json(),
             cache_policy_json: llm_access_core::store::default_kiro_cache_policy_json(),
@@ -7814,7 +7863,8 @@ mod tests {
             kiro_route_for_selection("beta", "user-beta", 10.0, None),
         ];
 
-        let ordered = super::selection_ordered_kiro_routes(&routes, scheduler.as_ref());
+        let ranker = crate::kiro_latency::KiroLatencyRanker::default();
+        let ordered = super::selection_ordered_kiro_routes(&routes, scheduler.as_ref(), &ranker, 0);
         assert_eq!(ordered[0].account_name, "alpha");
 
         let lease = scheduler
@@ -7822,7 +7872,7 @@ mod tests {
             .expect("alpha should acquire");
         drop(lease);
 
-        let ordered = super::selection_ordered_kiro_routes(&routes, scheduler.as_ref());
+        let ordered = super::selection_ordered_kiro_routes(&routes, scheduler.as_ref(), &ranker, 0);
         assert_eq!(ordered[0].account_name, "beta");
     }
 
@@ -7839,8 +7889,114 @@ mod tests {
             kiro_route_for_selection("beta", "user-beta", 10.0, Some("http://proxy-b")),
         ];
 
-        let ordered = super::selection_ordered_kiro_routes(&routes, scheduler.as_ref());
+        let ranker = crate::kiro_latency::KiroLatencyRanker::default();
+        let ordered = super::selection_ordered_kiro_routes(&routes, scheduler.as_ref(), &ranker, 0);
         assert_eq!(ordered[0].account_name, "beta");
+    }
+
+    #[test]
+    fn kiro_selection_prefers_recent_low_latency_account_and_proxy() {
+        let scheduler = llm_access_kiro::scheduler::KiroRequestScheduler::new();
+        let routes = vec![
+            kiro_route_for_selection("alpha", "user-alpha", 90.0, Some("http://proxy-slow")),
+            kiro_route_for_selection("beta", "user-beta", 10.0, Some("http://proxy-fast")),
+        ];
+        let ranker = crate::kiro_latency::KiroLatencyRanker::default();
+        ranker.replace_snapshot(crate::kiro_latency::KiroLatencyRoutingSnapshot {
+            generated_at_ms: 1_700_000_000_000,
+            global_avg_first_token_ms: 500.0,
+            accounts: vec![
+                crate::kiro_latency::KiroLatencyDimensionStat {
+                    key: "account:alpha".to_string(),
+                    samples: 20,
+                    avg_first_token_ms: 1_200.0,
+                },
+                crate::kiro_latency::KiroLatencyDimensionStat {
+                    key: "account:beta".to_string(),
+                    samples: 20,
+                    avg_first_token_ms: 120.0,
+                },
+            ],
+            proxies: vec![
+                crate::kiro_latency::KiroLatencyDimensionStat {
+                    key: "http://proxy-slow".to_string(),
+                    samples: 20,
+                    avg_first_token_ms: 1_500.0,
+                },
+                crate::kiro_latency::KiroLatencyDimensionStat {
+                    key: "http://proxy-fast".to_string(),
+                    samples: 20,
+                    avg_first_token_ms: 100.0,
+                },
+            ],
+        });
+
+        let ordered = super::selection_ordered_kiro_routes(
+            &routes,
+            scheduler.as_ref(),
+            &ranker,
+            1_700_000_010_000,
+        );
+        assert_eq!(ordered[0].account_name, "beta");
+    }
+
+    #[test]
+    fn kiro_selection_keeps_legacy_order_when_latency_routing_disabled() {
+        let scheduler = llm_access_kiro::scheduler::KiroRequestScheduler::new();
+        let mut alpha =
+            kiro_route_for_selection("alpha", "user-alpha", 90.0, Some("http://proxy-slow"));
+        let mut beta =
+            kiro_route_for_selection("beta", "user-beta", 10.0, Some("http://proxy-fast"));
+        alpha.latency_routing_enabled = false;
+        beta.latency_routing_enabled = false;
+        let routes = vec![alpha, beta];
+        let ranker = crate::kiro_latency::KiroLatencyRanker::default();
+        ranker.replace_snapshot(crate::kiro_latency::KiroLatencyRoutingSnapshot {
+            generated_at_ms: 1_700_000_000_000,
+            global_avg_first_token_ms: 500.0,
+            accounts: vec![crate::kiro_latency::KiroLatencyDimensionStat {
+                key: "account:beta".to_string(),
+                samples: 20,
+                avg_first_token_ms: 100.0,
+            }],
+            proxies: Vec::new(),
+        });
+
+        let ordered = super::selection_ordered_kiro_routes(
+            &routes,
+            scheduler.as_ref(),
+            &ranker,
+            1_700_000_010_000,
+        );
+        assert_eq!(ordered[0].account_name, "alpha");
+    }
+
+    #[test]
+    fn kiro_selection_keeps_legacy_order_when_latency_snapshot_is_stale() {
+        let scheduler = llm_access_kiro::scheduler::KiroRequestScheduler::new();
+        let routes = vec![
+            kiro_route_for_selection("alpha", "user-alpha", 90.0, None),
+            kiro_route_for_selection("beta", "user-beta", 10.0, None),
+        ];
+        let ranker = crate::kiro_latency::KiroLatencyRanker::default();
+        ranker.replace_snapshot(crate::kiro_latency::KiroLatencyRoutingSnapshot {
+            generated_at_ms: 1_700_000_000_000,
+            global_avg_first_token_ms: 500.0,
+            accounts: vec![crate::kiro_latency::KiroLatencyDimensionStat {
+                key: "account:beta".to_string(),
+                samples: 20,
+                avg_first_token_ms: 100.0,
+            }],
+            proxies: Vec::new(),
+        });
+
+        let ordered = super::selection_ordered_kiro_routes(
+            &routes,
+            scheduler.as_ref(),
+            &ranker,
+            1_700_010_000_000,
+        );
+        assert_eq!(ordered[0].account_name, "alpha");
     }
 
     #[test]

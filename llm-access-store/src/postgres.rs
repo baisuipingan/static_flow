@@ -93,6 +93,10 @@ impl PgRow {
             .try_get(index)
             .expect("decode sqlx postgres row column")
     }
+
+    fn get_optional_bool(&self, name: &str) -> Option<bool> {
+        self.0.try_get::<Option<bool>, _>(name).ok().flatten()
+    }
 }
 
 const POSTGRES_MAX_BIND_PARAMS: usize = 65_535;
@@ -1391,6 +1395,7 @@ impl PostgresControlRepository {
             zero_cache_debug_enabled: bundle.route.kiro_zero_cache_debug_enabled,
             full_request_logging_enabled: bundle.route.kiro_full_request_logging_enabled,
             remote_media_resolution_enabled: bundle.route.kiro_remote_media_resolution_enabled,
+            latency_routing_enabled: bundle.route.kiro_latency_routing_enabled,
             model_name_map_json: bundle
                 .route
                 .model_name_map_json
@@ -1882,7 +1887,8 @@ impl PostgresControlRepository {
                     COALESCE(u.credit_total, '0'),
                     COALESCE(u.credit_missing_events, 0),
                     u.last_used_at_ms,
-                    COALESCE(u.updated_at_ms, 0)
+                    COALESCE(u.updated_at_ms, 0),
+                    r.kiro_latency_routing_enabled AS kiro_latency_routing_enabled
                  FROM llm_keys k
                  LEFT JOIN llm_key_route_config r ON r.key_id = k.key_id
                  LEFT JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
@@ -1919,7 +1925,8 @@ impl PostgresControlRepository {
                     COALESCE(u.credit_total, '0'),
                     COALESCE(u.credit_missing_events, 0),
                     u.last_used_at_ms,
-                    COALESCE(u.updated_at_ms, k.updated_at_ms)
+                    COALESCE(u.updated_at_ms, k.updated_at_ms),
+                    r.kiro_latency_routing_enabled AS kiro_latency_routing_enabled
                  FROM llm_keys k
                  LEFT JOIN llm_key_route_config r ON r.key_id = k.key_id
                  LEFT JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
@@ -2028,7 +2035,8 @@ impl PostgresControlRepository {
                     COALESCE(u.credit_total, '0'),
                     COALESCE(u.credit_missing_events, 0),
                     u.last_used_at_ms,
-                    COALESCE(u.updated_at_ms, k.updated_at_ms)
+                    COALESCE(u.updated_at_ms, k.updated_at_ms),
+                    r.kiro_latency_routing_enabled AS kiro_latency_routing_enabled
                  FROM llm_keys k
                  LEFT JOIN llm_key_route_config r ON r.key_id = k.key_id
                  LEFT JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
@@ -2082,6 +2090,7 @@ impl PostgresControlRepository {
                         r.kiro_cache_estimation_enabled,
                         r.kiro_zero_cache_debug_enabled, r.kiro_full_request_logging_enabled,
                         r.kiro_remote_media_resolution_enabled,
+                        r.kiro_latency_routing_enabled,
                         r.kiro_cache_policy_override_json,
                         r.kiro_billable_model_multipliers_override_json,
                         COALESCE(u.input_uncached_tokens, 0) AS input_uncached_tokens,
@@ -2246,7 +2255,8 @@ impl PostgresControlRepository {
                     COALESCE(summary.loaded_balance_count, 0),
                     COALESCE(summary.missing_balance_count, 0),
                     COALESCE(summary.total_limit, 0.0),
-                    COALESCE(summary.total_remaining, 0.0)
+                    COALESCE(summary.total_remaining, 0.0),
+                    page_keys.kiro_latency_routing_enabled AS kiro_latency_routing_enabled
                  FROM page_keys
                  LEFT JOIN key_candidate_summary summary
                    ON summary.key_id = page_keys.key_id
@@ -2298,7 +2308,8 @@ impl PostgresControlRepository {
                     COALESCE(u.credit_total, '0'),
                     COALESCE(u.credit_missing_events, 0),
                     u.last_used_at_ms,
-                    COALESCE(u.updated_at_ms, k.updated_at_ms)
+                    COALESCE(u.updated_at_ms, k.updated_at_ms),
+                    r.kiro_latency_routing_enabled AS kiro_latency_routing_enabled
                  FROM llm_keys k
                  JOIN llm_key_route_config r ON r.key_id = k.key_id
                  LEFT JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
@@ -4905,11 +4916,12 @@ impl PostgresControlRepository {
                     request_min_start_interval_ms, codex_fast_enabled,
                     kiro_request_validation_enabled, kiro_cache_estimation_enabled,
                     kiro_zero_cache_debug_enabled, kiro_full_request_logging_enabled,
-                    kiro_remote_media_resolution_enabled, kiro_cache_policy_override_json,
+                    kiro_remote_media_resolution_enabled, kiro_latency_routing_enabled,
+                    kiro_cache_policy_override_json,
                     kiro_billable_model_multipliers_override_json
                  ) VALUES (
                     $1, $2, $3, $4::jsonb, $5, $6::jsonb, $7, $8, $9, $10, $11, $12,
-                    $13, $14, $15::jsonb, $16::jsonb
+                    $13, $14, $15, $16::jsonb, $17::jsonb
                  )
                  ON CONFLICT(key_id) DO UPDATE SET
                     route_strategy = EXCLUDED.route_strategy,
@@ -4927,6 +4939,8 @@ impl PostgresControlRepository {
                         EXCLUDED.kiro_full_request_logging_enabled,
                     kiro_remote_media_resolution_enabled =
                         EXCLUDED.kiro_remote_media_resolution_enabled,
+                    kiro_latency_routing_enabled =
+                        EXCLUDED.kiro_latency_routing_enabled,
                     kiro_cache_policy_override_json =
                         EXCLUDED.kiro_cache_policy_override_json,
                     kiro_billable_model_multipliers_override_json =
@@ -4946,6 +4960,7 @@ impl PostgresControlRepository {
                     &route.kiro_zero_cache_debug_enabled,
                     &route.kiro_full_request_logging_enabled,
                     &route.kiro_remote_media_resolution_enabled,
+                    &route.kiro_latency_routing_enabled,
                     &route.kiro_cache_policy_override_json,
                     &route.kiro_billable_model_multipliers_override_json,
                 ],
@@ -5398,6 +5413,9 @@ fn decode_key_bundle(row: &PgRow) -> anyhow::Result<KeyBundle> {
             kiro_zero_cache_debug_enabled: row.get::<_, Option<bool>>(21).unwrap_or(false),
             kiro_full_request_logging_enabled: row.get::<_, Option<bool>>(22).unwrap_or(false),
             kiro_remote_media_resolution_enabled: row.get::<_, Option<bool>>(23).unwrap_or(false),
+            kiro_latency_routing_enabled: row
+                .get_optional_bool("kiro_latency_routing_enabled")
+                .unwrap_or(true),
             kiro_cache_policy_override_json: row.get(24),
             kiro_billable_model_multipliers_override_json: row.get(25),
         },
@@ -5459,6 +5477,7 @@ fn admin_key_from_bundle(bundle: &KeyBundle) -> AdminKey {
         kiro_zero_cache_debug_enabled: bundle.route.kiro_zero_cache_debug_enabled,
         kiro_full_request_logging_enabled: bundle.route.kiro_full_request_logging_enabled,
         kiro_remote_media_resolution_enabled: bundle.route.kiro_remote_media_resolution_enabled,
+        kiro_latency_routing_enabled: bundle.route.kiro_latency_routing_enabled,
         kiro_cache_policy_override_json: bundle.route.kiro_cache_policy_override_json.clone(),
         kiro_billable_model_multipliers_override_json: bundle
             .route
@@ -6447,7 +6466,8 @@ impl AdminKeyStore for PostgresControlRepository {
                 COALESCE(u.credit_total, '0'),
                 COALESCE(u.credit_missing_events, 0),
                 u.last_used_at_ms,
-                COALESCE(u.updated_at_ms, k.updated_at_ms)
+                COALESCE(u.updated_at_ms, k.updated_at_ms),
+                r.kiro_latency_routing_enabled AS kiro_latency_routing_enabled
              FROM llm_keys k
              LEFT JOIN llm_key_route_config r ON r.key_id = k.key_id
              LEFT JOIN llm_key_usage_rollups u ON u.key_id = k.key_id
@@ -6528,6 +6548,7 @@ impl AdminKeyStore for PostgresControlRepository {
             kiro_zero_cache_debug_enabled: false,
             kiro_full_request_logging_enabled: false,
             kiro_remote_media_resolution_enabled: false,
+            kiro_latency_routing_enabled: true,
             kiro_cache_policy_override_json: None,
             kiro_billable_model_multipliers_override_json: None,
         };
@@ -6616,6 +6637,9 @@ impl AdminKeyStore for PostgresControlRepository {
         }
         if let Some(value) = patch.kiro_remote_media_resolution_enabled {
             bundle.route.kiro_remote_media_resolution_enabled = value;
+        }
+        if let Some(value) = patch.kiro_latency_routing_enabled {
+            bundle.route.kiro_latency_routing_enabled = value;
         }
         if let Some(value) = patch.kiro_cache_policy_override_json.as_ref() {
             bundle.route.kiro_cache_policy_override_json = value.clone();
@@ -8003,6 +8027,7 @@ impl AdminKiroAccountStore for PostgresControlRepository {
             zero_cache_debug_enabled: false,
             full_request_logging_enabled: false,
             remote_media_resolution_enabled: false,
+            latency_routing_enabled: true,
             model_name_map_json: "{}".to_string(),
             cache_kmodels_json: runtime_config.kiro_cache_kmodels_json,
             cache_policy_json: runtime_config.kiro_cache_policy_json,
@@ -8293,6 +8318,7 @@ impl ProviderRouteStore for PostgresControlRepository {
                 zero_cache_debug_enabled: snapshot.zero_cache_debug_enabled,
                 full_request_logging_enabled: snapshot.full_request_logging_enabled,
                 remote_media_resolution_enabled: snapshot.remote_media_resolution_enabled,
+                latency_routing_enabled: snapshot.latency_routing_enabled,
                 model_name_map_json: snapshot.model_name_map_json.clone(),
                 cache_kmodels_json: snapshot.cache_kmodels_json.clone(),
                 cache_policy_json: snapshot.cache_policy_json.clone(),
@@ -8358,6 +8384,7 @@ impl ProviderRouteStore for PostgresControlRepository {
             zero_cache_debug_enabled: false,
             full_request_logging_enabled: false,
             remote_media_resolution_enabled: false,
+            latency_routing_enabled: true,
             model_name_map_json: "{}".to_string(),
             cache_kmodels_json: runtime_config.kiro_cache_kmodels_json,
             cache_policy_json: runtime_config.kiro_cache_policy_json,

@@ -10,8 +10,9 @@ use axum::{
 };
 use llm_access_core::{
     store::{
-        UsageAnalyticsStore, UsageChartPoint, UsageEventPage, UsageEventQuery, UsageEventSource,
-        UsageEventStatusKind, UsageMetricsQuery, DEFAULT_USAGE_ANALYTICS_RETENTION_DAYS,
+        KiroLatencyRankingQuery, UsageAnalyticsStore, UsageChartPoint, UsageEventPage,
+        UsageEventQuery, UsageEventSource, UsageEventStatusKind, UsageMetricsQuery,
+        DEFAULT_USAGE_ANALYTICS_RETENTION_DAYS,
     },
     usage::UsageEvent,
 };
@@ -64,6 +65,15 @@ pub(crate) struct UsageMetricsRequest {
     window: Option<String>,
     #[serde(default)]
     top_limit: Option<usize>,
+}
+
+/// Query options for API-side Kiro latency routing weights.
+#[derive(Debug, Clone, Default, Deserialize)]
+pub(crate) struct KiroLatencyRankingRequest {
+    #[serde(default)]
+    source: Option<String>,
+    #[serde(default)]
+    window: Option<String>,
 }
 
 /// Aggregate totals over the full filtered result set.
@@ -329,6 +339,35 @@ pub(crate) async fn usage_metrics_snapshot(
     }
 }
 
+/// Return the compact Kiro latency snapshot used by API-side route ordering.
+pub(crate) async fn kiro_latency_ranking_snapshot(
+    State(state): State<UsageQueryState>,
+    Query(request): Query<KiroLatencyRankingRequest>,
+) -> Response {
+    let query = match normalize_kiro_latency_ranking_query(request) {
+        Ok(query) => query,
+        Err(message) => {
+            tracing::warn!(message, "invalid kiro latency ranking query");
+            return (StatusCode::BAD_REQUEST, message).into_response();
+        },
+    };
+    match state
+        .usage_analytics_store
+        .kiro_latency_ranking_snapshot(query)
+        .await
+    {
+        Ok(snapshot) => Json(snapshot).into_response(),
+        Err(err) => {
+            tracing::error!(error = ?err, "failed to load kiro latency ranking snapshot");
+            (
+                axum::http::StatusCode::INTERNAL_SERVER_ERROR,
+                format!("Failed to load Kiro latency ranking snapshot: {err:#}"),
+            )
+                .into_response()
+        },
+    }
+}
+
 async fn list_usage_events(
     state: UsageQueryState,
     request: ListUsageEventsRequest,
@@ -512,6 +551,38 @@ fn normalize_usage_metrics_query(
             .top_limit
             .unwrap_or(DEFAULT_USAGE_METRICS_TOP_LIMIT)
             .clamp(1, MAX_USAGE_METRICS_TOP_LIMIT),
+    })
+}
+
+fn normalize_kiro_latency_ranking_query(
+    request: KiroLatencyRankingRequest,
+) -> Result<KiroLatencyRankingQuery, &'static str> {
+    let source = match request
+        .source
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        Some(value) => UsageEventSource::from_query_value(value)
+            .ok_or("source must be one of hot, archive, or all")?,
+        None => UsageEventSource::Hot,
+    };
+    let window = request
+        .window
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("1h");
+    let window_ms = match window {
+        "15m" => 15 * 60 * 1000,
+        "1h" => 60 * 60 * 1000,
+        _ => return Err("window must be one of 15m or 1h"),
+    };
+    let end_ms = now_ms();
+    Ok(KiroLatencyRankingQuery {
+        source,
+        start_ms: end_ms.saturating_sub(window_ms),
+        end_ms,
     })
 }
 

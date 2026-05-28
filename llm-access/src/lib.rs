@@ -14,6 +14,7 @@ mod geoip;
 /// Local Kiro endpoints.
 pub mod kiro;
 mod kiro_headers;
+mod kiro_latency;
 mod kiro_refresh;
 mod kiro_status;
 mod process_memory;
@@ -178,12 +179,13 @@ fn duckdb_schema_output_path(config: &StorageConfig) -> PathBuf {
 pub fn router(runtime: runtime::LlmAccessRuntime) -> Router {
     let request_activity = Arc::new(activity::RequestActivityTracker::new());
     let geoip = runtime.geoip();
-    let provider_state = provider::ProviderState::new_with_config_store_and_activity(
+    let provider_state = provider::ProviderState::new_with_config_store_activity_and_latency(
         runtime.control_store(),
         runtime.provider_route_store(),
         runtime.admin_config_store(),
         Arc::clone(&request_activity),
         geoip.clone(),
+        runtime.kiro_latency_ranker(),
     );
     let state = HttpState {
         provider_state,
@@ -494,6 +496,10 @@ pub async fn serve(config: ServeConfig) -> anyhow::Result<()> {
     ) {
         codex_status::spawn_codex_status_refresher(&service_runtime);
         kiro_status::spawn_kiro_status_refresher(&service_runtime);
+        kiro_latency::spawn_kiro_latency_refresher(
+            service_runtime.admin_config_store(),
+            service_runtime.kiro_latency_ranker(),
+        );
     } else {
         tracing::info!(
             "background provider status refresh is disabled by \

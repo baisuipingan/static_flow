@@ -24,11 +24,13 @@ use flate2::{read::GzDecoder, write::GzEncoder, Compression};
 use llm_access_core::{
     provider::{ProtocolFamily, ProviderType, RouteStrategy},
     store::{
-        AdminRuntimeConfig, UsageAnalyticsStore, UsageChartPoint, UsageEventPage, UsageEventQuery,
-        UsageEventSink, UsageEventSource, UsageEventStatusKind, UsageEventTotals,
+        AdminRuntimeConfig, KiroLatencyRankingQuery, KiroLatencyRankingRow,
+        KiroLatencyRankingSnapshot, UsageAnalyticsStore, UsageChartPoint, UsageEventPage,
+        UsageEventQuery, UsageEventSink, UsageEventSource, UsageEventStatusKind, UsageEventTotals,
         UsageFilterOptions, UsageMetricsDimensionView, UsageMetricsQuery, UsageMetricsSnapshot,
         UsageMetricsStatusCodeView, UsageMetricsSummary,
         DEFAULT_DUCKDB_USAGE_CHECKPOINT_THRESHOLD_MIB, DEFAULT_DUCKDB_USAGE_MEMORY_LIMIT_MIB,
+        PROVIDER_KIRO,
     },
     usage::{UsageEvent, UsageStreamDetails, UsageTiming},
 };
@@ -4260,6 +4262,33 @@ impl UsageAnalyticsStore for DuckDbUsageRepository {
         .await
         .context("duckdb usage metrics task failed")?
     }
+
+    async fn kiro_latency_ranking_snapshot(
+        &self,
+        query: KiroLatencyRankingQuery,
+    ) -> anyhow::Result<KiroLatencyRankingSnapshot> {
+        let inner = Arc::clone(&self.inner);
+        task::spawn_blocking(move || match inner.as_ref() {
+            DuckDbUsageRepositoryInner::Single {
+                state, ..
+            } => {
+                let path = {
+                    let state = state
+                        .lock()
+                        .map_err(|_| anyhow!("single duckdb state lock poisoned"))?;
+                    state.path.clone()
+                };
+                kiro_latency_ranking_snapshot_from_path(&path, &query)
+            },
+            DuckDbUsageRepositoryInner::Tiered {
+                state,
+                catalog_backend,
+                ..
+            } => kiro_latency_ranking_snapshot_from_tiered(state, catalog_backend.as_ref(), &query),
+        })
+        .await
+        .context("duckdb kiro latency ranking task failed")?
+    }
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -5563,6 +5592,25 @@ impl UsageMetricsAccumulator {
             non_ok_status_codes,
         }
     }
+
+    fn into_kiro_latency_ranking(
+        self,
+        query: &KiroLatencyRankingQuery,
+    ) -> KiroLatencyRankingSnapshot {
+        KiroLatencyRankingSnapshot {
+            generated_at_ms: now_ms(),
+            start_ms: query.start_ms,
+            end_ms: query.end_ms,
+            source: query.source,
+            first_token_samples: self.summary.first_token_samples,
+            avg_first_token_ms: average_metric_ms(
+                self.summary.first_token_sum_ms,
+                self.summary.first_token_samples,
+            ),
+            accounts: kiro_latency_account_rows(&self.accounts),
+            proxies: kiro_latency_proxy_rows(&self.proxies),
+        }
+    }
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -5593,6 +5641,63 @@ fn usage_metrics_group_view(group: &UsageMetricsGroupAccumulator) -> UsageMetric
         usage_missing_count: group.usage_missing_count,
         credit_usage_missing_count: group.credit_usage_missing_count,
     }
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn kiro_latency_row(group: &UsageMetricsGroupAccumulator) -> KiroLatencyRankingRow {
+    KiroLatencyRankingRow {
+        key: group.key.clone(),
+        label: group.label.clone(),
+        account_name: group.account_name.clone(),
+        proxy_config_id: group.proxy_config_id.clone(),
+        proxy_config_name: group.proxy_config_name.clone(),
+        proxy_url: group.proxy_url.clone(),
+        proxy_source: group.proxy_source.clone(),
+        first_token_samples: group.first_token_samples,
+        avg_first_token_ms: average_metric_ms(group.first_token_sum_ms, group.first_token_samples),
+        max_first_token_ms: group.max_first_token_ms,
+    }
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn kiro_latency_account_rows(
+    groups: &BTreeMap<String, UsageMetricsGroupAccumulator>,
+) -> Vec<KiroLatencyRankingRow> {
+    let mut rows = groups
+        .values()
+        .filter(|group| group.account_name.is_some() && group.first_token_samples > 0)
+        .map(kiro_latency_row)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.avg_first_token_ms
+            .unwrap_or(f64::INFINITY)
+            .total_cmp(&right.avg_first_token_ms.unwrap_or(f64::INFINITY))
+            .then_with(|| right.first_token_samples.cmp(&left.first_token_samples))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    rows
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn kiro_latency_proxy_rows(
+    groups: &BTreeMap<String, UsageMetricsGroupAccumulator>,
+) -> Vec<KiroLatencyRankingRow> {
+    let mut rows = groups
+        .values()
+        .filter(|group| {
+            group.first_token_samples > 0
+                && (group.proxy_url.is_some() || group.proxy_config_id.is_some())
+        })
+        .map(kiro_latency_row)
+        .collect::<Vec<_>>();
+    rows.sort_by(|left, right| {
+        left.avg_first_token_ms
+            .unwrap_or(f64::INFINITY)
+            .total_cmp(&right.avg_first_token_ms.unwrap_or(f64::INFINITY))
+            .then_with(|| right.first_token_samples.cmp(&left.first_token_samples))
+            .then_with(|| left.label.cmp(&right.label))
+    });
+    rows
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -5784,6 +5889,59 @@ fn usage_metrics_snapshot_from_tiered(
         }
     }
     Ok(accumulator.into_snapshot(query))
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn kiro_latency_metrics_query(query: &KiroLatencyRankingQuery) -> UsageMetricsQuery {
+    UsageMetricsQuery {
+        provider_type: Some(PROVIDER_KIRO.to_string()),
+        source: query.source,
+        start_ms: query.start_ms,
+        end_ms: query.end_ms,
+        top_limit: usize::MAX,
+    }
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn kiro_latency_ranking_snapshot_from_path(
+    path: &Path,
+    query: &KiroLatencyRankingQuery,
+) -> anyhow::Result<KiroLatencyRankingSnapshot> {
+    let conn = DuckDbUsageRepository::open_read_only_conn(path)?;
+    let metrics_query = kiro_latency_metrics_query(query);
+    let mut accumulator = UsageMetricsAccumulator::default();
+    accumulate_usage_metrics_from_conn(&mut accumulator, &conn, &metrics_query)?;
+    Ok(accumulator.into_kiro_latency_ranking(query))
+}
+
+#[cfg(feature = "duckdb-runtime")]
+fn kiro_latency_ranking_snapshot_from_tiered(
+    state: &Mutex<TieredDuckDbUsageState>,
+    catalog_backend: &TieredUsageCatalogBackend,
+    query: &KiroLatencyRankingQuery,
+) -> anyhow::Result<KiroLatencyRankingSnapshot> {
+    let metrics_query = kiro_latency_metrics_query(query);
+    let mut accumulator = UsageMetricsAccumulator::default();
+    if query.source.includes_hot() {
+        let active_path = {
+            let state = state
+                .lock()
+                .map_err(|_| anyhow!("tiered duckdb state lock poisoned"))?;
+            state.active_path.clone()
+        };
+        let conn = DuckDbUsageRepository::open_read_only_conn(&active_path)?;
+        accumulate_usage_metrics_from_conn(&mut accumulator, &conn, &metrics_query)?;
+    }
+    if query.source.includes_archive() {
+        for segment in archived_segments_for_query(
+            catalog_backend,
+            &usage_metrics_query_as_segment_filter(&metrics_query),
+        )? {
+            let conn = DuckDbUsageRepository::open_read_only_conn(&segment.archive_path)?;
+            accumulate_usage_metrics_from_conn(&mut accumulator, &conn, &metrics_query)?;
+        }
+    }
+    Ok(accumulator.into_kiro_latency_ranking(query))
 }
 
 #[cfg(feature = "duckdb-runtime")]
@@ -6002,8 +6160,8 @@ mod tests {
     use llm_access_core::{
         provider::{ProtocolFamily, ProviderType, RouteStrategy},
         store::{
-            UsageAnalyticsStore, UsageEventQuery, UsageEventSink, UsageEventSource,
-            UsageEventStatusKind, UsageFilterOptions, UsageMetricsQuery,
+            KiroLatencyRankingQuery, UsageAnalyticsStore, UsageEventQuery, UsageEventSink,
+            UsageEventSource, UsageEventStatusKind, UsageFilterOptions, UsageMetricsQuery,
         },
         usage::{UsageEvent, UsageStreamDetails, UsageTiming},
     };
@@ -9025,6 +9183,24 @@ mod tests {
                 .first()
                 .map(|row| row.status_code),
             Some(524)
+        );
+        let ranking = repo
+            .kiro_latency_ranking_snapshot(KiroLatencyRankingQuery {
+                source: UsageEventSource::Hot,
+                start_ms: 1_700_000_000_000,
+                end_ms: 1_700_000_200_000,
+            })
+            .await
+            .expect("fetch kiro latency ranking snapshot");
+        assert_eq!(ranking.first_token_samples, 2);
+        assert_eq!(ranking.accounts.len(), 2);
+        assert_eq!(ranking.proxies.len(), 2);
+        assert_eq!(
+            ranking
+                .accounts
+                .first()
+                .and_then(|row| row.account_name.as_deref()),
+            Some("acct-fast")
         );
 
         std::fs::remove_dir_all(&root).expect("cleanup metrics test directory");

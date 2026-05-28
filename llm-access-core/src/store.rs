@@ -545,6 +545,8 @@ pub struct AdminKey {
     /// Whether URL image/document sources should be fetched server-side and
     /// rewritten to inline Kiro media payloads.
     pub kiro_remote_media_resolution_enabled: bool,
+    /// Whether recent first-token metrics may influence Kiro route ordering.
+    pub kiro_latency_routing_enabled: bool,
     /// Kiro cache policy override JSON.
     pub kiro_cache_policy_override_json: Option<String>,
     /// Kiro billable multiplier override JSON.
@@ -815,6 +817,8 @@ pub struct AdminKeyPatch {
     pub kiro_full_request_logging_enabled: Option<bool>,
     /// New Kiro remote-media resolution toggle.
     pub kiro_remote_media_resolution_enabled: Option<bool>,
+    /// New Kiro latency-routing toggle.
+    pub kiro_latency_routing_enabled: Option<bool>,
     /// New Kiro cache policy override JSON.
     pub kiro_cache_policy_override_json: Option<Option<String>>,
     /// New Kiro billable model multiplier override JSON.
@@ -1773,6 +1777,8 @@ pub struct ProviderKiroRoute {
     pub full_request_logging_enabled: bool,
     /// Whether public URL image/document sources may be fetched server-side.
     pub remote_media_resolution_enabled: bool,
+    /// Whether recent Kiro latency metrics may influence route ordering.
+    pub latency_routing_enabled: bool,
     /// JSON object mapping public model names to upstream Kiro model names.
     pub model_name_map_json: String,
     /// Effective Kiro cache k-model JSON for this key.
@@ -2524,6 +2530,14 @@ pub trait UsageAnalyticsStore: Send + Sync {
         &self,
         query: UsageMetricsQuery,
     ) -> anyhow::Result<UsageMetricsSnapshot>;
+
+    /// Return the compact Kiro latency snapshot used by API-side routing.
+    async fn kiro_latency_ranking_snapshot(
+        &self,
+        _query: KiroLatencyRankingQuery,
+    ) -> anyhow::Result<KiroLatencyRankingSnapshot> {
+        Ok(KiroLatencyRankingSnapshot::default())
+    }
 }
 
 /// Distinct values available for usage filter autocomplete.
@@ -2680,6 +2694,63 @@ pub struct UsageMetricsSnapshot {
     pub top_disconnect_proxies: Vec<UsageMetricsDimensionView>,
     /// Non-OK status-code distribution.
     pub non_ok_status_codes: Vec<UsageMetricsStatusCodeView>,
+}
+
+/// Query for API-side Kiro latency routing weights.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct KiroLatencyRankingQuery {
+    /// Physical usage-event source.
+    pub source: UsageEventSource,
+    /// Inclusive lower timestamp bound in Unix milliseconds.
+    pub start_ms: i64,
+    /// Exclusive upper timestamp bound in Unix milliseconds.
+    pub end_ms: i64,
+}
+
+/// One latency row grouped by Kiro account or proxy.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct KiroLatencyRankingRow {
+    /// Stable grouping key.
+    pub key: String,
+    /// Human-readable label.
+    pub label: String,
+    /// Account name when this row represents an account.
+    pub account_name: Option<String>,
+    /// Proxy config id when known.
+    pub proxy_config_id: Option<String>,
+    /// Proxy config name when known.
+    pub proxy_config_name: Option<String>,
+    /// Proxy URL when known.
+    pub proxy_url: Option<String>,
+    /// Proxy source (`fixed`, `binding`, `none`, ...).
+    pub proxy_source: Option<String>,
+    /// Samples carrying first-token timing.
+    pub first_token_samples: u64,
+    /// Average first-token latency in milliseconds.
+    pub avg_first_token_ms: Option<f64>,
+    /// Maximum first-token latency in milliseconds.
+    pub max_first_token_ms: Option<i64>,
+}
+
+/// Compact Kiro latency routing snapshot for one recent window.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, Default)]
+pub struct KiroLatencyRankingSnapshot {
+    /// Generation timestamp in Unix milliseconds.
+    pub generated_at_ms: i64,
+    /// Inclusive lower timestamp bound in Unix milliseconds.
+    pub start_ms: i64,
+    /// Exclusive upper timestamp bound in Unix milliseconds.
+    pub end_ms: i64,
+    /// Effective usage source.
+    pub source: UsageEventSource,
+    /// Total first-token samples across the snapshot.
+    pub first_token_samples: u64,
+    /// Global average first-token latency in milliseconds.
+    pub avg_first_token_ms: Option<f64>,
+    /// Account latency rows. This is intentionally full, not top-N.
+    pub accounts: Vec<KiroLatencyRankingRow>,
+    /// Proxy latency rows. This is intentionally full, not top-N.
+    pub proxies: Vec<KiroLatencyRankingRow>,
 }
 
 /// Public write queries used by unauthenticated public endpoints.
@@ -3520,6 +3591,7 @@ impl AdminKeyStore for EmptyAdminKeyStore {
             kiro_zero_cache_debug_enabled: false,
             kiro_full_request_logging_enabled: false,
             kiro_remote_media_resolution_enabled: false,
+            kiro_latency_routing_enabled: true,
             kiro_cache_policy_override_json: None,
             kiro_billable_model_multipliers_override_json: None,
             effective_kiro_cache_policy_json: default_kiro_cache_policy_json(),

@@ -6056,6 +6056,8 @@ pub struct AdminLlmGatewayKeyView {
     pub kiro_full_request_logging_enabled: bool,
     #[serde(default)]
     pub kiro_remote_media_resolution_enabled: bool,
+    #[serde(default = "default_true")]
+    pub kiro_latency_routing_enabled: bool,
     #[serde(default)]
     pub kiro_cache_policy_override_json: Option<String>,
     #[serde(default)]
@@ -8714,6 +8716,7 @@ pub async fn create_admin_llm_gateway_key(
             kiro_zero_cache_debug_enabled: false,
             kiro_full_request_logging_enabled: false,
             kiro_remote_media_resolution_enabled: false,
+            kiro_latency_routing_enabled: true,
             kiro_cache_policy_override_json: None,
             kiro_billable_model_multipliers_override_json: None,
             effective_kiro_cache_policy_json: String::new(),
@@ -8770,6 +8773,7 @@ pub struct PatchAdminLlmGatewayKeyRequest<'a> {
     pub kiro_zero_cache_debug_enabled: Option<bool>,
     pub kiro_full_request_logging_enabled: Option<bool>,
     pub kiro_remote_media_resolution_enabled: Option<bool>,
+    pub kiro_latency_routing_enabled: Option<bool>,
     pub kiro_cache_policy_override_json: Option<Option<&'a str>>,
     pub kiro_billable_model_multipliers_override_json: Option<Option<&'a str>>,
     pub request_max_concurrency_unlimited: bool,
@@ -8801,6 +8805,7 @@ pub async fn patch_admin_llm_gateway_key(
             request.kiro_zero_cache_debug_enabled,
             request.kiro_full_request_logging_enabled,
             request.kiro_remote_media_resolution_enabled,
+            request.kiro_latency_routing_enabled,
             request.kiro_cache_policy_override_json,
             request.kiro_billable_model_multipliers_override_json,
             request.request_max_concurrency_unlimited,
@@ -8922,6 +8927,12 @@ pub async fn patch_admin_llm_gateway_key(
             body.insert(
                 "kiro_remote_media_resolution_enabled".to_string(),
                 serde_json::Value::Bool(kiro_remote_media_resolution_enabled),
+            );
+        }
+        if let Some(kiro_latency_routing_enabled) = request.kiro_latency_routing_enabled {
+            body.insert(
+                "kiro_latency_routing_enabled".to_string(),
+                serde_json::Value::Bool(kiro_latency_routing_enabled),
             );
         }
         if let Some(kiro_cache_policy_override_json) = request.kiro_cache_policy_override_json {
@@ -10757,6 +10768,7 @@ pub async fn create_admin_kiro_key(
             kiro_zero_cache_debug_enabled: false,
             kiro_full_request_logging_enabled: false,
             kiro_remote_media_resolution_enabled: false,
+            kiro_latency_routing_enabled: true,
             kiro_cache_policy_override_json: None,
             kiro_billable_model_multipliers_override_json: None,
             effective_kiro_cache_policy_json: String::new(),
@@ -10814,6 +10826,7 @@ pub async fn patch_admin_kiro_key(
             request.kiro_zero_cache_debug_enabled,
             request.kiro_full_request_logging_enabled,
             request.kiro_remote_media_resolution_enabled,
+            request.kiro_latency_routing_enabled,
             request.kiro_cache_policy_override_json,
             request.kiro_billable_model_multipliers_override_json,
             request.request_max_concurrency_unlimited,
@@ -10917,6 +10930,12 @@ pub async fn patch_admin_kiro_key(
             body.insert(
                 "kiro_remote_media_resolution_enabled".to_string(),
                 serde_json::Value::Bool(kiro_remote_media_resolution_enabled),
+            );
+        }
+        if let Some(kiro_latency_routing_enabled) = request.kiro_latency_routing_enabled {
+            body.insert(
+                "kiro_latency_routing_enabled".to_string(),
+                serde_json::Value::Bool(kiro_latency_routing_enabled),
             );
         }
         if let Some(kiro_cache_policy_override_json) = request.kiro_cache_policy_override_json {

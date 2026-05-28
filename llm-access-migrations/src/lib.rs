@@ -68,6 +68,11 @@ const POSTGRES_MIGRATIONS: &[SqlMigration] = &[
         name: "usage_catalog_segment_filters",
         sql: include_str!("../migrations/postgres/0016_usage_catalog_segment_filters.sql"),
     },
+    SqlMigration {
+        version: 17,
+        name: "kiro_latency_routing_toggle",
+        sql: include_str!("../migrations/postgres/0017_kiro_latency_routing_toggle.sql"),
+    },
 ];
 
 /// Return target DuckDB migrations in execution order.
@@ -241,5 +246,18 @@ mod tests {
         assert!(migration
             .sql
             .contains("CREATE TABLE IF NOT EXISTS llm_usage_segment_key_rollups"));
+    }
+
+    #[test]
+    fn postgres_migrations_include_kiro_latency_routing_toggle() {
+        let migrations = super::postgres_migrations();
+        let migration = migrations
+            .iter()
+            .find(|migration| migration.name == "kiro_latency_routing_toggle")
+            .expect("kiro latency routing migration exists");
+
+        assert_eq!(migration.version, 17);
+        assert!(migration.sql.contains("kiro_latency_routing_enabled"));
+        assert!(migration.sql.contains("DEFAULT TRUE"));
     }
 }

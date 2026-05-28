@@ -526,6 +526,8 @@ pub(crate) struct PatchLlmGatewayKeyRequest {
     #[serde(default)]
     kiro_remote_media_resolution_enabled: Option<bool>,
     #[serde(default)]
+    kiro_latency_routing_enabled: Option<bool>,
+    #[serde(default)]
     kiro_cache_policy_override_json: Option<Option<String>>,
     #[serde(default)]
     kiro_billable_model_multipliers_override_json: Option<Option<String>>,
@@ -5388,6 +5390,7 @@ fn normalize_key_patch(
         kiro_zero_cache_debug_enabled: request.kiro_zero_cache_debug_enabled,
         kiro_full_request_logging_enabled: request.kiro_full_request_logging_enabled,
         kiro_remote_media_resolution_enabled: request.kiro_remote_media_resolution_enabled,
+        kiro_latency_routing_enabled: request.kiro_latency_routing_enabled,
         kiro_cache_policy_override_json: request.kiro_cache_policy_override_json,
         kiro_billable_model_multipliers_override_json,
         updated_at_ms: now_ms(),
@@ -6371,6 +6374,7 @@ mod tests {
             kiro_zero_cache_debug_enabled: None,
             kiro_full_request_logging_enabled: None,
             kiro_remote_media_resolution_enabled: None,
+            kiro_latency_routing_enabled: None,
             kiro_cache_policy_override_json: None,
             kiro_billable_model_multipliers_override_json: None,
         }
@@ -6408,6 +6412,7 @@ mod tests {
             kiro_zero_cache_debug_enabled: false,
             kiro_full_request_logging_enabled: false,
             kiro_remote_media_resolution_enabled: false,
+            kiro_latency_routing_enabled: true,
             kiro_cache_policy_override_json: policy_override_json,
             kiro_billable_model_multipliers_override_json: None,
             effective_kiro_cache_policy_json: "{}".to_string(),

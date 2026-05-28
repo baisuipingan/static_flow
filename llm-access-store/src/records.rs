@@ -72,6 +72,8 @@ pub struct KeyRouteConfig {
     pub kiro_full_request_logging_enabled: bool,
     /// Whether URL image/document sources should be fetched server-side.
     pub kiro_remote_media_resolution_enabled: bool,
+    /// Whether recent Kiro latency metrics may influence route ordering.
+    pub kiro_latency_routing_enabled: bool,
     /// Optional Kiro cache policy override JSON.
     pub kiro_cache_policy_override_json: Option<String>,
     /// Optional Kiro billable multiplier override JSON.
