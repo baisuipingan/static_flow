@@ -26,7 +26,12 @@ grep -F 'cargo build -p llm-access --release' "$LOCAL_SCRIPT" >/dev/null
 grep -F 'render_llm_access_cloud_bundle.sh' "$LOCAL_SCRIPT" >/dev/null
 grep -F 'scp ' "$LOCAL_SCRIPT" >/dev/null
 grep -F 'llm-access.latest' "$LOCAL_SCRIPT" >/dev/null
+grep -F '.local/llm-access-cloud-release-aws.env' "$LOCAL_SCRIPT" >/dev/null
 grep -F '.local/llm-access-cloud-release.env' "$LOCAL_SCRIPT" >/dev/null
+grep -F '.local/llm-access-cloud-release-aws.env' "$API_ONLY_SCRIPT" >/dev/null
+grep -F '.local/llm-access-cloud-release.env' "$API_ONLY_SCRIPT" >/dev/null
+grep -F '.local/llm-access-cloud-release-aws.env' "$WORKER_ONLY_SCRIPT" >/dev/null
+grep -F '.local/llm-access-cloud-release.env' "$WORKER_ONLY_SCRIPT" >/dev/null
 grep -F 'source "$CONFIG_FILE"' "$LOCAL_SCRIPT" >/dev/null
 ! grep -F 'pgrep' "$LOCAL_SCRIPT" >/dev/null
 ! grep -F 'another Rust/frontend build appears to be running' "$LOCAL_SCRIPT" >/dev/null

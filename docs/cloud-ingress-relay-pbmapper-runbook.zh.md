@@ -44,14 +44,15 @@ public client
 
 ## 2. 云主机预检
 
-云主机公网地址、SSH 用户、SSH key 路径不写入 tracked 文档。它们统一放在
-本机 ignored 配置 `.local/llm-access-cloud-release.env`，新 checkout 用
+云主机公网地址、SSH 用户、SSH key 路径不写入 tracked 文档。它们优先放在
+本机 ignored 配置 `.local/llm-access-cloud-release-aws.env`；发布脚本会回退
+到旧的 `.local/llm-access-cloud-release.env`。新 checkout 用
 `conf/llm-access-cloud-release.env.example` 复制后填写。这个文件当前仍沿用
 历史命名的 `GCP_*` 变量，但现网 active host 已经是 AWS。
 
 ```bash
 set -a
-source .local/llm-access-cloud-release.env
+source .local/llm-access-cloud-release-aws.env
 set +a
 ssh -i "$GCP_SSH_KEY" -o IdentitiesOnly=yes "$GCP_DEST"
 ```
@@ -62,7 +63,7 @@ ssh -i "$GCP_SSH_KEY" -o IdentitiesOnly=yes "$GCP_DEST"
 
 ```bash
 set -a
-source .local/llm-access-cloud-release.env
+source .local/llm-access-cloud-release-aws.env
 set +a
 ssh -i "$GCP_SSH_KEY" -o IdentitiesOnly=yes "$GCP_DEST" \
   'hostname; date -u +%FT%TZ; sudo ss -lntup'
@@ -288,7 +289,7 @@ Caddy/pb-mapper/local Pingora 链路。
 
 ```bash
 set -a
-source .local/llm-access-cloud-release.env
+source .local/llm-access-cloud-release-aws.env
 set +a
 ssh -i "$GCP_SSH_KEY" -o IdentitiesOnly=yes "$GCP_DEST"
 sudo systemctl restart caddy
@@ -338,8 +339,10 @@ env -u https_proxy -u HTTPS_PROXY -u http_proxy -u HTTP_PROXY -u all_proxy -u AL
   curl -I https://staticflow.cc/_caddy_health
 ```
 
-当前 active cloud host 以 `.local/llm-access-cloud-release.env` 里的
-`GCP_HOST` 或 `GCP_DEST` 为准。对 `ackingliu.top` / `www.ackingliu.top`，
+当前 active cloud host 以优先配置
+`.local/llm-access-cloud-release-aws.env` 里的 `GCP_HOST` 或 `GCP_DEST`
+为准；如果它不存在，发布脚本才会回退到旧的
+`.local/llm-access-cloud-release.env`。对 `ackingliu.top` / `www.ackingliu.top`，
 公共 DNS 直接返回 AWS origin 是正常的；对 `staticflow.cc` /
 `www.staticflow.cc`，公共 DNS 返回 Cloudflare Anycast IP 也是正常的，
 因为它们仍然走 orange-cloud。对这组域名，验证重点不是 A 记录是否等于

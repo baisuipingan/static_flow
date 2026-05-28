@@ -2,7 +2,7 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-CONFIG_FILE="${LLM_ACCESS_CLOUD_RELEASE_CONFIG:-$ROOT_DIR/.local/llm-access-cloud-release.env}"
+CONFIG_FILE=""
 REMOTE_SCRIPT_NAME="activate_llm_access_cloud_release.sh"
 RENDER_DIR="$(mktemp -d "$ROOT_DIR/tmp/llm-access-cloud-worker-only.XXXXXX")"
 
@@ -30,11 +30,24 @@ expand_path() {
   esac
 }
 
+default_config_file() {
+  local preferred="$ROOT_DIR/.local/llm-access-cloud-release-aws.env"
+  local legacy="$ROOT_DIR/.local/llm-access-cloud-release.env"
+  if [[ -n "${LLM_ACCESS_CLOUD_RELEASE_CONFIG:-}" ]]; then
+    printf '%s\n' "$LLM_ACCESS_CLOUD_RELEASE_CONFIG"
+  elif [[ -r "$preferred" ]]; then
+    printf '%s\n' "$preferred"
+  else
+    printf '%s\n' "$legacy"
+  fi
+}
+
 require_var() {
   local name="$1"
   [[ -n "${!name:-}" ]] || fail "missing required config value: $name in $CONFIG_FILE"
 }
 
+CONFIG_FILE="$(default_config_file)"
 [[ -r "$CONFIG_FILE" ]] || fail "missing config file: $CONFIG_FILE"
 # shellcheck source=/dev/null
 source "$CONFIG_FILE"

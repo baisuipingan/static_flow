@@ -4,7 +4,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 REMOTE_SCRIPT="$ROOT_DIR/scripts/activate_llm_access_cloud_release.sh"
 RENDER_SCRIPT="$ROOT_DIR/scripts/render_llm_access_cloud_bundle.sh"
-CONFIG_FILE="${LLM_ACCESS_CLOUD_RELEASE_CONFIG:-$ROOT_DIR/.local/llm-access-cloud-release.env}"
+CONFIG_FILE=""
 LOCAL_NEON_ENV_FILE="${LLM_ACCESS_LOCAL_NEON_ENV_FILE:-$ROOT_DIR/.local/llm-access-neon.env}"
 
 log() {
@@ -38,7 +38,20 @@ expand_path() {
   esac
 }
 
+default_config_file() {
+  local preferred="$ROOT_DIR/.local/llm-access-cloud-release-aws.env"
+  local legacy="$ROOT_DIR/.local/llm-access-cloud-release.env"
+  if [[ -n "${LLM_ACCESS_CLOUD_RELEASE_CONFIG:-}" ]]; then
+    printf '%s\n' "$LLM_ACCESS_CLOUD_RELEASE_CONFIG"
+  elif [[ -r "$preferred" ]]; then
+    printf '%s\n' "$preferred"
+  else
+    printf '%s\n' "$legacy"
+  fi
+}
+
 load_config() {
+  CONFIG_FILE="$(default_config_file)"
   [[ -r "$CONFIG_FILE" ]] || fail "missing config file: $CONFIG_FILE; copy conf/llm-access-cloud-release.env.example and edit it"
   # shellcheck source=/dev/null
   source "$CONFIG_FILE"

@@ -12,8 +12,10 @@ ignored local env file still uses legacy `GCP_*` variable names.
 
 Current source-of-truth production facts verified on 2026-05-28:
 - Active public front door and single live `core` run on the AWS/Lightsail
-  cloud host referenced by `.local/llm-access-cloud-release.env`. That ignored
-  file still uses legacy `GCP_*` variable names.
+  cloud host referenced by the preferred local config
+  `.local/llm-access-cloud-release-aws.env`. Release scripts fall back to the
+  legacy `.local/llm-access-cloud-release.env`. Both ignored files still use
+  legacy `GCP_*` variable names.
 - `ackingliu.top` and `www.ackingliu.top` resolve directly to the AWS origin.
 - `staticflow.cc` and `www.staticflow.cc` stay behind Cloudflare
   orange-cloud, but terminate on the same AWS Caddy origin; the origin must
@@ -66,14 +68,15 @@ Current cloud / Valkey / JuiceFS facts verified on 2026-05-28. Concrete host,
 user, key, bucket, account, and metadata endpoint values remain in ignored
 private env files, not in tracked docs.
 
-- Local private cloud-release config is:
-  `.local/llm-access-cloud-release.env`. Copy
+- Local private cloud-release config is preferably
+  `.local/llm-access-cloud-release-aws.env`. Release scripts fall back to the
+  legacy `.local/llm-access-cloud-release.env`. Copy
   `conf/llm-access-cloud-release.env.example` when bootstrapping a new checkout.
 - Cloud SSH login from this workstation currently still uses the legacy
   variable names from that file:
   ```bash
   set -a
-  source .local/llm-access-cloud-release.env
+  source .local/llm-access-cloud-release-aws.env
   set +a
   ssh -i "$GCP_SSH_KEY" -o IdentitiesOnly=yes "$GCP_DEST"
   ```
@@ -442,9 +445,11 @@ host; keep swap as an emergency buffer, not as normal working memory.
 - Keep a local ignored copy of the shared Neon control config at
   `.local/llm-access-neon.env`. It must define
   `LLM_ACCESS_CONTROL_DATABASE_URL=postgresql://...`.
-- The ignored cloud-release env file still uses legacy `GCP_*` variable names
-  even though the active host is AWS. Do not rename those variables without
-  updating the release scripts.
+- The preferred ignored cloud-release env file is now
+  `.local/llm-access-cloud-release-aws.env`, with the legacy
+  `.local/llm-access-cloud-release.env` kept only as a script fallback. Both
+  still use legacy `GCP_*` variable names. Do not rename those variables
+  without updating the release scripts.
 - `prepare_llm_access_cloud_release.sh` now treats that local file as the
   release source of truth, uploads it into the staged bundle, and
   `activate_llm_access_cloud_release.sh` installs it back onto the live JuiceFS
@@ -457,7 +462,7 @@ host; keep swap as an emergency buffer, not as normal working memory.
 - Remote activation:
   ```bash
   set -a
-  source .local/llm-access-cloud-release.env
+  source .local/llm-access-cloud-release-aws.env
   set +a
   ssh -i "$GCP_SSH_KEY" -o IdentitiesOnly=yes "$GCP_DEST" \
     "$REMOTE_RELEASE_DIR/activate_llm_access_cloud_release.sh"
@@ -584,7 +589,7 @@ normal downstream latency:
 
 ```bash
 set -a
-source .local/llm-access-cloud-release.env
+source .local/llm-access-cloud-release-aws.env
 set +a
 ssh -i "$GCP_SSH_KEY" -o IdentitiesOnly=yes "$GCP_DEST"
 sudo systemctl restart caddy
@@ -596,7 +601,7 @@ After restart, verify both the relay path and public path:
 
 ```bash
 set -a
-source .local/llm-access-cloud-release.env
+source .local/llm-access-cloud-release-aws.env
 set +a
 ssh -i "$GCP_SSH_KEY" -o IdentitiesOnly=yes "$GCP_DEST" \
   "curl -o /dev/null -sS -w 'code=%{http_code} size=%{size_download} start=%{time_starttransfer} total=%{time_total}\n' \
