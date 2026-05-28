@@ -30,6 +30,7 @@ use crate::{
     email::EmailNotifier,
     geoip::GeoIpResolver,
     gpt2api_rs::Gpt2ApiRsState,
+    llm_access_admin_proxy::LlmAccessAdminProxyState,
     music_wish_worker::{self, MusicWishWorkerConfig},
     public_submit_guard::PublicSubmitGuard,
     table_maintenance,
@@ -236,6 +237,7 @@ pub struct AppState {
     pub(crate) shutdown_rx: watch::Receiver<bool>,
     pub(crate) frontend_dist_dir: Arc<PathBuf>,
     pub(crate) runtime_metadata: Arc<RuntimeMetadata>,
+    pub(crate) llm_access_admin_proxy: Arc<LlmAccessAdminProxyState>,
     #[cfg(feature = "local-media")]
     pub(crate) media_proxy: Option<Arc<MediaProxyState>>,
 }
@@ -265,6 +267,7 @@ impl AppState {
         let geoip = GeoIpResolver::from_env()?;
         geoip.warmup().await;
         let gpt2api_rs = Arc::new(Gpt2ApiRsState::load_from_env().await?);
+        let llm_access_admin_proxy = LlmAccessAdminProxyState::from_env()?;
         let email_notifier = EmailNotifier::from_env()?.map(Arc::new);
         let runtime_metadata = Arc::new(RuntimeMetadata {
             started_at_ms: chrono::Utc::now().timestamp_millis(),
@@ -364,6 +367,7 @@ impl AppState {
             shutdown_rx: app_shutdown_rx,
             frontend_dist_dir: Arc::new(frontend_dist_dir),
             runtime_metadata,
+            llm_access_admin_proxy,
             #[cfg(feature = "local-media")]
             media_proxy,
         })

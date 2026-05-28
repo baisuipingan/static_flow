@@ -102,9 +102,6 @@ const LOCAL_MEDIA_API_BASE_OVERRIDE: Option<&str> = option_env!("STATICFLOW_LOCA
 const LLM_ACCESS_ADMIN_BASE_OVERRIDE: Option<&str> =
     option_env!("STATICFLOW_LLM_ACCESS_ADMIN_BASE");
 
-#[cfg(any(not(feature = "mock"), test))]
-const DEFAULT_LLM_ACCESS_ADMIN_BASE: &str = "http://127.0.0.1:19182";
-
 #[cfg(feature = "mock")]
 pub const API_BASE: &str = "http://localhost:3000/api";
 
@@ -188,19 +185,11 @@ fn resolve_llm_access_admin_base(override_base: Option<&str>, api_base: &str) ->
 #[cfg(any(not(feature = "mock"), test))]
 fn derive_llm_access_admin_base_from_api_base(api_base: &str) -> String {
     let trimmed = api_base.trim();
-    if trimmed.is_empty() || trimmed.starts_with('/') {
-        return DEFAULT_LLM_ACCESS_ADMIN_BASE.to_string();
+    if trimmed.is_empty() {
+        return String::new();
     }
 
     let without_trailing = trimmed.trim_end_matches('/');
-    if without_trailing.starts_with("http://127.0.0.1:")
-        || without_trailing.starts_with("https://127.0.0.1:")
-        || without_trailing.starts_with("http://localhost:")
-        || without_trailing.starts_with("https://localhost:")
-    {
-        return DEFAULT_LLM_ACCESS_ADMIN_BASE.to_string();
-    }
-
     if let Some(prefix) = without_trailing.strip_suffix("/api") {
         return prefix.to_string();
     }
@@ -209,7 +198,7 @@ fn derive_llm_access_admin_base_from_api_base(api_base: &str) -> String {
         return without_trailing.to_string();
     }
 
-    DEFAULT_LLM_ACCESS_ADMIN_BASE.to_string()
+    without_trailing.to_string()
 }
 
 #[cfg(any(not(feature = "mock"), test))]
@@ -11638,15 +11627,15 @@ mod tests {
     }
 
     #[test]
-    fn derive_llm_access_admin_base_from_relative_api_base_uses_local_mirror() {
+    fn derive_llm_access_admin_base_from_relative_api_base_uses_same_origin_admin_path() {
         let base = derive_llm_access_admin_base_from_api_base("/api");
-        assert_eq!(base, "http://127.0.0.1:19182");
+        assert_eq!(base, "");
     }
 
     #[test]
-    fn derive_llm_access_admin_base_from_local_http_api_base_uses_local_mirror() {
+    fn derive_llm_access_admin_base_from_local_http_api_base_uses_backend_origin() {
         let base = derive_llm_access_admin_base_from_api_base("http://127.0.0.1:39080/api");
-        assert_eq!(base, "http://127.0.0.1:19182");
+        assert_eq!(base, "http://127.0.0.1:39080");
     }
 
     #[test]

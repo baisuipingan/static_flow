@@ -8,6 +8,7 @@ mod geoip;
 mod gpt2api_rs;
 mod handlers;
 mod health;
+mod llm_access_admin_proxy;
 #[cfg(feature = "local-media")]
 mod media_proxy;
 mod memory_profiler;

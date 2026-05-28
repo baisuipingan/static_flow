@@ -434,6 +434,31 @@ pub fn create_router(state: AppState) -> Router {
         .route("/admin/local-media/api", any(handlers::local_media_feature_disabled_api))
         .route("/admin/local-media/api/*path", any(handlers::local_media_feature_disabled_api));
 
+    let api_router = api_router
+        .route("/admin/llm-gateway", get(seo::seo_spa_shell))
+        .route("/admin/llm-gateway/monitor", get(seo::seo_spa_shell))
+        .route("/static_flow/admin/llm-gateway", get(seo::seo_spa_shell))
+        .route("/static_flow/admin/llm-gateway/monitor", get(seo::seo_spa_shell))
+        .route("/admin/kiro-gateway", get(seo::seo_spa_shell))
+        .route("/admin/kiro-gateway/accounts", get(seo::seo_spa_shell))
+        .route("/static_flow/admin/kiro-gateway", get(seo::seo_spa_shell))
+        .route("/static_flow/admin/kiro-gateway/accounts", get(seo::seo_spa_shell))
+        .route("/admin/llm-gateway/*path", any(crate::llm_access_admin_proxy::proxy_admin_request))
+        .route(
+            "/static_flow/admin/llm-gateway/*path",
+            any(crate::llm_access_admin_proxy::proxy_admin_request),
+        )
+        .route("/admin/kiro-gateway/*path", any(crate::llm_access_admin_proxy::proxy_admin_request))
+        .route(
+            "/static_flow/admin/kiro-gateway/*path",
+            any(crate::llm_access_admin_proxy::proxy_admin_request),
+        )
+        .route("/admin/llm-access/*path", any(crate::llm_access_admin_proxy::proxy_admin_request))
+        .route(
+            "/static_flow/admin/llm-access/*path",
+            any(crate::llm_access_admin_proxy::proxy_admin_request),
+        );
+
     let api_router = api_router.with_state(state.clone());
 
     // 2) SEO routes — /, /posts/:id, /sitemap.xml, /robots.txt
@@ -441,8 +466,6 @@ pub fn create_router(state: AppState) -> Router {
     let seo_router = Router::new()
         .route("/", get(seo::seo_homepage))
         .route("/posts/:id", get(seo::seo_article_page))
-        .route("/admin/llm-gateway/*path", get(seo::seo_spa_shell))
-        .route("/static_flow/admin/llm-gateway/*path", get(seo::seo_spa_shell))
         .route("/sitemap.xml", get(seo::sitemap_xml))
         .route("/robots.txt", get(seo::robots_txt))
         .with_state(state);
@@ -500,7 +523,7 @@ mod tests {
         body::{to_bytes, Body},
         extract::OriginalUri,
         http::{header, Request, StatusCode},
-        response::Html,
+        response::{Html, Json},
         routing::any,
         routing::get,
         Router,
@@ -510,7 +533,8 @@ mod tests {
         body::{to_bytes, Body},
         extract::OriginalUri,
         http::{header, Request, StatusCode},
-        response::Html,
+        response::{Html, Json},
+        routing::any,
         routing::get,
         Router,
     };
@@ -604,9 +628,13 @@ mod tests {
         let explicit = move |OriginalUri(uri): OriginalUri| async move {
             Html(format!("explicit:{}", uri.path()))
         };
+        let proxy = move |OriginalUri(uri): OriginalUri| async move {
+            Json(serde_json::json!({"proxied": uri.path()}))
+        };
 
         let mut router = Router::new()
-            .route("/admin/llm-gateway/*path", get(explicit))
+            .route("/admin/llm-gateway/monitor", get(explicit))
+            .route("/admin/llm-gateway/*path", any(proxy))
             .fallback_service(ServeDir::new("frontend/dist").fallback(get(fallback)))
             .into_service();
 
@@ -627,6 +655,48 @@ mod tests {
         assert_eq!(
             std::str::from_utf8(&body).expect("utf8 body"),
             "explicit:/admin/llm-gateway/monitor"
+        );
+    }
+
+    #[tokio::test]
+    async fn admin_llm_gateway_usage_metrics_prefers_proxy_route() {
+        let fallback = move |OriginalUri(uri): OriginalUri| async move {
+            Html(format!("fallback:{}", uri.path()))
+        };
+        let explicit = move |OriginalUri(uri): OriginalUri| async move {
+            Html(format!("explicit:{}", uri.path()))
+        };
+        let proxy = move |OriginalUri(uri): OriginalUri| async move {
+            Json(serde_json::json!({"proxied": uri.path()}))
+        };
+
+        let mut router = Router::new()
+            .route("/admin/llm-gateway/monitor", get(explicit))
+            .route("/admin/llm-gateway/*path", any(proxy))
+            .fallback_service(ServeDir::new("frontend/dist").fallback(get(fallback)))
+            .into_service();
+
+        let response = router
+            .call(
+                Request::builder()
+                    .uri("/admin/llm-gateway/usage/metrics")
+                    .body(Body::empty())
+                    .expect("request"),
+            )
+            .await
+            .expect("response");
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE),
+            Some(&header::HeaderValue::from_static("application/json"))
+        );
+        let body = to_bytes(response.into_body(), usize::MAX)
+            .await
+            .expect("body");
+        assert_eq!(
+            std::str::from_utf8(&body).expect("utf8 body"),
+            r#"{"proxied":"/admin/llm-gateway/usage/metrics"}"#
         );
     }
 }
