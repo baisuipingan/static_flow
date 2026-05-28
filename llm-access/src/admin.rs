@@ -5312,6 +5312,7 @@ fn build_direct_kiro_model_probe_request(
     );
     llm_access_kiro::wire::KiroRequest {
         conversation_state: llm_access_kiro::wire::ConversationState::new(conversation_id)
+            .with_chat_trigger_type("MANUAL")
             .with_current_message(current_message),
         profile_arn,
     }
@@ -6866,6 +6867,7 @@ mod tests {
                 .content,
             ADMIN_KIRO_MODEL_PROBE_PROMPT
         );
+        assert_eq!(request.conversation_state.chat_trigger_type.as_deref(), Some("MANUAL"));
         assert!(request.conversation_state.history.is_empty());
         assert_eq!(
             request.profile_arn.as_deref(),
