@@ -124,7 +124,9 @@ pub fn map_model(model: &str) -> Option<String> {
             Some("claude-sonnet-4.5".to_string())
         }
     } else if model.contains("opus") {
-        if model.contains("4-7") || model.contains("4.7") {
+        if model.contains("4-8") || model.contains("4.8") {
+            Some("claude-opus-4.8".to_string())
+        } else if model.contains("4-7") || model.contains("4.7") {
             Some("claude-opus-4.7".to_string())
         } else if model.contains("4-5") || model.contains("4.5") {
             Some("claude-opus-4.5".to_string())
@@ -145,7 +147,8 @@ pub fn get_context_window_size(model: &str) -> i32 {
         Some(mapped)
             if mapped == "claude-sonnet-4.6"
                 || mapped == "claude-opus-4.6"
-                || mapped == "claude-opus-4.7" =>
+                || mapped == "claude-opus-4.7"
+                || mapped == "claude-opus-4.8" =>
         {
             1_000_000
         },
@@ -2221,6 +2224,7 @@ fn requested_model_identity_id(model: &str) -> &str {
 
 fn requested_model_identity_name(model: &str) -> Option<&'static str> {
     match requested_model_identity_id(model) {
+        "claude-opus-4-8" => Some("Opus 4.8"),
         "claude-opus-4-7" => Some("Opus 4.7"),
         "claude-opus-4-6" => Some("Opus 4.6"),
         "claude-sonnet-4-6" => Some("Sonnet 4.6"),
@@ -2622,6 +2626,9 @@ mod tests {
     fn get_context_window_size_matches_latest_kiro_model_rules() {
         assert_eq!(get_context_window_size("claude-sonnet-4-6"), 1_000_000);
         assert_eq!(get_context_window_size("claude-opus-4-20250514"), 1_000_000);
+        assert_eq!(map_model("claude-opus-4-8"), Some("claude-opus-4.8".to_string()));
+        assert_eq!(map_model("claude-opus-4.8"), Some("claude-opus-4.8".to_string()));
+        assert_eq!(get_context_window_size("claude-opus-4-8"), 1_000_000);
         assert_eq!(map_model("claude-opus-4-7"), Some("claude-opus-4.7".to_string()));
         assert_eq!(get_context_window_size("claude-opus-4-7"), 1_000_000);
         assert_eq!(get_context_window_size("claude-sonnet-4-5-20250929"), 200_000);
@@ -3485,7 +3492,7 @@ mod tests {
             role: "user".to_string(),
             content: serde_json::json!("Hello"),
         }]);
-        req.model = "claude-opus-4-7-thinking".to_string();
+        req.model = "claude-opus-4-8-thinking".to_string();
         req.system = Some(vec![SystemMessage {
             text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
         }]);
@@ -3512,9 +3519,9 @@ mod tests {
         assert!(current.contains("<thinking_effort>xhigh</thinking_effort>"));
         assert!(!system_prefix.contains("<thinking_effort>xhigh</thinking_effort>"));
         assert!(system_prefix.contains(
-            "You are powered by the model named Opus 4.7. The exact model ID is claude-opus-4-7."
+            "You are powered by the model named Opus 4.8. The exact model ID is claude-opus-4-8."
         ));
-        assert!(!system_prefix.contains("claude-opus-4-7-thinking"));
+        assert!(!system_prefix.contains("claude-opus-4-8-thinking"));
     }
 
     #[test]
@@ -3567,7 +3574,7 @@ mod tests {
             role: "user".to_string(),
             content: serde_json::json!("Hello"),
         }]);
-        req.model = "claude-opus-4-7".to_string();
+        req.model = "claude-opus-4-8".to_string();
         req.system = Some(vec![SystemMessage {
             text: "You are Claude Code, Anthropic's official CLI for Claude.".to_string(),
         }]);
@@ -3580,7 +3587,7 @@ mod tests {
 
         assert!(system_prefix.contains("You are Claude Code, Anthropic's official CLI"));
         assert!(system_prefix.contains(
-            "You are powered by the model named Opus 4.7. The exact model ID is claude-opus-4-7."
+            "You are powered by the model named Opus 4.8. The exact model ID is claude-opus-4-8."
         ));
     }
 

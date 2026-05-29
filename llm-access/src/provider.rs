@@ -4983,7 +4983,9 @@ fn override_kiro_thinking_from_model_name(payload: &mut MessagesRequest) {
         && (model.contains("4-6")
             || model.contains("4.6")
             || model.contains("4-7")
-            || model.contains("4.7"));
+            || model.contains("4.7")
+            || model.contains("4-8")
+            || model.contains("4.8"));
     payload.thinking = Some(Thinking {
         thinking_type: if is_high_reasoning_opus {
             "adaptive".to_string()
@@ -5272,6 +5274,7 @@ fn normalize_kiro_kmodel_name(model: &str) -> &str {
     match model {
         "claude-opus-4.6" => "claude-opus-4-6",
         "claude-opus-4.7" => "claude-opus-4-7",
+        "claude-opus-4.8" => "claude-opus-4-8",
         _ => model,
     }
 }
@@ -8018,10 +8021,10 @@ mod tests {
     }
 
     #[test]
-    fn override_kiro_thinking_aligns_opus_47_with_opus_46() {
+    fn override_kiro_thinking_aligns_opus_48_with_previous_opus_models() {
         let mut payload: llm_access_kiro::anthropic::types::MessagesRequest =
             serde_json::from_value(json!({
-                "model": "claude-opus-4-7-thinking",
+                "model": "claude-opus-4-8-thinking",
                 "max_tokens": 64,
                 "messages": [{
                     "role": "user",
@@ -8045,7 +8048,8 @@ mod tests {
     }
 
     #[test]
-    fn normalize_kiro_kmodel_name_maps_opus_47_back_to_public_name() {
+    fn normalize_kiro_kmodel_name_maps_opus_dot_names_back_to_public_names() {
+        assert_eq!(super::normalize_kiro_kmodel_name("claude-opus-4.8"), "claude-opus-4-8");
         assert_eq!(super::normalize_kiro_kmodel_name("claude-opus-4.7"), "claude-opus-4-7");
     }
 
@@ -10261,6 +10265,8 @@ mod tests {
             .collect::<Vec<_>>();
         assert!(ids.contains(&"claude-opus-4-7"));
         assert!(ids.contains(&"claude-opus-4-7-thinking"));
+        assert!(ids.contains(&"claude-opus-4-8"));
+        assert!(ids.contains(&"claude-opus-4-8-thinking"));
     }
 
     #[tokio::test]
