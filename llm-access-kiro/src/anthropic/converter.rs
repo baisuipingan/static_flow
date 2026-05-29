@@ -183,6 +183,13 @@ impl ResponseModelIdentity {
     pub fn canonical_response(&self) -> String {
         format!("模型名称：{}\n模型 ID：{}", self.model_name, self.model_id)
     }
+
+    pub fn canonical_thinking(&self) -> String {
+        format!(
+            "The model identity is {}; the public API model ID is {}.",
+            self.model_name, self.model_id
+        )
+    }
 }
 
 #[derive(Debug, Default)]
