@@ -34,10 +34,13 @@ REPO = Path(__file__).resolve().parent.parent
 FRONTEND = "static-flow-frontend"
 
 # Files whose change can affect every crate's build/lint, so they force a full
-# run rather than a per-crate subset. .github/ and scripts/ are included so a
-# change to this very selector is validated against the whole workspace.
+# run rather than a per-crate subset: the root manifest, the lockfile, the
+# toolchain pin (rust-toolchain*), and cargo config (.cargo/). CI YAML and
+# scripts deliberately are NOT here -- they change no Rust code, so a PR that
+# only touches them compiles nothing; the `detect` job itself exercises this
+# selector.
 CROSS_EXACT = {"Cargo.toml", "Cargo.lock"}
-CROSS_PREFIX = (".github/", "scripts/")
+CROSS_PREFIX = (".cargo/",)
 
 
 def run(cmd, **kw):
