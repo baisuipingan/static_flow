@@ -155,13 +155,34 @@ pub fn summarize_error_bytes(bytes: &Bytes) -> String {
         body
     }
 }
-pub fn kiro_prompt_too_long_message(model: &str, request_input_tokens: i32) -> String {
-    let limit_tokens = get_context_window_size(model).max(1);
+/// Formats the `Prompt is too long` message against an explicit limit. The
+/// actual count is forced strictly above the limit so the client's `N > M`
+/// overflow parser always fires.
+fn kiro_too_long_message_with_limit(request_input_tokens: i32, limit_tokens: i32) -> String {
+    let limit_tokens = limit_tokens.max(1);
     let actual_tokens = request_input_tokens.max(limit_tokens.saturating_add(1));
     format!(
         "Prompt is too long: {actual_tokens} tokens > {limit_tokens} tokens for the model context \
          window."
     )
+}
+pub fn kiro_prompt_too_long_message(model: &str, request_input_tokens: i32) -> String {
+    kiro_too_long_message_with_limit(request_input_tokens, get_context_window_size(model))
+}
+/// The proactive-compaction `Prompt is too long` message for the configured
+/// `trigger`. Exposed so the dispatch gate can record the same text into the
+/// usage/error audit trail before returning the response.
+pub fn kiro_proactive_compact_message(request_input_tokens: i32, trigger: i32) -> String {
+    kiro_too_long_message_with_limit(request_input_tokens, trigger)
+}
+/// Builds the proactive `Prompt is too long` response that nudges the client
+/// into reactive compaction at the configured `trigger`, before the request is
+/// sent upstream. The reported limit is the trigger itself — an honest soft
+/// ceiling that sits below the model's true window — so the client compacts
+/// early, while the summary request it then issues still fits the real window.
+pub fn kiro_proactive_compact_response(request_input_tokens: i32, trigger: i32) -> Response {
+    let message = kiro_too_long_message_with_limit(request_input_tokens, trigger);
+    anthropic_json_error(StatusCode::PAYLOAD_TOO_LARGE, "invalid_request_error", &message)
 }
 pub fn kiro_prompt_too_long_response_for_body(
     status: StatusCode,
@@ -219,4 +240,30 @@ pub fn kiro_text_is_content_length_exceeded(text: &str) -> bool {
         || normalized.contains("contentlengthexceededexception")
         || normalized.contains("input content length exceeds threshold")
         || normalized.contains("input is too long")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn proactive_message_reports_trigger_as_limit_with_strict_overflow() {
+        // real input above the trigger → reported verbatim, gap positive
+        let message = kiro_too_long_message_with_limit(812_345, 780_000);
+        assert!(message.contains("812345 tokens > 780000 tokens"), "got: {message}");
+        assert!(message.starts_with("Prompt is too long:"), "got: {message}");
+    }
+
+    #[test]
+    fn proactive_message_forces_actual_above_limit_at_boundary() {
+        // real input == trigger → actual bumped to trigger+1 so N > M still holds
+        let message = kiro_too_long_message_with_limit(780_000, 780_000);
+        assert!(message.contains("780001 tokens > 780000 tokens"), "got: {message}");
+    }
+
+    #[test]
+    fn proactive_response_is_413_invalid_request() {
+        let response = kiro_proactive_compact_response(900_000, 780_000);
+        assert_eq!(response.status(), StatusCode::PAYLOAD_TOO_LARGE);
+    }
 }
