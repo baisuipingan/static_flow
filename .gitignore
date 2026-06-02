@@ -63,7 +63,7 @@ node_modules/
 yarn.lock
 
 # Tailwind CSS 生成文件
-frontend/static/styles.css
+crates/frontend/static/styles.css
 
 # 测试覆盖率报告
 coverage/
