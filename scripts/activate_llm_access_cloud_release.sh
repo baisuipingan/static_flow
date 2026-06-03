@@ -63,6 +63,28 @@ require_env_file_var() {
   env_file_has_nonempty_var "$file" "$name" || fail "$label does not define $name: $file"
 }
 
+sudo_env_file_has_nonempty_var() {
+  local file="$1"
+  local name="$2"
+  sudo REQUIRED_ENV_FILE="$file" REQUIRED_ENV_VAR="$name" bash -lc '
+    set -a
+    # shellcheck source=/dev/null
+    source "$REQUIRED_ENV_FILE"
+    set +a
+    value="${!REQUIRED_ENV_VAR:-}"
+    value="${value#"${value%%[![:space:]]*}"}"
+    value="${value%"${value##*[![:space:]]}"}"
+    [[ -n "$value" ]]
+  '
+}
+
+require_env_file_var_with_sudo() {
+  local file="$1"
+  local name="$2"
+  local label="$3"
+  sudo_env_file_has_nonempty_var "$file" "$name" || fail "$label does not define $name: $file"
+}
+
 manifest_value() {
   local key="$1"
   [[ -f "$MANIFEST" ]] || return 0
@@ -227,8 +249,8 @@ if [[ -e "$STAGED_NEON_ENV" ]]; then
   sudo install -o "$SERVICE_USER" -g "$SERVICE_GROUP" -m 0600 "$STAGED_NEON_ENV" "$NEON_ENV_PATH"
 fi
 sudo test -r "$NEON_ENV_PATH" || fail "missing shared llm-access runtime env: $NEON_ENV_PATH"
-require_env_file_var "$NEON_ENV_PATH" LLM_ACCESS_CONTROL_DATABASE_URL "shared llm-access runtime env"
-require_env_file_var "$NEON_ENV_PATH" KIRO_THINKING_SIGNATURE_SECRET "shared llm-access runtime env"
+require_env_file_var_with_sudo "$NEON_ENV_PATH" LLM_ACCESS_CONTROL_DATABASE_URL "shared llm-access runtime env"
+require_env_file_var_with_sudo "$NEON_ENV_PATH" KIRO_THINKING_SIGNATURE_SECRET "shared llm-access runtime env"
 if [[ "$ACTIVATE_TARGET" == "worker" || "$ACTIVATE_TARGET" == "both" ]]; then
   if findmnt -T /mnt/llm-access-usage >/dev/null; then
     log "/mnt/llm-access-usage is mounted before activation"
