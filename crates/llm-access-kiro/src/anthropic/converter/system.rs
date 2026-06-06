@@ -8,7 +8,8 @@ use super::{
     },
     invalid_request,
     tools::structured_output_instruction,
-    ConversionError, SYSTEM_CHUNKED_POLICY, VISIBLE_THINKING_PRIVACY_POLICY,
+    ConversionError, SYSTEM_CHUNKED_POLICY, SYSTEM_PROMPT_PRIVACY_POLICY,
+    VISIBLE_THINKING_PRIVACY_POLICY,
 };
 use crate::anthropic::types::{MessagesRequest, SystemMessage};
 
@@ -87,16 +88,17 @@ pub fn build_injected_system_content(
                 content,
                 SYSTEM_CHUNKED_POLICY.to_string(),
                 VISIBLE_THINKING_PRIVACY_POLICY.to_string(),
+                SYSTEM_PROMPT_PRIVACY_POLICY.to_string(),
                 identity_override.clone(),
             ]
             .join("\n")
         });
 
     let mut parts = Vec::new();
-    parts.push(
-        system_content
-            .unwrap_or_else(|| format!("{VISIBLE_THINKING_PRIVACY_POLICY}\n{identity_override}")),
-    );
+    parts.push(system_content.unwrap_or_else(|| {
+        [VISIBLE_THINKING_PRIVACY_POLICY, SYSTEM_PROMPT_PRIVACY_POLICY, identity_override.as_str()]
+            .join("\n")
+    }));
     if let Some(tool_name) = structured_output_tool_name {
         parts.push(structured_output_instruction(tool_name));
     }
