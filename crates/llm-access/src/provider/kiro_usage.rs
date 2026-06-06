@@ -71,21 +71,30 @@ pub fn build_kiro_usage_summary(
     }
 }
 pub fn anthropic_usage_json_with_policy(
-    _policy: &KiroCachePolicy,
+    policy: &KiroCachePolicy,
     input_tokens_total: i32,
     output_tokens: i32,
-    _cache_read_input_tokens: i32,
+    cache_read_input_tokens: i32,
 ) -> serde_json::Value {
     let input_tokens_total = input_tokens_total.max(0);
-    // The runtime usage summary may estimate cache hits for billing, but the
-    // public Anthropic surface should not expose synthetic cache token splits.
+    let cache_read_input_tokens = cache_read_input_tokens.max(0).min(input_tokens_total);
+    let non_cached_input_tokens_total = input_tokens_total.saturating_sub(cache_read_input_tokens);
+    let ratio = policy.anthropic_cache_creation_input_ratio;
+    let cache_creation_input_tokens = if !ratio.is_finite() || ratio <= 0.0 {
+        0
+    } else {
+        (((non_cached_input_tokens_total as f64) * ratio).floor() as i32)
+            .max(0)
+            .min(non_cached_input_tokens_total)
+    };
+    let input_tokens = non_cached_input_tokens_total.saturating_sub(cache_creation_input_tokens);
     serde_json::json!({
-        "input_tokens": input_tokens_total,
+        "input_tokens": input_tokens,
         "output_tokens": output_tokens.max(0),
-        "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,
+        "cache_creation_input_tokens": cache_creation_input_tokens,
+        "cache_read_input_tokens": cache_read_input_tokens,
         "cache_creation": {
-            "ephemeral_5m_input_tokens": 0,
+            "ephemeral_5m_input_tokens": cache_creation_input_tokens,
             "ephemeral_1h_input_tokens": 0
         },
         "output_tokens_details": {

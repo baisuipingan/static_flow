@@ -1584,17 +1584,17 @@ async fn forced_proxy_route_store_overrides_candidates_and_hydrated_routes() {
 }
 
 #[test]
-fn anthropic_usage_json_with_policy_exposes_total_input_tokens_and_anthropic_fields() {
+fn anthropic_usage_json_with_policy_exposes_cache_breakdown_when_available() {
     let mut policy = llm_access_kiro::cache_policy::default_kiro_cache_policy();
     policy.anthropic_cache_creation_input_ratio = 0.25;
 
     let usage = super::anthropic_usage_json_with_policy(&policy, 200, 7, 20);
 
-    assert_eq!(usage["input_tokens"], 200);
-    assert_eq!(usage["cache_creation_input_tokens"], 0);
-    assert_eq!(usage["cache_read_input_tokens"], 0);
+    assert_eq!(usage["input_tokens"], 135);
+    assert_eq!(usage["cache_creation_input_tokens"], 45);
+    assert_eq!(usage["cache_read_input_tokens"], 20);
     assert_eq!(usage["output_tokens"], 7);
-    assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 0);
+    assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 45);
     assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 0);
     assert_eq!(usage["output_tokens_details"]["thinking_tokens"], 0);
     assert_eq!(usage["service_tier"], "standard");
@@ -1605,6 +1605,14 @@ fn anthropic_usage_json_with_policy_exposes_total_input_tokens_and_anthropic_fie
     assert_eq!(no_cache_read["input_tokens"], 100);
     assert_eq!(no_cache_read["cache_creation_input_tokens"], 0);
     assert_eq!(no_cache_read["cache_read_input_tokens"], 0);
+    assert_eq!(no_cache_read["cache_creation"]["ephemeral_5m_input_tokens"], 0);
+
+    policy.anthropic_cache_creation_input_ratio = 0.25;
+    let ratio_only = super::anthropic_usage_json_with_policy(&policy, 100, 3, 0);
+    assert_eq!(ratio_only["input_tokens"], 75);
+    assert_eq!(ratio_only["cache_creation_input_tokens"], 25);
+    assert_eq!(ratio_only["cache_read_input_tokens"], 0);
+    assert_eq!(ratio_only["cache_creation"]["ephemeral_5m_input_tokens"], 25);
 }
 
 #[test]

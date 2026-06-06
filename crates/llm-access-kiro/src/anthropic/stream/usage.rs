@@ -22,18 +22,16 @@ pub const KIRO_CONTEXT_USAGE_MIN_REQUEST_TOKENS: u64 =
 pub fn anthropic_usage_json(
     input_tokens_total: i32,
     output_tokens: i32,
-    _cache_read_input_tokens: i32,
+    cache_read_input_tokens: i32,
 ) -> serde_json::Value {
     let input_tokens_total = input_tokens_total.max(0);
-    // Kiro does not expose Anthropic-native prompt-cache metadata. Public
-    // Anthropic responses should therefore report the resolved total input
-    // tokens and leave cache breakdown fields at zero instead of inventing a
-    // synthetic split.
+    let cache_read_input_tokens = cache_read_input_tokens.max(0).min(input_tokens_total);
+    let input_tokens = input_tokens_total.saturating_sub(cache_read_input_tokens);
     json!({
-        "input_tokens": input_tokens_total,
+        "input_tokens": input_tokens,
         "output_tokens": output_tokens.max(0),
         "cache_creation_input_tokens": 0,
-        "cache_read_input_tokens": 0,
+        "cache_read_input_tokens": cache_read_input_tokens,
         "cache_creation": {
             "ephemeral_5m_input_tokens": 0,
             "ephemeral_1h_input_tokens": 0
@@ -139,11 +137,11 @@ mod tests {
 
     #[test]
     fn anthropic_usage_json_exposes_extended_anthropic_fields() {
-        let usage = super::anthropic_usage_json(125, 16, 0);
+        let usage = super::anthropic_usage_json(125, 16, 20);
 
-        assert_eq!(usage["input_tokens"], 125);
+        assert_eq!(usage["input_tokens"], 105);
         assert_eq!(usage["cache_creation_input_tokens"], 0);
-        assert_eq!(usage["cache_read_input_tokens"], 0);
+        assert_eq!(usage["cache_read_input_tokens"], 20);
         assert_eq!(usage["cache_creation"]["ephemeral_5m_input_tokens"], 0);
         assert_eq!(usage["cache_creation"]["ephemeral_1h_input_tokens"], 0);
         assert_eq!(usage["output_tokens_details"]["thinking_tokens"], 0);
