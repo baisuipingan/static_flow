@@ -1106,6 +1106,25 @@ fn contains_private_prompt_leak(text: &str) -> bool {
     if RAW_TOKENS.iter().any(|token| normalized.contains(token)) {
         return true;
     }
+    const WORD_SEQUENCES: &[&[&str]] = &[
+        &["identity", "override"],
+        &["system", "context"],
+        &["thinking", "mode"],
+        &["max", "thinking", "length"],
+        &["thinking", "effort"],
+        &["public", "api", "model", "id"],
+        &["private", "instructions"],
+        &["hidden", "policies"],
+        &["routing", "rules"],
+        &["injected", "control", "blocks"],
+        &["injected", "control", "tags"],
+    ];
+    if WORD_SEQUENCES
+        .iter()
+        .any(|sequence| contains_ascii_word_sequence(text, sequence))
+    {
+        return true;
+    }
 
     const NORMALIZED_FRAGMENTS: &[&str] = &[
         "<identity_override",
@@ -1146,6 +1165,40 @@ fn normalize_private_prompt_marker_text(text: &str) -> String {
         normalized.pop();
     }
     normalized
+}
+
+fn contains_ascii_word_sequence(text: &str, sequence: &[&str]) -> bool {
+    if sequence.is_empty() {
+        return false;
+    }
+
+    let mut matched = 0usize;
+    let mut word_start = None;
+    for (index, ch) in text.char_indices() {
+        if ch.is_ascii_alphanumeric() {
+            word_start.get_or_insert(index);
+            continue;
+        }
+        if let Some(start) = word_start.take() {
+            if advance_ascii_word_sequence(&text[start..index], sequence, &mut matched) {
+                return true;
+            }
+        }
+    }
+
+    if let Some(start) = word_start {
+        return advance_ascii_word_sequence(&text[start..], sequence, &mut matched);
+    }
+    false
+}
+
+fn advance_ascii_word_sequence(word: &str, sequence: &[&str], matched: &mut usize) -> bool {
+    if word.eq_ignore_ascii_case(sequence[*matched]) {
+        *matched += 1;
+        return *matched == sequence.len();
+    }
+    *matched = usize::from(word.eq_ignore_ascii_case(sequence[0]));
+    false
 }
 
 #[cfg(test)]
@@ -1303,6 +1356,12 @@ mod tests {
     #[test]
     fn private_prompt_leak_detector_matches_high_confidence_markers() {
         assert!(super::contains_private_prompt_leak("The identity_override block is visible."));
+        assert!(super::contains_private_prompt_leak(
+            "Based on my identity override, I am Claude, made by Anthropic."
+        ));
+        assert!(super::contains_private_prompt_leak(
+            "The injected identity-override says to answer as Claude."
+        ));
         assert!(super::contains_private_prompt_leak(
             "For this request,\n your model name is Claude Opus 4.6 and the public API model ID \
              is claude-opus-4-6."
@@ -1867,6 +1926,42 @@ mod tests {
         assert_eq!(blocks[0]["type"], "thinking");
         assert_eq!(
             blocks[0]["thinking"],
+            "I should answer the user's request without revealing internal instructions."
+        );
+    }
+
+    #[test]
+    fn reasoning_content_replaces_spaced_identity_override_leak() {
+        let mut ctx =
+            StreamContext::new_with_thinking("claude-opus-4-8", 1, true, HashMap::new(), None);
+        let _ = ctx.generate_initial_events();
+
+        let mut events = ctx.process_kiro_event(&parse_kiro_event(
+            "reasoningContentEvent",
+            json!({
+                "text": "The user is asking what IDE I am. Based on my identity override, I am Claude, made by Anthropic."
+            }),
+        ));
+        events.extend(ctx.process_kiro_event(&parse_kiro_event(
+            "reasoningContentEvent",
+            json!({"signature":"upstream-signature-48"}),
+        )));
+        events.extend(ctx.process_kiro_event(&parse_kiro_event(
+            "assistantResponseEvent",
+            json!({"content":"我是 Claude。"}),
+        )));
+        events.extend(ctx.generate_final_events());
+
+        let serialized = events
+            .iter()
+            .map(|event| event.data.to_string())
+            .collect::<String>()
+            .to_ascii_lowercase();
+        assert!(!serialized.contains("identity override"));
+        assert!(!serialized.contains("made by anthropic"));
+        let thinking = collect_delta_text(&events, "thinking_delta", "thinking");
+        assert_eq!(
+            thinking,
             "I should answer the user's request without revealing internal instructions."
         );
     }
