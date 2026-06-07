@@ -6,12 +6,17 @@
 
 use std::time::{Duration, Instant};
 
+use chrono::Utc;
 use serde::Serialize;
 
 use super::{
     anchor_index::{AnchorTokenCounts, ConversationAnchorIndex, ConversationAnchorRuntimeStats},
-    prefix_tree::{PrefixCacheMatch, PrefixTree, PrefixTreeRuntimeStats},
+    prefix_tree::{skip_prefix_section, PrefixCacheMatch, PrefixTree, PrefixTreeRuntimeStats},
     projection::{PromptProjection, RuntimePromptProjection, PREFIX_CACHE_PAGE_SIZE},
+    snapshot::{
+        decode_frame, finalize_frame, write_varint, AnchorUnion, DecodedFrame,
+        KiroSnapshotImportOutcome, SnapshotCaps, SnapshotHeader, SnapshotReader,
+    },
 };
 use crate::wire::AssistantMessage;
 
@@ -222,5 +227,227 @@ impl KiroCacheSimulator {
             prefix_tree,
             conversation_anchors,
         }
+    }
+
+    /// Serialize the live simulator state into a gzip-framed snapshot blob.
+    ///
+    /// TTL pruning runs first so stale state is never persisted. Returns `None`
+    /// only when there is nothing worth saving (Formula mode with no anchors);
+    /// anchors are persisted even in Formula mode because they drive the
+    /// proactive-compaction gate.
+    pub fn export_snapshot(
+        &self,
+        config: KiroCacheSimulationConfig,
+        caps: SnapshotCaps,
+        now: Instant,
+    ) -> Option<Vec<u8>> {
+        let prefix_tree_mode = matches!(config.mode, KiroCacheSimulationMode::PrefixTree);
+        let mut raw = Vec::new();
+        let mut prefix_section = Vec::new();
+        let resident_tokens = {
+            let mut tree = self.prefix_tree.lock();
+            tree.prune_expired(now, config.prefix_cache_entry_ttl);
+            if prefix_tree_mode {
+                tree.encode_section(&mut prefix_section, now, caps.max_tokens);
+                tree.resident_tokens()
+            } else {
+                // Empty prefix section (root with zero children).
+                write_varint(&mut prefix_section, 0);
+                0
+            }
+        };
+        let mut anchor_section = Vec::new();
+        let anchors_empty = {
+            let mut index = self.anchor_index.lock();
+            index.remove_expired(now, config.conversation_anchor_ttl);
+            index.encode_section(&mut anchor_section, now, caps.max_anchor_entries);
+            index.is_empty()
+        };
+        // Nothing worth persisting. Skipping here avoids writing an empty own
+        // key that would otherwise shadow warm peer snapshots on the next
+        // restart (a cold node's first scheduled flush would do exactly that).
+        if resident_tokens == 0 && anchors_empty {
+            return None;
+        }
+        SnapshotHeader {
+            snapshot_unix_ms: Utc::now().timestamp_millis(),
+            resident_tokens,
+        }
+        .write(&mut raw);
+        raw.extend_from_slice(&prefix_section);
+        raw.extend_from_slice(&anchor_section);
+        match finalize_frame(raw) {
+            Ok(blob) => Some(blob),
+            Err(err) => {
+                tracing::warn!(error = %err, "failed to finalize kiro cache snapshot");
+                None
+            },
+        }
+    }
+
+    /// Restore simulator state from this node's snapshot plus peer snapshots.
+    ///
+    /// Prefix tree: own snapshot wins; otherwise the newest decodable peer
+    /// seeds it (single source, no page-level merge). Anchors: union across own
+    /// and all peers (newest-touch wins), then capped. Every decode failure is
+    /// counted and skipped; this never panics and never fails startup.
+    pub fn import_snapshot(
+        &self,
+        own: Option<&[u8]>,
+        peers: &[Vec<u8>],
+        config: KiroCacheSimulationConfig,
+        caps: SnapshotCaps,
+        now: Instant,
+    ) -> KiroSnapshotImportOutcome {
+        let max_tokens = caps.max_tokens.unwrap_or(config.prefix_cache_max_tokens);
+        let max_anchor_entries = caps
+            .max_anchor_entries
+            .unwrap_or(config.conversation_anchor_max_entries);
+        let ctx = RestoreCtx {
+            now,
+            now_unix_ms: Utc::now().timestamp_millis(),
+            ttl: config.prefix_cache_entry_ttl,
+            anchor_ttl: config.conversation_anchor_ttl,
+            max_tokens,
+            // Each retained page costs >= 1 token, so the page budget tracks the
+            // token budget; a section that cannot fit it is rejected on decode.
+            max_pages: usize::try_from(max_tokens).unwrap_or(usize::MAX),
+            max_anchor_entries,
+        };
+
+        let mut outcome = KiroSnapshotImportOutcome::default();
+        let mut best: Option<PrefixCandidate> = None;
+        let mut anchors = AnchorUnion::new(ctx.now_unix_ms, ctx.anchor_ttl, ctx.max_anchor_entries);
+
+        // Stream frames one at a time so only a single decompressed frame is
+        // resident at once: decode, fold its prefix candidate, fold its bounded
+        // anchor rows into the running union (which dedups + trims to
+        // max_anchor_entries each fold), then drop its section bytes before the
+        // next peer. Own is folded first so a non-empty own tree wins; among
+        // peers the newest snapshot wins, and an empty/expired tree never
+        // shadows a warm source.
+        if let Some(frame) = decode_blob(own, &mut outcome.decode_errors) {
+            fold_restore_frame(&frame, true, &ctx, &mut best, &mut anchors);
+        }
+        for peer in peers {
+            if let Some(frame) = decode_blob(Some(peer.as_slice()), &mut outcome.decode_errors) {
+                fold_restore_frame(&frame, false, &ctx, &mut best, &mut anchors);
+            }
+        }
+
+        if let Some(candidate) = best {
+            outcome.prefix_resident_tokens = candidate.tree.resident_tokens();
+            outcome.prefix_from_own = candidate.from_own;
+            outcome.prefix_from_peer = !candidate.from_own;
+            *self.prefix_tree.lock() = candidate.tree;
+        }
+
+        let merged = anchors.finish();
+        {
+            let mut index = self.anchor_index.lock();
+            index.rebuild_from_rows(merged, ctx.now, ctx.anchor_ttl, ctx.max_anchor_entries);
+            outcome.anchor_entries = index.len();
+        }
+        outcome
+    }
+}
+
+fn decode_blob(blob: Option<&[u8]>, errors: &mut usize) -> Option<DecodedFrame> {
+    let blob = blob?;
+    match decode_frame(blob) {
+        Ok(frame) => Some(frame),
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to decode kiro cache snapshot blob");
+            *errors += 1;
+            None
+        },
+    }
+}
+
+/// Scalar restore parameters threaded into per-frame folding, kept in one
+/// struct so `fold_restore_frame` stays within the argument budget.
+struct RestoreCtx {
+    now: Instant,
+    now_unix_ms: i64,
+    ttl: Duration,
+    anchor_ttl: Duration,
+    max_tokens: u64,
+    max_pages: usize,
+    max_anchor_entries: usize,
+}
+
+/// The best prefix tree found so far while streaming decoded frames.
+struct PrefixCandidate {
+    tree: PrefixTree,
+    from_own: bool,
+    snapshot_unix_ms: i64,
+}
+
+/// Whether a `(from_own, snapshot_unix_ms)` tree should replace the current
+/// best prefix candidate. Own always wins; among peers the newest snapshot
+/// wins. Keeps selection order-independent across the streamed frames.
+fn prefix_candidate_wins(
+    best: Option<&PrefixCandidate>,
+    from_own: bool,
+    snapshot_unix_ms: i64,
+) -> bool {
+    match best {
+        None => true,
+        Some(existing) if existing.from_own => false,
+        Some(_) if from_own => true,
+        Some(existing) => snapshot_unix_ms > existing.snapshot_unix_ms,
+    }
+}
+
+/// Decode one frame's prefix tree (folding it into `best` when non-empty and it
+/// wins) and append its bounded anchor rows. The caller drops the frame's
+/// section bytes after this returns, so peak memory stays at one decompressed
+/// frame plus the retained best tree rather than every peer frame at once.
+fn fold_restore_frame(
+    frame: &DecodedFrame,
+    from_own: bool,
+    ctx: &RestoreCtx,
+    best: &mut Option<PrefixCandidate>,
+    anchors: &mut AnchorUnion,
+) {
+    let mut reader = SnapshotReader::new(&frame.sections);
+    match PrefixTree::decode_section(
+        &mut reader,
+        frame.header.snapshot_unix_ms,
+        ctx.now,
+        ctx.now_unix_ms,
+        ctx.ttl,
+        ctx.max_pages,
+    ) {
+        Ok(mut tree) => {
+            tree.enforce_token_budget(ctx.max_tokens);
+            if tree.resident_tokens() > 0
+                && prefix_candidate_wins(best.as_ref(), from_own, frame.header.snapshot_unix_ms)
+            {
+                *best = Some(PrefixCandidate {
+                    tree,
+                    from_own,
+                    snapshot_unix_ms: frame.header.snapshot_unix_ms,
+                });
+            }
+        },
+        Err(err) => {
+            tracing::warn!(error = %err, "failed to decode kiro prefix snapshot section");
+        },
+    }
+
+    // Anchors from a fresh reader so a rejected/oversized prefix does not stop
+    // anchor recovery for this frame. Folding into the running union dedups and
+    // trims to max_anchor_entries now, so memory does not scale with peer count.
+    let mut anchor_reader = SnapshotReader::new(&frame.sections);
+    if skip_prefix_section(&mut anchor_reader).is_err() {
+        return;
+    }
+    if let Ok(decoded) = ConversationAnchorIndex::decode_section(
+        &mut anchor_reader,
+        frame.header.snapshot_unix_ms,
+        ctx.max_anchor_entries,
+    ) {
+        anchors.fold(decoded);
     }
 }
