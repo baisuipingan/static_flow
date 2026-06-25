@@ -58,7 +58,9 @@ Default proxy behavior:
   `GET /admin/kiro-gateway/accounts?limit=10000&offset=0`.
 - Try to read hot Kiro latency ranking from
   `/internal/kiro-gateway/latency-ranking?source=hot&window=1h`.
-- Prefer lower first-token latency while still balancing account counts.
+- Prefer the least-used active United States proxy first.
+- Use hot first-token latency only as a tie-breaker within the same account
+  count bucket, then break remaining ties by proxy name.
 - If latency data is unavailable, choose the least-used active proxy and break
   ties by proxy name.
 - Direct/no-proxy imports are not allowed for Kiro accounts.

@@ -328,14 +328,23 @@ def rank_proxies(
 ) -> list[dict[str, Any]]:
     if not proxies:
         return []
+    # Balance first. Latency is only a tie-breaker inside the same load bucket;
+    # otherwise a fast proxy can keep absorbing every new Kiro account.
+    latency_bucket_ms = max(balance_penalty_ms, 1.0)
 
-    def score(proxy: dict[str, Any]) -> tuple[float, int, str]:
+    def score(proxy: dict[str, Any]) -> tuple[int, int, float, str]:
         proxy_id = str(proxy["id"])
         count = account_counts.get(proxy_id, 0)
         latency = latencies.get(proxy_id)
         if latency is None:
             latency = 1_000_000.0
-        return (latency + count * balance_penalty_ms, count, str(proxy.get("name") or proxy_id))
+        latency_bucket = int(latency // latency_bucket_ms)
+        return (
+            count,
+            latency_bucket,
+            latency,
+            str(proxy.get("name") or proxy_id),
+        )
 
     return sorted(proxies, key=score)
 
@@ -596,7 +605,7 @@ def main(argv: list[str]) -> int:
         balance = result.get("balance")
         user_id = field(balance, "user_id") if isinstance(balance, dict) else None
         if result.get("validated") and user_id is not None:
-            existing_user_ids.setdefault(str(user_id), name)
+            existing_user_ids.setdefault(str(user_id), auth.name)
         results.append(result)
 
     print(

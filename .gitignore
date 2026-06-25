@@ -38,8 +38,17 @@ Thumbs.db
 
 # Python 缓存
 __pycache__/
-*.pyc
-*.pyo
+**/__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.pyre/
+
+# Kiro skill 执行中间产物
+/kiro-social-google-*/
+*.before-social-google-onboard-*
 
 # 备份文件
 *.bak
